@@ -55,27 +55,81 @@ function buildAdminAuth() {
 
 function buildApp() {
   const app = express();
-  app.use(express.json({ limit: "256kb" }));
+  app.use(express.json({ limit: "512kb" }));
 
-  // ---- CORS (must be BEFORE /admin auth) ----
+  // ---- CORS (robust)
   app.use((req, res, next) => {
-    const origin = env.CORS_ORIGIN || "*";
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-api-key",
-    );
+    const reqOrigin = req.headers.origin;
+
+    // env.CORS_ORIGIN supports:
+    //  - "*" (allow all)
+    //  - "http://localhost:5173,http://127.0.0.1:5173"
+    const raw = String(env.CORS_ORIGIN || "*").trim();
+    const allowList = raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const allowAll = allowList.includes("*");
+
+    // DEV: reflect whatever Origin is sent (so Vite port changes won't break)
+    let allowOrigin = "*";
+    if (env.NODE_ENV !== "production") {
+      allowOrigin = reqOrigin || "*";
+    } else {
+      // PROD: strict allowlist unless "*"
+      if (allowAll) allowOrigin = reqOrigin || "*";
+      else if (reqOrigin && allowList.includes(reqOrigin))
+        allowOrigin = reqOrigin;
+      else allowOrigin = ""; // not allowed
+    }
+
+    if (allowOrigin) {
+      res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+      // Only vary when we are reflecting a specific origin
+      if (allowOrigin !== "*") res.setHeader("Vary", "Origin");
+    }
+
+    // If you ever use cookies/sessions:
+    // res.setHeader("Access-Control-Allow-Credentials", "true");
+
+    // Allow methods
     res.setHeader(
       "Access-Control-Allow-Methods",
       "GET,POST,PUT,DELETE,OPTIONS",
     );
+
+    // Allow headers:
+    // Echo the requested headers for maximum compatibility
+    const reqHeaders = req.headers["access-control-request-headers"];
+    if (reqHeaders) {
+      res.setHeader("Access-Control-Allow-Headers", reqHeaders);
+    } else {
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-api-key",
+      );
+    }
+
     res.setHeader("Access-Control-Max-Age", "600");
 
     // Handle preflight
     if (req.method === "OPTIONS") return res.sendStatus(204);
+
+    // If prod and origin not allowed, block early
+    if (
+      env.NODE_ENV === "production" &&
+      reqOrigin &&
+      !allowAll &&
+      !allowList.includes(reqOrigin)
+    ) {
+      return res.status(403).json({ ok: false, error: "CORS_ORIGIN_BLOCKED" });
+    }
+
     next();
   });
+  // ------------------------------------------
+
   // ------------------------------------------
 
   app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
