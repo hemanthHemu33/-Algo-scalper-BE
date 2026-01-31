@@ -437,7 +437,19 @@ function buildTradePlan({
     if (!Number.isFinite(premEntry) || premEntry <= 0)
       return { ok: false, reason: "bad_premium_entry" };
 
-    const absDelta = clamp(optionAbsDelta(env, optionMeta), 0.2, 0.9);
+    const delta = safeNum(optionMeta?.delta, null);
+    const gamma = safeNum(optionMeta?.gamma, null);
+
+    const deltaAbsRaw = Number.isFinite(delta) ? Math.abs(delta) : null;
+    const absDelta = clamp(
+      Number.isFinite(deltaAbsRaw)
+        ? deltaAbsRaw
+        : optionAbsDelta(env, optionMeta),
+      0.2,
+      0.95,
+    );
+    const gammaAbs = Number.isFinite(gamma) ? Math.abs(gamma) : null;
+
     const dte = daysToExpiry(optionMeta);
     const near = Number.isFinite(dte) ? clamp((3 - dte) / 3, 0, 1) : 0;
 
@@ -459,8 +471,16 @@ function buildTradePlan({
     const underlyingRisk = Math.abs(entryU - stopU);
     const underlyingReward = Math.abs(targetU - entryU);
 
-    const premDrop = underlyingRisk * absDelta * stopScale;
-    const premGain = underlyingReward * absDelta * targetScale;
+    // Delta + (optional) gamma mapping: premiumMove ~ |d|xdS + 0.5xgammaxdS^2
+    const mapMove = (dS) => {
+      const ds = Math.max(0, safeNum(dS, 0));
+      const linear = ds * absDelta;
+      const convex = Number.isFinite(gammaAbs) ? 0.5 * gammaAbs * ds * ds : 0;
+      return linear + convex;
+    };
+
+    const premDrop = mapMove(underlyingRisk) * stopScale;
+    const premGain = mapMove(underlyingReward) * targetScale;
 
     let stopP = premEntry - premDrop;
     let targetP = premEntry + premGain;
@@ -498,6 +518,8 @@ function buildTradePlan({
 
     meta.option = {
       absDelta,
+      delta: Number.isFinite(delta) ? delta : null,
+      gamma: Number.isFinite(gamma) ? gamma : null,
       daysToExpiry: Number.isFinite(dte) ? dte : null,
       stopScale,
       targetScale,

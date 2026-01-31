@@ -2965,6 +2965,134 @@ class TradeManager {
       }
     }
 
+    // ---- Option Greeks edge gate: IV + Vega + Theta ----
+    // Protects from cases where direction is right but premium loses due to IV drop/theta.
+    if (s.option_meta && Boolean(env.OPT_IV_THETA_FILTER_ENABLED ?? true)) {
+      try {
+        const metaOpt = s.option_meta || {};
+        const vega1 = Number(metaOpt.vega_1pct);
+        const thetaDay = Number(metaOpt.theta_per_day);
+        const ivChPts = Number(metaOpt.iv_change_pts);
+
+        const minDropPts = Number(env.OPT_IV_DROP_MIN_PTS || 1.5);
+        const capDropPts = Number(env.OPT_IV_DROP_CAP_PTS || 4.0);
+
+        const holdMin = Number(
+          env.OPT_EXPECTED_HOLD_MIN || env.OPT_EXIT_MAX_HOLD_MIN || 10,
+        );
+        const edgeMult = Number(env.OPT_IV_THETA_EDGE_MULT || 1.2);
+
+        // Expected premium gain: prefer planned target distance; fallback to delta-mapped move.
+        const expectedGainP = Number.isFinite(Number(plannedTargetPrice))
+          ? Math.abs(Number(plannedTargetPrice) - Number(entryGuess || 0))
+          : null;
+
+        const entryU = Number(
+          planMeta?.underlying?.entry || s.underlying_ltp || 0,
+        );
+        const targetU = Number(planMeta?.underlying?.target || 0);
+        const moveU =
+          Number.isFinite(entryU) && Number.isFinite(targetU) && targetU > 0
+            ? Math.abs(targetU - entryU)
+            : Math.abs(Number(reg?.meta?.expectedMovePerShare || 0));
+
+        const absDelta = Number.isFinite(Number(metaOpt.delta))
+          ? Math.abs(Number(metaOpt.delta))
+          : Number(planMeta?.option?.absDelta || 0);
+        const gamma = Number.isFinite(Number(metaOpt.gamma))
+          ? Math.abs(Number(metaOpt.gamma))
+          : 0;
+
+        const mappedGainP =
+          Number.isFinite(moveU) && moveU > 0 && absDelta > 0
+            ? absDelta * moveU + 0.5 * gamma * moveU * moveU
+            : null;
+
+        const baseGain = Number.isFinite(expectedGainP)
+          ? expectedGainP
+          : mappedGainP;
+
+        // IV drop impact (only when IV is clearly falling right now)
+        let ivImpact = 0;
+        if (
+          Number.isFinite(vega1) &&
+          Number.isFinite(ivChPts) &&
+          ivChPts < -minDropPts
+        ) {
+          const drop = Math.min(capDropPts, Math.abs(ivChPts));
+          ivImpact = Math.max(0, vega1 * drop);
+        }
+
+        // Theta bleed for expected holding time
+        let thetaCost = 0;
+        if (
+          Number.isFinite(thetaDay) &&
+          thetaDay < 0 &&
+          Number.isFinite(holdMin) &&
+          holdMin > 0
+        ) {
+          thetaCost = Math.abs(thetaDay) * (holdMin / 1440);
+        }
+
+        const friction = ivImpact + thetaCost;
+
+        if (
+          Number.isFinite(baseGain) &&
+          baseGain > 0 &&
+          Number.isFinite(friction) &&
+          friction > 0
+        ) {
+          if (baseGain < friction * edgeMult) {
+            logger.info(
+              {
+                token,
+                side,
+                reason: "IV_THETA_EDGE_TOO_LOW",
+                meta: {
+                  baseGain,
+                  expectedGainP,
+                  mappedGainP,
+                  moveU,
+                  absDelta,
+                  gamma,
+                  ivChPts,
+                  vega_1pct: vega1,
+                  theta_per_day: thetaDay,
+                  holdMin,
+                  ivImpact,
+                  thetaCost,
+                  friction,
+                  edgeMult,
+                },
+              },
+              "[trade] blocked (IV/theta edge gate)",
+            );
+            trackDecision("BLOCKED", "trade", "IV_THETA_EDGE_TOO_LOW", {
+              baseGain,
+              expectedGainP,
+              mappedGainP,
+              moveU,
+              absDelta,
+              gamma,
+              ivChPts,
+              vega_1pct: vega1,
+              theta_per_day: thetaDay,
+              holdMin,
+              ivImpact,
+              thetaCost,
+              friction,
+              edgeMult,
+            });
+            return;
+          }
+        }
+      } catch (e) {
+        logger.warn(
+          { err: e?.message || e },
+          "[trade] IV/theta gate failed; continuing",
+        );
+      }
+    }
     // NOTE: RiskEngine.calcQty expects `entryPrice`.
     // Passing the wrong key here makes qtyByRisk become NaN (and JSON logs show it as null),
     // which then trips margin sizing and blocks trades incorrectly.

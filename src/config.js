@@ -209,6 +209,40 @@ const schema = z.object({
   // Candidate scoring weights (comma-separated k:v; keys: spread,dist,depth,volume,oi)
   OPT_PICK_SCORE_WEIGHTS: z.string().optional(),
 
+  // ---- Option-chain greeks / advanced filters ----
+  OPT_RISK_FREE_RATE: z.coerce.number().default(0.06),
+
+  // Delta band to avoid far OTM / low-reacting contracts (0..1)
+  OPT_DELTA_BAND_MIN: z.coerce.number().default(0.35),
+  OPT_DELTA_BAND_MAX: z.coerce.number().default(0.65),
+  OPT_DELTA_TARGET: z.coerce.number().default(0.5),
+
+  // IV gating in IV points (e.g., 20 = 20%)
+  OPT_IV_NEUTRAL_PTS: z.coerce.number().default(20),
+  OPT_IV_MAX_PTS: z.coerce.number().default(80),
+  OPT_IV_DROP_BLOCK_PTS: z.coerce.number().default(2.0),
+
+  // Spread trend gate (bps increase since previous snapshot)
+  OPT_SPREAD_RISE_BLOCK_BPS: z.coerce.number().default(8),
+  OPT_SPREAD_RISE_PENALTY_MULT: z.coerce.number().default(1.0),
+
+  // Gamma gate near expiry
+  OPT_GAMMA_MAX: z.coerce.number().default(0.004),
+  OPT_GAMMA_GATE_DTE_DAYS: z.coerce.number().default(0.5),
+
+  // OI wall context filter (support/resistance)
+  OPT_OI_WALL_MULT: z.coerce.number().default(2.5),
+  OPT_OI_WALL_STRIKES: z.coerce.number().default(2),
+  OPT_OI_WALL_BLOCK: z.coerce.boolean().default(true),
+  OPT_OI_WALL_REQUIRE_OI_CHANGE: z.coerce.boolean().default(true),
+
+  // IV + theta edge gate (after plan) to avoid IV-crush traps
+  OPT_IV_THETA_FILTER_ENABLED: z.coerce.boolean().default(true),
+  OPT_IV_DROP_MIN_PTS: z.coerce.number().default(1.5),
+  OPT_IV_DROP_CAP_PTS: z.coerce.number().default(4.0),
+  OPT_EXPECTED_HOLD_MIN: z.coerce.number().default(10),
+  OPT_IV_THETA_EDGE_MULT: z.coerce.number().default(1.2),
+
   // Stops for long options (premium-based)
   OPT_STOP_MODE: z.string().default("PCT"),
   OPT_SL_PCT: z.coerce.number().default(12),
