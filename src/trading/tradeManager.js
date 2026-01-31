@@ -1,0 +1,5612 @@
+// TradeManager.js
+const crypto = require("crypto");
+const { DateTime } = require("luxon");
+const { env } = require("../config");
+const { logger } = require("../logger");
+const { telemetry } = require("../telemetry/signalTelemetry");
+const { tradeTelemetry } = require("../telemetry/tradeTelemetry");
+const { marginAwareQty } = require("./marginSizer");
+const { alert } = require("../alerts/alertService");
+const { isHalted } = require("../runtime/halt");
+const { getDb } = require("../db");
+const { ensureInstrument } = require("../instruments/instrumentRepo");
+const { getLastFnoUniverse, buildFnoUniverse } = require("../fno/fnoUniverse");
+const { pickOptionContractForSignal } = require("../fno/optionsRouter");
+const { computePacingPolicy } = require("../policy/pacingPolicy");
+const { buildTradePlan } = require("./planBuilder");
+const { roundToTick } = require("./priceUtils");
+const {
+  fitStopLossToLotRiskCap,
+  computeTargetFromRR,
+} = require("./optionSlFitter");
+const { getRecentCandles } = require("../market/candleStore");
+const { OrderRateLimiter } = require("./orderRateLimiter");
+const { computeDynamicExitPlan } = require("./dynamicExitManager");
+const { planRunnerTarget } = require("./targetPlanner");
+const { detectRegime } = require("../strategy/selector");
+const { costGate, estimateRoundTripCostInr } = require("./costModel");
+const { costCalibrator } = require("./costCalibrator");
+const { optimizer } = require("../optimizer/adaptiveOptimizer");
+const {
+  ensureTradeIndexes,
+  insertTrade,
+  updateTrade,
+  getTrade,
+  getActiveTrades,
+  linkOrder,
+  findTradeByOrder,
+  saveOrphanOrderUpdate,
+  popOrphanOrderUpdates,
+  upsertDailyRisk,
+  getDailyRisk,
+} = require("./tradeStore");
+
+const STATUS = {
+  ENTRY_PLACED: "ENTRY_PLACED",
+  ENTRY_OPEN: "ENTRY_OPEN",
+  ENTRY_FILLED: "ENTRY_FILLED",
+  LIVE: "LIVE",
+  EXITED_TARGET: "EXITED_TARGET",
+  EXITED_SL: "EXITED_SL",
+  ENTRY_FAILED: "ENTRY_FAILED",
+  GUARD_FAILED: "GUARD_FAILED",
+  CLOSED: "CLOSED",
+};
+
+function todayKey() {
+  return DateTime.now()
+    .setZone(env.CANDLE_TZ || "Asia/Kolkata")
+    .toFormat("yyyy-LL-dd");
+}
+
+function dayRange() {
+  const tz = env.CANDLE_TZ || "Asia/Kolkata";
+  const start = DateTime.now().setZone(tz).startOf("day");
+  const end = start.plus({ days: 1 });
+  return { start: start.toJSDate(), end: end.toJSDate() };
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function worseSlippageBps({ side, expected, actual, leg }) {
+  const exp = Number(expected);
+  const act = Number(actual);
+  if (!(exp > 0) || !(act > 0)) return null;
+
+  const s = String(side || "BUY").toUpperCase();
+  const isExit = String(leg || "ENTRY").toUpperCase() === "EXIT";
+
+  // For BUY: entry worse if act > exp, exit worse if act < exp
+  // For SELL: entry worse if act < exp, exit worse if act > exp
+  let worse = 0;
+
+  if (s === "BUY") {
+    worse = isExit ? exp - act : act - exp;
+  } else {
+    worse = isExit ? act - exp : exp - act;
+  }
+
+  if (worse <= 0) return 0;
+  return (worse / exp) * 10000;
+}
+
+function worseSlippageInr({ side, expected, actual, qty, leg }) {
+  const exp = Number(expected);
+  const act = Number(actual);
+  const q = Number(qty || 0);
+  if (!(exp > 0) || !(act > 0) || !(q > 0)) return null;
+
+  const bps = worseSlippageBps({ side, expected: exp, actual: act, leg });
+  if (!Number.isFinite(bps) || bps <= 0) return 0;
+
+  const s = String(side || "BUY").toUpperCase();
+  const isExit = String(leg || "ENTRY").toUpperCase() === "EXIT";
+
+  let diff = 0;
+  if (s === "BUY") diff = isExit ? exp - act : act - exp;
+  else diff = isExit ? act - exp : exp - act;
+
+  return diff > 0 ? diff * q : 0;
+}
+
+class TradeManager {
+  constructor({ kite, riskEngine }) {
+    this.kite = kite;
+    this.risk = riskEngine;
+
+    this.lastPriceByToken = new Map(); // token -> ltp
+    this.activeTradeId = null; // single-stock mode
+    this.recoveredPosition = null; // set when positions exist but trade state missing
+
+    // Prevent duplicate SL/TARGET placement (concurrent calls)
+    this.exitPlacementLocks = new Set(); // tradeId -> locked?
+
+    // Ignore expected OCO cancels
+    this.expectedCancelOrderIds = new Set(); // orderId strings
+
+    // Throttle expensive DB-based checks (avoid per-tick Mongo hammering)
+    this._lastDailyLossCheckAt = 0;
+    this._lastFlattenCheckAt = 0;
+
+    // Optional fallback LTP fetch throttle (helps OPT mode when ticks are sparse)
+    this._lastLtpFetchAtByToken = new Map(); // token -> ts
+
+    // Order rate limits + daily count
+    this.orderLimiter = new OrderRateLimiter({
+      maxPerSec: Number(env.MAX_ORDERS_PER_SEC || 10),
+      maxPerMin: Number(env.MAX_ORDERS_PER_MIN || 200),
+      maxPerDay: Number(env.MAX_ORDERS_PER_DAY || 3000),
+    });
+    this.ordersPlacedToday = 0;
+
+    // Dynamic exit adjustments (trail SL / adjust target)
+    this._dynExitLastAt = new Map(); // tradeId -> last adjust ts
+
+    // Injected by pipeline: runtime token subscription (needed for OPT mode correctness)
+    this.runtimeAddTokens = null;
+  }
+
+  setRuntimeAddTokens(fn) {
+    this.runtimeAddTokens = typeof fn === "function" ? fn : null;
+  }
+
+  _isFnoEnabled() {
+    return String(env.FNO_ENABLED || "false").toLowerCase() === "true";
+  }
+
+  _isOptMode() {
+    return (
+      this._isFnoEnabled() &&
+      String(env.FNO_MODE || "FUT").toUpperCase() === "OPT"
+    );
+  }
+
+  _normalizeQtyToLot(qty, instrument) {
+    const q = Math.floor(Number(qty || 0));
+    if (!Number.isFinite(q) || q <= 0) return 0;
+
+    const lot = Number(instrument?.lot_size || 1);
+    if (!Number.isFinite(lot) || lot <= 1) return q;
+
+    const rounded = Math.floor(q / lot) * lot;
+    if (rounded >= lot) return rounded;
+
+    // For derivatives: sizing can produce < 1 lot. Policy decides what to do.
+    const policy = String(env.FNO_MIN_LOT_POLICY || "STRICT").toUpperCase();
+    if (policy === "FORCE_ONE_LOT") return lot;
+    return 0;
+  }
+
+  // ---------------------------
+  // Stop-loss order helpers (F&O safe)
+  // ---------------------------
+  _isDerivativesExchange(exchange) {
+    const ex = String(exchange || "").toUpperCase();
+    return ["NFO", "BFO", "CDS", "BCD", "MCX"].includes(ex);
+  }
+
+  _getMaxSpreadBps(instrument) {
+    const base = Number(env.MAX_SPREAD_BPS || 15);
+    const ex = String(instrument?.exchange || "").toUpperCase();
+    const seg = String(instrument?.segment || "").toUpperCase();
+    const ts = String(instrument?.tradingsymbol || "").toUpperCase();
+    const it = String(instrument?.instrument_type || "").toUpperCase();
+
+    const isDeriv =
+      this._isDerivativesExchange(ex) ||
+      seg.includes("NFO") ||
+      seg.includes("BFO");
+    const isOpt =
+      isDeriv &&
+      (it === "CE" ||
+        it === "PE" ||
+        /(?:CE|PE)$/.test(ts) ||
+        seg.includes("OPT"));
+    const isFut =
+      isDeriv && !isOpt && (seg.includes("FUT") || ts.includes("FUT"));
+
+    if (isOpt)
+      return Number(env.MAX_SPREAD_BPS_OPT || env.OPT_MAX_SPREAD_BPS || base);
+    if (isFut) return Number(env.MAX_SPREAD_BPS_FUT || base);
+    return Number(env.MAX_SPREAD_BPS_EQ || base);
+  }
+
+  _getStopLossOrderType(instrument) {
+    const ex = String(instrument?.exchange || "").toUpperCase();
+    const isDeriv = this._isDerivativesExchange(ex);
+
+    const raw = String(
+      isDeriv ? env.STOPLOSS_ORDER_TYPE_FO : env.STOPLOSS_ORDER_TYPE_EQ,
+    )
+      .toUpperCase()
+      .trim();
+
+    // Safety: default to SL for derivatives if misconfigured
+    if (isDeriv && raw === "SL-M") return "SL";
+    if (raw === "SL" || raw === "SL-M") return raw;
+
+    // Fallbacks
+    return isDeriv ? "SL" : "SL-M";
+  }
+
+  _buildStopLossLimitPrice({ triggerPrice, exitSide, instrument }) {
+    const tick = Number(instrument?.tick_size || 0.05);
+    const trig = Number(triggerPrice);
+
+    const bps = Math.max(0, Number(env.SL_LIMIT_BUFFER_BPS || 50));
+    const ticks = Math.max(0, Number(env.SL_LIMIT_BUFFER_TICKS || 10));
+    const abs = Math.max(0, Number(env.SL_LIMIT_BUFFER_ABS || 0));
+    const maxBps = Math.max(0, Number(env.SL_LIMIT_BUFFER_MAX_BPS || 500));
+
+    let buf = 0;
+    if (Number.isFinite(trig) && trig > 0) buf = (trig * bps) / 10000;
+    if (Number.isFinite(tick) && tick > 0) buf = Math.max(buf, tick * ticks);
+    buf = Math.max(buf, abs);
+
+    // Cap buffer to avoid extreme limit prices
+    if (
+      Number.isFinite(trig) &&
+      trig > 0 &&
+      Number.isFinite(maxBps) &&
+      maxBps > 0
+    ) {
+      buf = Math.min(buf, (trig * maxBps) / 10000);
+    }
+
+    const side = String(exitSide || "SELL").toUpperCase();
+    let px = side === "SELL" ? trig - buf : trig + buf;
+
+    // Keep SL-L logically valid: SELL price <= trigger, BUY price >= trigger
+    if (side === "SELL") px = Math.min(px, trig);
+    else px = Math.max(px, trig);
+
+    // Round to tick (SELL down, BUY up) and keep positive
+    px = roundToTick(px, tick, side === "SELL" ? "down" : "up");
+    if (!Number.isFinite(px) || px <= 0)
+      px = Number.isFinite(tick) && tick > 0 ? tick : 0.05;
+
+    return px;
+  }
+
+  _isSlmBlockedError(msg) {
+    const s = String(msg || "").toLowerCase();
+    return (
+      s.includes("sl-m") &&
+      (s.includes("blocked") ||
+        s.includes("discontinued") ||
+        s.includes("not allowed") ||
+        s.includes("rejected"))
+    );
+  }
+
+  async init() {
+    await ensureTradeIndexes();
+    // Patch-6: load persisted cost calibration multipliers (if enabled)
+    try {
+      await costCalibrator.start();
+    } catch {}
+    await this._ensureDailyRisk();
+    await this._hydrateRiskFromDb();
+    await this._loadActiveTradeId();
+    await this._hydrateOpenPositionFromActiveTrade();
+  }
+
+  async _ensureDailyRisk() {
+    const key = todayKey();
+    const cur = await getDailyRisk(key);
+    if (!cur) {
+      await upsertDailyRisk(key, {
+        realizedPnl: 0,
+        kill: false,
+        reason: null,
+        ordersPlaced: 0,
+      });
+      return;
+    }
+    // Backfill newer fields
+    const patch = {};
+    if (cur.ordersPlaced == null) patch.ordersPlaced = 0;
+    if (Object.keys(patch).length) await upsertDailyRisk(key, patch);
+  }
+
+  async _hydrateRiskFromDb() {
+    const db = getDb();
+    const { start, end } = dayRange();
+
+    // Count trades today (excluding recovery records)
+    const tradesToday = await db.collection("trades").countDocuments({
+      createdAt: { $gte: start, $lt: end },
+      strategyId: { $ne: "recovery" },
+    });
+
+    this.risk.setTradesToday(tradesToday);
+
+    // Persisted kill-switch (if set earlier)
+    const dr = await getDailyRisk(todayKey());
+    if (dr?.kill) {
+      this.risk.setKillSwitch(true);
+    }
+    this.ordersPlacedToday = Number(dr?.ordersPlaced || 0);
+  }
+
+  async _recordOrdersPlaced(n = 1) {
+    const inc = Number(n || 0);
+    if (!Number.isFinite(inc) || inc <= 0) return;
+    this.ordersPlacedToday += inc;
+    await upsertDailyRisk(todayKey(), { ordersPlaced: this.ordersPlacedToday });
+  }
+
+  async _loadActiveTradeId() {
+    const actives = await getActiveTrades();
+    if (actives.length) {
+      const latest = actives.sort(
+        (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0),
+      )[0];
+      this.activeTradeId = latest.tradeId;
+      logger.warn(
+        { tradeId: latest.tradeId, status: latest.status },
+        "[reconcile] found active trade in DB",
+      );
+    }
+  }
+
+  async _hydrateOpenPositionFromActiveTrade() {
+    if (!this.activeTradeId) return;
+    const t = await getTrade(this.activeTradeId);
+    if (!t) return;
+    this.risk.setOpenPosition(Number(t.instrument_token), {
+      tradeId: t.tradeId,
+      side: t.side,
+      qty: Number(t.qty || 0),
+    });
+  }
+
+  onTick(tick) {
+    if (!tick?.instrument_token) return;
+    const token = Number(tick.instrument_token);
+    const ltp = Number(tick.last_price);
+    if (Number.isFinite(ltp)) this.lastPriceByToken.set(token, ltp);
+
+    const now = Date.now();
+
+    const lossEveryMs = Number(env.DAILY_LOSS_CHECK_MS || 2000);
+    if (
+      Number.isFinite(lossEveryMs) &&
+      lossEveryMs > 0 &&
+      now - this._lastDailyLossCheckAt >= lossEveryMs
+    ) {
+      this._lastDailyLossCheckAt = now;
+      this._checkDailyLoss().catch(() => {});
+    }
+
+    const flattenEveryMs = Number(env.FORCE_FLATTEN_CHECK_MS || 1000);
+    if (
+      Number.isFinite(flattenEveryMs) &&
+      flattenEveryMs > 0 &&
+      now - this._lastFlattenCheckAt >= flattenEveryMs
+    ) {
+      this._lastFlattenCheckAt = now;
+      this._forceFlattenIfNeeded().catch(() => {});
+    }
+  }
+
+  async _getLtp(token, instrument) {
+    const tok = Number(token);
+    const cached = this.lastPriceByToken.get(tok);
+    if (Number.isFinite(cached)) return cached;
+
+    const ex = instrument?.exchange || env.DEFAULT_EXCHANGE || "NSE";
+    const sym = instrument?.tradingsymbol;
+    if (!sym) return cached;
+
+    const key = `${String(ex).toUpperCase()}:${String(sym).toUpperCase()}`;
+    try {
+      if (typeof this.kite.getLTP === "function") {
+        const resp = await this.kite.getLTP([key]);
+        const ltp = Number(resp?.[key]?.last_price);
+        if (Number.isFinite(ltp)) {
+          this.lastPriceByToken.set(tok, ltp);
+          return ltp;
+        }
+      }
+      if (typeof this.kite.getQuote === "function") {
+        const resp = await this.kite.getQuote([key]);
+        const ltp = Number(resp?.[key]?.last_price);
+        if (Number.isFinite(ltp)) {
+          this.lastPriceByToken.set(tok, ltp);
+          return ltp;
+        }
+      }
+    } catch (e) {
+      logger.warn({ token: tok, key, e: e.message }, "[ltp] fetch failed");
+    }
+    return cached;
+  }
+
+  async _checkDailyLoss() {
+    if (!this.activeTradeId) return;
+    if (this.risk.getKillSwitch()) return;
+
+    const trade = await getTrade(this.activeTradeId);
+    if (!trade) return;
+    if (
+      ![STATUS.ENTRY_OPEN, STATUS.ENTRY_FILLED, STATUS.LIVE].includes(
+        trade.status,
+      )
+    )
+      return;
+
+    const token = Number(trade.instrument_token);
+    let ltp = this.lastPriceByToken.get(token);
+
+    // OPT mode can have sparse ticks right after entry; allow a throttled quote fetch
+    const allowFetch =
+      String(env.DAILY_LOSS_ALLOW_LTP_FETCH || "true") === "true";
+    if (!Number.isFinite(ltp) && allowFetch && Number.isFinite(token)) {
+      const now = Date.now();
+      const last = Number(this._lastLtpFetchAtByToken.get(token) || 0);
+      if (now - last >= 1500) {
+        this._lastLtpFetchAtByToken.set(token, now);
+        try {
+          const instrument = await ensureInstrument(this.kite, token);
+          ltp = await this._getLtp(token, instrument);
+        } catch (_) {
+          // ignore
+        }
+      }
+    }
+
+    if (!Number.isFinite(ltp)) return;
+
+    const openPnl = calcOpenPnl(trade, ltp);
+    const day = await getDailyRisk(todayKey());
+    const realized = Number(day?.realizedPnl || 0);
+    const total = realized + openPnl;
+
+    if (total <= -Number(env.DAILY_MAX_LOSS_INR || 1000)) {
+      logger.error(
+        { total, realized, openPnl },
+        "[risk] DAILY_MAX_LOSS hit -> kill switch",
+      );
+      alert("error", "🛑 DAILY_MAX_LOSS hit -> kill switch", {
+        total,
+        realized,
+        openPnl,
+      }).catch(() => {});
+      this.risk.setKillSwitch(true);
+      await upsertDailyRisk(todayKey(), {
+        kill: true,
+        reason: "DAILY_MAX_LOSS",
+        lastTotal: total,
+      });
+
+      if (String(env.AUTO_EXIT_ON_DAILY_LOSS) === "true") {
+        await this._panicExit(trade, "DAILY_MAX_LOSS");
+      }
+    }
+  }
+
+  async _forceFlattenIfNeeded() {
+    if (!this.activeTradeId) return;
+    if (this.risk.getKillSwitch()) return;
+
+    const tz = env.CANDLE_TZ || "Asia/Kolkata";
+    const now = DateTime.now().setZone(tz);
+    const flat = DateTime.fromFormat(env.FORCE_FLATTEN_AT || "15:15", "HH:mm", {
+      zone: tz,
+    });
+    if (!flat.isValid) return;
+
+    const flatToday = now.set({
+      hour: flat.hour,
+      minute: flat.minute,
+      second: 0,
+      millisecond: 0,
+    });
+    if (now < flatToday) return;
+
+    const trade = await getTrade(this.activeTradeId);
+    if (!trade) return;
+    if (
+      ![STATUS.ENTRY_OPEN, STATUS.ENTRY_FILLED, STATUS.LIVE].includes(
+        trade.status,
+      )
+    )
+      return;
+
+    logger.warn(
+      { tradeId: trade.tradeId },
+      "[time_guard] FORCE_FLATTEN triggered",
+    );
+    alert("warn", "⏰ FORCE_FLATTEN triggered (closing position)", {
+      tradeId: trade.tradeId,
+    }).catch(() => {});
+    this.risk.setKillSwitch(true);
+    await upsertDailyRisk(todayKey(), {
+      kill: true,
+      reason: "FORCE_FLATTEN",
+      lastTradeId: trade.tradeId,
+    });
+    await this._panicExit(trade, "FORCE_FLATTEN");
+  }
+
+  async _safePlaceOrder(variety, params, { purpose, tradeId } = {}) {
+    const maxAttempts = Math.max(1, Number(env.ORDER_PLACE_RETRY_MAX || 1));
+    const backoffMs = Math.max(
+      0,
+      Number(env.ORDER_PLACE_RETRY_BACKOFF_MS || 250),
+    );
+
+    const baseParams = { ...params };
+
+    // Market protection (ENFORCED by default for scalping)
+    const enforceMp =
+      String(env.ENFORCE_MARKET_PROTECTION || "true") === "true";
+    const ot = String(baseParams.order_type || "").toUpperCase();
+    if (enforceMp && (ot === "MARKET" || ot === "SL-M")) {
+      const mpRaw = env.MARKET_PROTECTION ?? "-1";
+      const n = Number(mpRaw);
+      if (Number.isFinite(n)) baseParams.market_protection = n;
+      else baseParams.market_protection = mpRaw;
+    }
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const rate = this.orderLimiter.check({ count: 1 });
+      if (!rate.ok) {
+        throw new Error(
+          `Order rate limit hit (${rate.reason}). Refusing to place order.`,
+        );
+      }
+      if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY || 3000)) {
+        this.risk.setKillSwitch(true);
+        await upsertDailyRisk(todayKey(), {
+          kill: true,
+          reason: "MAX_ORDERS_PER_DAY_REACHED",
+        });
+        throw new Error("MAX_ORDERS_PER_DAY reached; kill-switch enabled.");
+      }
+
+      try {
+        const resp = await this.kite.placeOrder(variety, baseParams);
+        const orderId = String(resp?.order_id || resp?.orderId || resp || "");
+        if (!orderId) throw new Error("placeOrder returned no order_id");
+
+        this.orderLimiter.record({ count: 1 });
+        await this._recordOrdersPlaced(1);
+
+        logger.info(
+          { tradeId, purpose, orderId, attempt },
+          "[orders] placed successfully",
+        );
+        return { orderId, resp };
+      } catch (e) {
+        const msg = String(e?.message || e);
+        const retryable = isRetryablePlaceError(e);
+
+        // If retryable, attempt dedupe by tag before retrying
+        if (retryable && attempt < maxAttempts) {
+          const tag = String(baseParams.tag || "");
+          if (tag) {
+            const found = await this._findRecentOrderByTag(tag, baseParams);
+            if (found?.order_id) {
+              const orderId = String(found.order_id);
+              logger.warn(
+                { tradeId, purpose, orderId, attempt, msg },
+                "[orders] place error but matching order exists; treating as success",
+              );
+              this.orderLimiter.record({ count: 1 });
+              await this._recordOrdersPlaced(1);
+              return { orderId, resp: { deduped: true, order_id: orderId } };
+            }
+          }
+
+          logger.warn(
+            { tradeId, purpose, attempt, msg },
+            "[orders] retryable place error; retrying",
+          );
+          await sleep(backoffMs * attempt);
+          continue;
+        }
+
+        // Non-retryable or attempts exhausted
+        throw e;
+      }
+    }
+
+    throw new Error("placeOrder failed after retries");
+  }
+
+  async _safeCancelOrder(variety, orderId, { purpose, tradeId } = {}) {
+    const oid = String(orderId || "");
+    if (!oid) throw new Error("cancelOrder missing orderId");
+
+    const rate = this.orderLimiter.check({ count: 1 });
+    if (!rate.ok) {
+      throw new Error(
+        `Order rate limit hit (${rate.reason}). Refusing to cancel order.`,
+      );
+    }
+
+    // ✅ enforce daily limit for cancel as well
+    if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY || 3000)) {
+      this.risk.setKillSwitch(true);
+      await upsertDailyRisk(todayKey(), {
+        kill: true,
+        reason: "MAX_ORDERS_PER_DAY_REACHED",
+      });
+      throw new Error("MAX_ORDERS_PER_DAY reached; kill-switch enabled.");
+    }
+
+    try {
+      const resp = await this.kite.cancelOrder(variety, oid);
+      this.orderLimiter.record({ count: 1 });
+      await this._recordOrdersPlaced(1);
+      logger.info({ tradeId, purpose, orderId: oid }, "[orders] cancelled");
+      return resp;
+    } catch (e) {
+      logger.error(
+        { tradeId, purpose, orderId: oid, e: e.message },
+        "[orders] cancel failed",
+      );
+      throw e;
+    }
+  }
+
+  async _safeModifyOrder(variety, orderId, patch, { purpose, tradeId } = {}) {
+    const oid = String(orderId || "");
+    if (!oid) throw new Error("modifyOrder missing orderId");
+
+    const rate = this.orderLimiter.check({ count: 1 });
+    if (!rate.ok) {
+      throw new Error(
+        `Order rate limit hit (${rate.reason}). Refusing to modify order.`,
+      );
+    }
+
+    // ✅ enforce daily limit for modify as well
+    if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY || 3000)) {
+      this.risk.setKillSwitch(true);
+      await upsertDailyRisk(todayKey(), {
+        kill: true,
+        reason: "MAX_ORDERS_PER_DAY_REACHED",
+      });
+      throw new Error("MAX_ORDERS_PER_DAY reached; kill-switch enabled.");
+    }
+
+    try {
+      const resp = await this.kite.modifyOrder(variety, oid, patch);
+      this.orderLimiter.record({ count: 1 });
+      await this._recordOrdersPlaced(1);
+      logger.info(
+        { tradeId, purpose, orderId: oid, patch },
+        "[orders] modified",
+      );
+      return resp;
+    } catch (e) {
+      logger.error(
+        { tradeId, purpose, orderId: oid, e: e.message },
+        "[orders] modify failed",
+      );
+      throw e;
+    }
+  }
+
+  async _findRecentOrderByTag(tag, params) {
+    try {
+      const orders = await this.kite.getOrders();
+      const now = Date.now();
+      const lookbackMs = Math.max(
+        1000,
+        Number(env.ORDER_DEDUP_LOOKBACK_SEC || 120) * 1000,
+      );
+
+      const want = normalizeOrderShapeForMatch(params);
+      const tagU = String(tag || "").trim();
+
+      for (const o of orders || []) {
+        if (String(o.tag || "").trim() !== tagU) continue;
+        const tsRaw = o.order_timestamp || o.exchange_timestamp || o.created_at;
+        const ts = tsRaw ? new Date(tsRaw).getTime() : NaN;
+        if (!Number.isFinite(ts) || now - ts > lookbackMs) continue;
+
+        const got = normalizeOrderShapeForMatch(o);
+        if (ordersMatch(want, got)) {
+          return o;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
+  async _replayOrphanUpdates(orderId) {
+    const oid = String(orderId || "");
+    if (!oid) return;
+    try {
+      const payloads = await popOrphanOrderUpdates(oid);
+      if (!payloads.length) return;
+      logger.warn(
+        { orderId: oid, count: payloads.length },
+        "[order_update] replaying orphan updates",
+      );
+      for (const p of payloads) {
+        const payload = p?.payload || p; // ✅ handle {payload} wrapper
+        try {
+          await this.onOrderUpdate(payload);
+        } catch (e) {
+          logger.warn({ orderId: oid, e: e.message }, "[orphan] replay failed");
+        }
+      }
+    } catch (e) {
+      logger.warn({ orderId: oid, e: e.message }, "[orphan] pop failed");
+    }
+  }
+
+  async _panicExit(trade, reason) {
+    const tradeId = trade?.tradeId;
+    try {
+      if (!tradeId) return;
+
+      // prevent repeated panic exits
+      const fresh = (await getTrade(tradeId)) || trade;
+      if (fresh?.panicExitOrderId) {
+        logger.warn(
+          { tradeId, panicExitOrderId: fresh.panicExitOrderId },
+          "[panic] already placed",
+        );
+        return;
+      }
+
+      if (isHalted()) {
+        logger.warn({ tradeId }, "[panic] skipped (halted)");
+        return;
+      }
+
+      // Best-effort: cancel any working orders (ENTRY/SL/TARGET) so they don't fill after we start panic exit
+      try {
+        const variety = String(env.DEFAULT_ORDER_VARIETY || "regular");
+        const toCancel = [
+          fresh.entryOrderId,
+          fresh.slOrderId,
+          fresh.targetOrderId,
+          fresh.tp1OrderId,
+          fresh.tp2OrderId,
+        ].filter(Boolean);
+
+        for (const oid of toCancel) {
+          try {
+            await this._safeCancelOrder(variety, oid, {
+              purpose: "PANIC_CANCEL",
+              tradeId,
+            });
+          } catch {}
+        }
+      } catch {}
+
+      // Use live net qty if possible to avoid over-exiting (which can flip the position)
+      let netQty = Number(fresh.qty || 0);
+      try {
+        const positions = await this.kite.getPositions();
+        const net = positions?.net || positions?.day || [];
+
+        // Build a quick lookup: instrument_token -> net quantity
+        const posQtyByToken = new Map();
+        for (const p of net || []) {
+          const tok = Number(p?.instrument_token);
+          if (!Number.isFinite(tok)) continue;
+          const q = Number(p?.quantity ?? p?.net_quantity ?? 0);
+          if (!Number.isFinite(q)) continue;
+          posQtyByToken.set(tok, q);
+        }
+
+        const token = Number(fresh.instrument_token);
+        const p = Array.isArray(net)
+          ? net.find((x) => Number(x.instrument_token) === token)
+          : null;
+        const q = Number(p?.quantity ?? p?.net_quantity ?? 0);
+        if (Number.isFinite(q)) netQty = q;
+      } catch {}
+
+      if (!Number.isFinite(netQty) || netQty === 0) {
+        // Nothing to exit -> close the trade record to unblock signals
+        await updateTrade(tradeId, {
+          status: STATUS.CLOSED,
+          closeReason: `PANIC_EXIT_SKIPPED_NO_POSITION | ${reason}`,
+          closedAt: new Date(),
+        });
+        await this._finalizeClosed(tradeId, Number(fresh.instrument_token));
+        return;
+      }
+
+      const instrument = fresh.instrument;
+      const exitSide = netQty > 0 ? "SELL" : "BUY";
+      const qty = Math.abs(netQty);
+
+      logger.warn(
+        { tradeId, reason, exitSide, qty },
+        "[panic] placing MARKET exit",
+      );
+      alert("warn", `🚨 PANIC EXIT: ${reason}`, { tradeId }).catch(() => {});
+
+      let exitOrderId = null;
+
+      // 1) Prefer MARKET for fastest exit, but it can be blocked for some F&O instruments
+      //    (e.g., illiquid contracts / stock options restrictions).
+      try {
+        const r = await this._safePlaceOrder(
+          env.DEFAULT_ORDER_VARIETY,
+          {
+            exchange: instrument.exchange,
+            tradingsymbol: instrument.tradingsymbol,
+            transaction_type: exitSide,
+            quantity: qty,
+            product: env.DEFAULT_PRODUCT,
+            order_type: "MARKET",
+            validity: "DAY",
+            tag: makeTag(tradeId, "PANIC_EXIT"),
+          },
+          { purpose: "PANIC_EXIT", tradeId },
+        );
+        exitOrderId = r?.orderId || null;
+      } catch (e) {
+        const msg = String(e?.message || e);
+        logger.error(
+          { tradeId, reason, exitSide, qty, e: msg },
+          "[panic] MARKET exit failed; attempting LIMIT fallback",
+        );
+
+        const allowFallback =
+          String(env.PANIC_EXIT_LIMIT_FALLBACK_ENABLED || "true") !== "false";
+
+        if (allowFallback) {
+          try {
+            const fb = await this._panicExitFallbackLimit({
+              tradeId,
+              instrument,
+              exitSide,
+              qty,
+              reason,
+              marketError: msg,
+            });
+            exitOrderId = fb?.orderId || null;
+          } catch (e2) {
+            logger.error(
+              { tradeId, reason, e: String(e2?.message || e2) },
+              "[panic] LIMIT fallback failed",
+            );
+          }
+        }
+
+        if (!exitOrderId) throw e;
+      }
+
+      if (exitOrderId) {
+        await updateTrade(tradeId, {
+          status: STATUS.GUARD_FAILED,
+          panicExitOrderId: exitOrderId,
+          panicExitPlacedAt: new Date(),
+          closeReason: `PANIC_EXIT_PLACED | ${reason}`,
+        });
+        await linkOrder({
+          order_id: exitOrderId,
+          tradeId,
+          role: "PANIC_EXIT",
+        });
+        await this._replayOrphanUpdates(exitOrderId);
+      }
+    } catch (e) {
+      logger.error({ tradeId, e: e.message }, "[panic] exit failed");
+    }
+  }
+
+  async _panicExitFallbackLimit({
+    tradeId,
+    instrument,
+    exitSide,
+    qty,
+    reason,
+    marketError,
+  }) {
+    if (!this.kite || typeof this.kite.getQuote !== "function") {
+      throw new Error("no_getQuote_for_panic_fallback");
+    }
+
+    const ex = instrument?.exchange || env.DEFAULT_EXCHANGE || "NSE";
+    const sym = instrument?.tradingsymbol;
+    const key = `${String(ex).toUpperCase()}:${String(sym).toUpperCase()}`;
+
+    const tick = Number(instrument?.tick_size || 0.05);
+    const bufTicks = Math.max(
+      1,
+      Number(env.PANIC_EXIT_LIMIT_BUFFER_TICKS || 2),
+    );
+    const maxBps = Math.max(50, Number(env.PANIC_EXIT_LIMIT_MAX_BPS || 250));
+
+    const resp = await this.kite.getQuote([key]);
+    const q = resp?.[key];
+    const bid = Number(q?.depth?.buy?.[0]?.price);
+    const ask = Number(q?.depth?.sell?.[0]?.price);
+    const ltp = Number(q?.last_price);
+
+    // Choose an aggressive LIMIT price that is very likely to execute immediately.
+    // SELL -> at/under bid; BUY -> at/over ask.
+    let pxBase = null;
+    if (exitSide === "SELL") {
+      if (Number.isFinite(bid) && bid > 0) pxBase = bid;
+      else if (Number.isFinite(ltp) && ltp > 0) pxBase = ltp;
+    } else {
+      if (Number.isFinite(ask) && ask > 0) pxBase = ask;
+      else if (Number.isFinite(ltp) && ltp > 0) pxBase = ltp;
+    }
+
+    if (!Number.isFinite(pxBase) || pxBase <= 0) {
+      throw new Error("panic_fallback_no_price");
+    }
+
+    // Apply buffer (cross the spread + a little extra).
+    const buf = bufTicks * tick;
+    let price = exitSide === "SELL" ? pxBase - buf : pxBase + buf;
+
+    // Guard against crazy prices (cap by maxBps vs base).
+    const cap = (pxBase * maxBps) / 10000;
+    if (exitSide === "SELL") price = Math.max(pxBase - cap, price);
+    else price = Math.min(pxBase + cap, price);
+
+    // Round to tick size.
+    price = roundToTick(price, tick);
+
+    logger.warn(
+      {
+        tradeId,
+        reason,
+        marketError,
+        exitSide,
+        qty,
+        bid,
+        ask,
+        ltp,
+        price,
+        tick,
+        bufTicks,
+      },
+      "[panic] LIMIT fallback placing",
+    );
+
+    alert("warn", `🚨 PANIC EXIT fallback (LIMIT): ${reason}`, {
+      tradeId,
+      marketError,
+    }).catch(() => {});
+
+    const { orderId } = await this._safePlaceOrder(
+      env.DEFAULT_ORDER_VARIETY,
+      {
+        exchange: instrument.exchange,
+        tradingsymbol: instrument.tradingsymbol,
+        transaction_type: exitSide,
+        quantity: qty,
+        product: env.DEFAULT_PRODUCT,
+        order_type: "LIMIT",
+        price,
+        validity: "DAY",
+        tag: makeTag(tradeId, "PANIC_EXIT"),
+      },
+      { purpose: "PANIC_EXIT_LIMIT_FALLBACK", tradeId },
+    );
+
+    return { ok: !!orderId, orderId, price };
+  }
+
+  /**
+   * Restart safety:
+   * - fetch open orders + positions
+   * - rebuild internal state
+   * - ensure we don't double-place trades after restart
+   *
+   * NOTE: If an open position exists but we can't map it to an active trade,
+   * we set kill-switch and create a "recovery" trade record (no new orders placed).
+   */
+  async reconcile(tokens = []) {
+    await this.init();
+
+    // 1) Read today's orders (used for mapping existing entry/sl/target)
+    const orders = await this.kite.getOrders();
+    const byId = new Map(
+      (orders || []).map((o) => [String(o.order_id || o.orderId), o]),
+    );
+
+    // 2) Read positions (net positions)
+    let positions = null;
+    try {
+      positions = await this.kite.getPositions();
+    } catch (e) {
+      logger.warn(
+        { e: e.message },
+        "[reconcile] getPositions failed (continuing with orders only)",
+      );
+    }
+
+    const net = positions?.net || positions?.day || [];
+
+    // Build a quick lookup: instrument_token -> net quantity
+    const posQtyByToken = new Map();
+    for (const p of net || []) {
+      const tok = Number(p?.instrument_token);
+      if (!Number.isFinite(tok)) continue;
+      const q = Number(p?.quantity ?? p?.net_quantity ?? 0);
+      if (!Number.isFinite(q)) continue;
+      posQtyByToken.set(tok, q);
+    }
+
+    // 3) Fetch active trades first
+    const actives = await getActiveTrades();
+
+    // 4) If broker shows open positions but we have no active trade in DB -> kill-switch (institutional safety)
+    // This is more robust than scanning only the configured "tokens" list.
+    if (!this.activeTradeId && Array.isArray(net) && actives.length === 0) {
+      const open = (net || []).filter((p) => {
+        const qty = Number(p?.quantity ?? p?.net_quantity ?? 0);
+        if (!Number.isFinite(qty) || qty === 0) return false;
+        if (p?.product)
+          return String(p.product) === String(env.DEFAULT_PRODUCT);
+        return true;
+      });
+
+      if (open.length) {
+        const p = open[0];
+        const token = Number(p?.instrument_token);
+        const qty = Number(p?.quantity ?? p?.net_quantity ?? 0);
+        if (!Number.isFinite(token) || !Number.isFinite(qty) || qty === 0) {
+          logger.error(
+            { p },
+            "[reconcile] open position found but token/qty invalid",
+          );
+        } else {
+          let instrument = null;
+          try {
+            instrument = await ensureInstrument(this.kite, token);
+          } catch (e) {
+            logger.warn(
+              { token, e: e?.message || String(e) },
+              "[reconcile] ensureInstrument failed",
+            );
+          }
+
+          // Entry order type and slippage guard thresholds (segment-aware)
+          const entryOrderType = String(
+            env.ENTRY_ORDER_TYPE || "MARKET",
+          ).toUpperCase();
+
+          const isOptContract =
+            String(instrument?.segment || "")
+              .toUpperCase()
+              .includes("-OPT") ||
+            ["CE", "PE", "OPT"].includes(
+              String(instrument?.instrument_type || "").toUpperCase(),
+            ) ||
+            /(?:CE|PE)$/.test(
+              String(instrument?.tradingsymbol || "").toUpperCase(),
+            ) ||
+            /(?:CE|PE)$/.test(String(p?.tradingsymbol || "").toUpperCase());
+
+          const maxEntrySlipBps = Number(
+            isOptContract
+              ? Number(env.MAX_ENTRY_SLIPPAGE_BPS_OPT || 120)
+              : Number(env.MAX_ENTRY_SLIPPAGE_BPS || 25),
+          );
+          const maxEntrySlipKillBps = Number(
+            isOptContract
+              ? Number(env.MAX_ENTRY_SLIPPAGE_KILL_BPS_OPT || 250)
+              : Number(env.MAX_ENTRY_SLIPPAGE_KILL_BPS || 60),
+          );
+
+          const tradeId = crypto.randomUUID();
+          const side = qty > 0 ? "BUY" : "SELL";
+          const avg = Number(
+            p?.average_price || p?.buy_price || p?.sell_price || 0,
+          );
+
+          this.recoveredPosition = {
+            instrument_token: token,
+            exchange: instrument?.exchange || String(p?.exchange || ""),
+            tradingsymbol:
+              instrument?.tradingsymbol || String(p?.tradingsymbol || ""),
+            qty,
+            avgPrice: avg,
+            openPositionsCount: open.length,
+          };
+
+          logger.error(
+            { ...this.recoveredPosition },
+            "[reconcile] OPEN POSITION FOUND without active trade. Kill-switch enabled; manual recovery needed.",
+          );
+          alert(
+            "error",
+            "🛑 OPEN POSITION FOUND without active trade (manual recovery needed)",
+            this.recoveredPosition,
+          ).catch(() => {});
+
+          this.risk.setKillSwitch(true);
+          this.risk.setOpenPosition(token, {
+            tradeId,
+            side,
+            qty: Math.abs(qty),
+          });
+          this.activeTradeId = tradeId;
+
+          await insertTrade({
+            tradeId,
+            instrument_token: token,
+            instrument,
+            strategyId: "recovery",
+            side,
+            qty: Math.abs(qty),
+            candle: null,
+            stopLoss: null,
+            rr: null,
+            status: STATUS.GUARD_FAILED,
+            entryOrderId: null,
+            slOrderId: null,
+            targetOrderId: null,
+            entryPrice: avg || null,
+            exitPrice: null,
+            closeReason: "RECOVERY_REQUIRED_OPEN_POSITION",
+          });
+          await upsertDailyRisk(todayKey(), {
+            kill: true,
+            reason: "RECOVERY_REQUIRED_OPEN_POSITION",
+            lastTradeId: tradeId,
+          });
+        }
+      }
+    }
+
+    // 5) Normal reconciliation for active trades from DB
+    for (const t of actives) {
+      await this._reconcileTrade(t, byId, posQtyByToken);
+    }
+  }
+
+  async _reconcileTrade(trade, byId, posQtyByToken) {
+    const tradeId = trade.tradeId;
+    const token = Number(trade.instrument_token);
+    const hasPosInfo = posQtyByToken instanceof Map;
+    const netQty = hasPosInfo ? Number(posQtyByToken.get(token) || 0) : null;
+
+    const panic = trade.panicExitOrderId
+      ? byId.get(String(trade.panicExitOrderId))
+      : null;
+    const entry = trade.entryOrderId
+      ? byId.get(String(trade.entryOrderId))
+      : null;
+    const sl = trade.slOrderId ? byId.get(String(trade.slOrderId)) : null;
+    const tgt = trade.targetOrderId
+      ? byId.get(String(trade.targetOrderId))
+      : null;
+    const tp1 = trade.tp1OrderId ? byId.get(String(trade.tp1OrderId)) : null;
+
+    // If broker shows NO position but trade thinks it's live/filled, someone manually exited
+    // (or RMS square-off happened). Treat as a critical safety event: kill-switch + close trade.
+    if (
+      hasPosInfo &&
+      netQty === 0 &&
+      [STATUS.ENTRY_FILLED, STATUS.LIVE, STATUS.GUARD_FAILED].includes(
+        trade.status,
+      )
+    ) {
+      logger.error(
+        { tradeId, token, status: trade.status },
+        "[reconcile] broker position flat while trade is active (manual exit / RMS?)",
+      );
+      alert(
+        "error",
+        "🛑 Broker position is flat but trade is active -> kill-switch",
+        {
+          tradeId,
+          token,
+          status: trade.status,
+        },
+      ).catch(() => {});
+      this.risk.setKillSwitch(true);
+      await upsertDailyRisk(todayKey(), {
+        kill: true,
+        reason: "BROKER_POSITION_FLAT_MANUAL_EXIT",
+        lastTradeId: tradeId,
+      });
+
+      // Best-effort cancel any remaining legs
+      for (const [role, oid] of [
+        ["ENTRY", trade.entryOrderId],
+        ["SL", trade.slOrderId],
+        ["TP1", trade.tp1OrderId],
+        ["TARGET", trade.targetOrderId],
+        ["PANIC_EXIT", trade.panicExitOrderId],
+      ]) {
+        if (!oid) continue;
+        try {
+          const o = byId.get(String(oid));
+          const st = String(o?.status || "").toUpperCase();
+          if (st === "COMPLETE" || isDead(st)) continue;
+          this.expectedCancelOrderIds.add(String(oid));
+          await this._safeCancelOrder(env.DEFAULT_ORDER_VARIETY, oid, {
+            purpose: `CANCEL_${role}_ON_FLAT`,
+            tradeId,
+          });
+        } catch {}
+      }
+
+      await updateTrade(tradeId, {
+        status: STATUS.CLOSED,
+        closeReason: "BROKER_POSITION_FLAT_MANUAL_EXIT",
+        closedAt: new Date(),
+      });
+      await this._finalizeClosed(tradeId, token);
+      return;
+    }
+
+    // If we are in GUARD_FAILED, keep reconciling PANIC exit order after restarts.
+    if (trade.status === STATUS.GUARD_FAILED) {
+      if (panic) {
+        const ps = String(panic.status || "").toUpperCase();
+        if (ps === "COMPLETE") {
+          const exitPrice = Number(panic.average_price || panic.price || 0);
+          await updateTrade(tradeId, {
+            status: STATUS.CLOSED,
+            exitPrice: exitPrice > 0 ? exitPrice : trade.exitPrice,
+            closeReason:
+              (trade.closeReason || "GUARD_FAILED") + " | PANIC_FILLED",
+            closedAt: new Date(),
+          });
+          await this._bookRealizedPnl(tradeId);
+          await this._finalizeClosed(tradeId, token);
+          return;
+        }
+
+        if (isDead(ps)) {
+          logger.error(
+            { tradeId, token, status: ps },
+            "[reconcile] PANIC_EXIT order is dead while in GUARD_FAILED",
+          );
+          // keep kill-switch; operator must intervene
+          return;
+        }
+
+        // OPEN / TRIGGER PENDING / PARTIAL etc -> wait for updates
+        return;
+      }
+
+      // No panic order id; if position still exists, try again
+      if (hasPosInfo && netQty !== 0) {
+        await this._panicExit(trade, "RECONCILE_GUARD_FAILED");
+      }
+      return;
+    }
+
+    // If ENTRY got rejected/cancelled/lapsed while we were offline (or we missed order_update),
+    // close the trade so we don't keep treating it as "active" after restart.
+    if ([STATUS.ENTRY_PLACED, STATUS.ENTRY_OPEN].includes(trade.status)) {
+      if (!trade.entryOrderId) {
+        await updateTrade(tradeId, {
+          status: STATUS.ENTRY_FAILED,
+          closeReason: "ENTRY_ORDER_ID_MISSING_ON_RESTART",
+        });
+        await this._finalizeClosed(tradeId, trade.instrument_token);
+        return;
+      }
+
+      let entryStatus = entry?.status;
+      let entryMsg = entry?.status_message_raw || entry?.status_message || null;
+
+      // Sometimes getOrders() may not include a just-rejected order; try history as fallback.
+      if (!entryStatus && typeof this.kite.getOrderHistory === "function") {
+        try {
+          const hist = await this.kite.getOrderHistory(trade.entryOrderId);
+          const last = Array.isArray(hist) ? hist[hist.length - 1] : null;
+          entryStatus = last?.status;
+          entryMsg =
+            last?.status_message_raw || last?.status_message || entryMsg;
+        } catch {
+          // ignore
+        }
+      }
+
+      if (entryStatus && isDead(entryStatus)) {
+        await updateTrade(tradeId, {
+          status: STATUS.ENTRY_FAILED,
+          closeReason: `ENTRY_${String(entryStatus).toUpperCase()}${
+            entryMsg ? " | " + String(entryMsg) : ""
+          }`,
+        });
+        await this._finalizeClosed(tradeId, trade.instrument_token);
+        return;
+      }
+      // If ENTRY is partially filled (or OPEN with partial fills) while we were offline,
+      // place/adjust protective exits for the filled quantity.
+      const es = String(entryStatus || "").toUpperCase();
+      const filledNow = Number(entry?.filled_quantity || 0);
+      if ((es === "PARTIAL" || es === "OPEN") && filledNow > 0) {
+        const avgNow = Number(
+          entry?.average_price || trade.entryPrice || trade.candle?.close,
+        );
+
+        const missingExits = !trade.slOrderId || !trade.targetOrderId;
+        const qtyChanged = filledNow !== Number(trade.qty || 0);
+
+        if (qtyChanged || missingExits) {
+          await updateTrade(tradeId, {
+            status: STATUS.ENTRY_OPEN,
+            entryPrice:
+              Number.isFinite(avgNow) && avgNow > 0 ? avgNow : trade.entryPrice,
+            qty: filledNow,
+          });
+
+          await this._placeExitsIfMissing({
+            ...trade,
+            entryPrice:
+              Number.isFinite(avgNow) && avgNow > 0 ? avgNow : trade.entryPrice,
+            qty: filledNow,
+          });
+
+          await this._ensureExitQty(tradeId, filledNow);
+        }
+
+        return;
+      }
+    }
+
+    // Entry filled but exits missing -> place exits
+    if (
+      entry &&
+      String(entry.status).toUpperCase() === "COMPLETE" &&
+      trade.status !== STATUS.LIVE
+    ) {
+      const avg = Number(
+        entry.average_price || trade.entryPrice || trade.candle?.close,
+      );
+      const filledQty = Number(entry.filled_quantity || trade.qty);
+      await updateTrade(tradeId, {
+        status: STATUS.ENTRY_FILLED,
+        entryPrice: avg,
+        qty: filledQty,
+      });
+      await this._placeExitsIfMissing({
+        ...trade,
+        entryPrice: avg,
+        qty: filledQty,
+      });
+      await this._ensureExitQty(tradeId, filledQty);
+      return;
+    }
+
+    // TP1 filled -> transition to runner stage (scale-out)
+    if (
+      tp1 &&
+      String(tp1.status).toUpperCase() === "COMPLETE" &&
+      !trade.tp1Done
+    ) {
+      await this._onTp1Filled(tradeId, trade, tp1);
+      return;
+    }
+
+    // TP1 dead -> abort scale-out and fallback to a single TARGET (SL still protects)
+    if (
+      tp1 &&
+      isDead(tp1.status) &&
+      String(tp1.status).toUpperCase() !== "COMPLETE" &&
+      !trade.tp1Done
+    ) {
+      await updateTrade(tradeId, {
+        tp1Aborted: true,
+        tp1DeadReason: "TP1_" + String(tp1.status).toUpperCase(),
+      });
+      if (!trade.targetOrderId) {
+        try {
+          await this._placeTargetOnly(trade);
+        } catch {}
+      }
+      return;
+    }
+
+    // One leg filled -> OCO cancel other and close
+    if (tgt && String(tgt.status).toUpperCase() === "COMPLETE") {
+      await this._onTargetFilled(tradeId, trade, tgt);
+      return;
+    }
+    if (sl && String(sl.status).toUpperCase() === "COMPLETE") {
+      await this._onSlFilled(tradeId, trade, sl);
+      return;
+    }
+
+    if (trade.status === STATUS.LIVE) {
+      // SL dead => immediate guard fail + panic
+      if (
+        sl &&
+        isDead(sl.status) &&
+        String(sl.status).toUpperCase() !== "COMPLETE"
+      ) {
+        await this._guardFail(trade, "SL_" + String(sl.status).toUpperCase());
+        return;
+      }
+
+      // TARGET dead => replace (do NOT panic; SL remains protection)
+      if (
+        tgt &&
+        isDead(tgt.status) &&
+        String(tgt.status).toUpperCase() !== "COMPLETE"
+      ) {
+        await this._handleDeadTarget(trade, tgt, "reconcile");
+        return;
+      }
+
+      // If exits missing (rare), place them
+      if (!trade.slOrderId || !trade.targetOrderId) {
+        await this._placeExitsIfMissing(trade);
+      }
+
+      // Dynamic trailing SL / target adjustments (throttled)
+      await this._maybeDynamicAdjustExits(trade, byId);
+    }
+  }
+
+  async _maybeDynamicAdjustExits(trade, byId) {
+    if (String(env.DYNAMIC_EXITS_ENABLED) !== "true") return;
+    if (!trade || trade.status !== STATUS.LIVE) return;
+    if (!trade.slOrderId && !trade.targetOrderId) return;
+
+    const tradeId = trade.tradeId;
+    const scaleOutEnabled = this._scaleOutEligible(trade);
+    const keepTp2Resting =
+      scaleOutEnabled &&
+      trade.tp1Done &&
+      String(env.RUNNER_KEEP_TP2_RESTING) === "true";
+    if (
+      scaleOutEnabled &&
+      String(env.DYNAMIC_EXITS_AFTER_TP1_ONLY) === "true" &&
+      !trade.tp1Done
+    )
+      return;
+    const minMs = Number(env.DYNAMIC_EXIT_MIN_INTERVAL_MS || 5000);
+    const last = Number(this._dynExitLastAt.get(tradeId) || 0);
+    const now = Date.now();
+    if (now - last < minMs) return;
+
+    // Need a live price + candles for ATR trail
+    const token = Number(trade.instrument_token);
+    const ltp = await this._getLtp(token, trade.instrument);
+    if (!Number.isFinite(ltp) || ltp <= 0) return;
+
+    const intervalMin = Number(
+      trade.intervalMin || trade.candle?.interval_min || 1,
+    );
+    let candles = [];
+    try {
+      candles = await getRecentCandles(token, intervalMin, 260);
+    } catch {
+      candles = [];
+    }
+    // For OPT trades we may not have full candle history immediately; exit model can fall back.
+    let underlyingLtp = null;
+    const uTok = Number(trade.underlying_token || 0);
+    if (Number.isFinite(uTok) && uTok > 0 && uTok !== token) {
+      const cachedU = this.lastPriceByToken.get(uTok);
+      if (Number.isFinite(cachedU)) underlyingLtp = cachedU;
+
+      const allowFetch =
+        String(env.OPT_DYN_EXIT_ALLOW_UNDERLYING_LTP_FETCH || "false") ===
+        "true";
+      if (!Number.isFinite(underlyingLtp) && allowFetch) {
+        const lastFetch = Number(this._lastLtpFetchAtByToken.get(uTok) || 0);
+        if (now - lastFetch >= 2500) {
+          this._lastLtpFetchAtByToken.set(uTok, now);
+          try {
+            const instU = await ensureInstrument(this.kite, uTok);
+            const ul = await this._getLtp(uTok, instU);
+            if (Number.isFinite(ul)) underlyingLtp = ul;
+          } catch {}
+        }
+      }
+    }
+
+    const plan = computeDynamicExitPlan({
+      trade,
+      ltp,
+      candles,
+      nowTs: now,
+      env,
+      underlyingLtp: Number.isFinite(underlyingLtp) ? underlyingLtp : null,
+    });
+    if (!plan?.ok) return;
+
+    if (plan?.action?.exitNow) {
+      await this._panicExit(trade, plan.action.reason || "DYN_EXIT_ACTION");
+      this._dynExitLastAt.set(tradeId, now);
+      return;
+    }
+
+    let did = false;
+
+    // ---- SL trail (SL / SL-M) ----
+    if (plan.sl?.stopLoss && trade.slOrderId) {
+      const sl = byId?.get(String(trade.slOrderId));
+      const slStatus = String(sl?.status || "").toUpperCase();
+      const slType = String(sl?.order_type || "").toUpperCase();
+
+      // Only modify while it's pending/open.
+      if (slStatus === "TRIGGER PENDING" || slStatus === "OPEN") {
+        const slSide = trade.side === "BUY" ? "SELL" : "BUY";
+
+        const patch = { trigger_price: plan.sl.stopLoss };
+        if (slType === "SL") {
+          patch.price = this._buildStopLossLimitPrice({
+            triggerPrice: plan.sl.stopLoss,
+            exitSide: slSide,
+            instrument: trade.instrument,
+          });
+        }
+
+        try {
+          await this._safeModifyOrder(
+            env.DEFAULT_ORDER_VARIETY,
+            trade.slOrderId,
+            patch,
+            { purpose: "DYN_TRAIL_SL", tradeId },
+          );
+          await updateTrade(tradeId, { stopLoss: plan.sl.stopLoss });
+          did = true;
+          logger.info(
+            { tradeId, stopLoss: plan.sl.stopLoss, meta: plan.meta },
+            "[dyn_exit] SL trailed",
+          );
+        } catch (e) {
+          logger.warn(
+            { tradeId, e: e.message, stopLoss: plan.sl.stopLoss },
+            "[dyn_exit] SL modify failed",
+          );
+        }
+      }
+    }
+
+    // ---- TARGET adjust (LIMIT) ----
+    if (!keepTp2Resting && plan.target?.targetPrice && trade.targetOrderId) {
+      const tgt = byId?.get(String(trade.targetOrderId));
+      const tgtStatus = String(tgt?.status || "").toUpperCase();
+      const tgtType = String(tgt?.order_type || "").toUpperCase();
+      // Only modify an open LIMIT target (market targets can't be modified meaningfully)
+      if (tgtStatus === "OPEN" && (tgtType === "LIMIT" || tgtType === "LM")) {
+        try {
+          await this._safeModifyOrder(
+            env.DEFAULT_ORDER_VARIETY,
+            trade.targetOrderId,
+            { price: plan.target.targetPrice },
+            { purpose: "DYN_ADJUST_TARGET", tradeId },
+          );
+          await updateTrade(tradeId, { targetPrice: plan.target.targetPrice });
+          did = true;
+          logger.info(
+            { tradeId, targetPrice: plan.target.targetPrice, meta: plan.meta },
+            "[dyn_exit] TARGET adjusted",
+          );
+        } catch (e) {
+          logger.warn(
+            { tradeId, e: e.message, targetPrice: plan.target.targetPrice },
+            "[dyn_exit] TARGET modify failed",
+          );
+        }
+      }
+    }
+
+    if (did) this._dynExitLastAt.set(tradeId, now);
+  }
+
+  async _watchEntryUntilDone(tradeId, entryOrderId) {
+    const pollMs = Number(env.ENTRY_WATCH_POLL_MS || 1000);
+    const maxMs = Number(env.ENTRY_WATCH_MS || 30000);
+    const deadline = Date.now() + maxMs;
+
+    while (Date.now() < deadline) {
+      const t = await getTrade(tradeId);
+      if (!t) return;
+
+      // already progressed
+      if (
+        [
+          STATUS.LIVE,
+          STATUS.EXITED_TARGET,
+          STATUS.EXITED_SL,
+          STATUS.ENTRY_FAILED,
+          STATUS.CLOSED,
+          STATUS.GUARD_FAILED,
+        ].includes(t.status)
+      ) {
+        return;
+      }
+
+      let status = null;
+      let avg = null;
+      let filledQty = null;
+      let msg = null;
+
+      // Prefer order history (more reliable)
+      if (typeof this.kite.getOrderHistory === "function") {
+        try {
+          const hist = await this.kite.getOrderHistory(entryOrderId);
+          const last = Array.isArray(hist) ? hist[hist.length - 1] : null;
+          status = last?.status;
+          avg = last?.average_price;
+          filledQty = last?.filled_quantity;
+          msg = last?.status_message_raw || last?.status_message || null;
+        } catch {
+          // ignore and try getOrders fallback
+        }
+      }
+
+      if (!status) {
+        try {
+          const orders = await this.kite.getOrders();
+          const o = (orders || []).find(
+            (x) => String(x.order_id || x.orderId) === String(entryOrderId),
+          );
+          status = o?.status;
+          avg = o?.average_price;
+          filledQty = o?.filled_quantity;
+          msg = o?.status_message_raw || o?.status_message || null;
+        } catch {
+          // ignore
+        }
+      }
+
+      status = String(status || "").toUpperCase();
+
+      if (status === "COMPLETE") {
+        const avgPx = Number(avg || t.entryPrice || t.candle?.close);
+        const qty = Number(filledQty || t.qty);
+
+        await updateTrade(tradeId, {
+          status: STATUS.ENTRY_FILLED,
+          entryPrice: avgPx,
+          qty,
+        });
+
+        await this._placeExitsIfMissing({
+          ...t,
+          entryPrice: avgPx,
+          qty,
+        });
+
+        return;
+      }
+
+      if (isDead(status)) {
+        await updateTrade(tradeId, {
+          status: STATUS.ENTRY_FAILED,
+          closeReason: `ENTRY_${status}${msg ? " | " + msg : ""}`,
+        });
+        await this._finalizeClosed(tradeId, t.instrument_token);
+        return;
+      }
+
+      await sleep(pollMs);
+    }
+
+    // -------- timeout handling --------
+
+    // If entry is still alive after watch window, cancel it to avoid a stale fill later.
+
+    // This is especially important for LIMIT entries.
+
+    const tFinal = await getTrade(tradeId);
+
+    if (!tFinal) return;
+
+    // already progressed in between
+
+    if (
+      [
+        STATUS.LIVE,
+
+        STATUS.EXITED_TARGET,
+
+        STATUS.EXITED_SL,
+
+        STATUS.ENTRY_FILLED,
+
+        STATUS.ENTRY_FAILED,
+
+        STATUS.GUARD_FAILED,
+
+        STATUS.CLOSED,
+      ].includes(tFinal.status)
+    ) {
+      return;
+    }
+
+    let status = null;
+
+    let avg = null;
+
+    let filledQty = null;
+
+    let msg = null;
+
+    // Try order history first (more reliable than getOrders for old/rejected orders)
+
+    if (typeof this.kite.getOrderHistory === "function") {
+      try {
+        const hist = await this.kite.getOrderHistory(entryOrderId);
+
+        const last = Array.isArray(hist) ? hist[hist.length - 1] : null;
+
+        status = last?.status;
+
+        avg = last?.average_price;
+
+        filledQty = last?.filled_quantity;
+
+        msg = last?.status_message_raw || last?.status_message || null;
+      } catch {
+        // ignore
+      }
+    }
+
+    if (!status) {
+      try {
+        const orders = await this.kite.getOrders();
+
+        const o = (orders || []).find(
+          (x) => String(x.order_id || x.orderId) === String(entryOrderId),
+        );
+
+        status = o?.status;
+
+        avg = o?.average_price;
+
+        filledQty = o?.filled_quantity;
+
+        msg = o?.status_message_raw || o?.status_message || null;
+      } catch {
+        // ignore
+      }
+    }
+
+    status = String(status || "").toUpperCase();
+
+    if (status === "COMPLETE") {
+      const avgPx = Number(avg) || Number(tFinal.expectedEntryPrice) || 0;
+
+      const qty = Number(filledQty || tFinal.qty || 0);
+
+      await updateTrade(tradeId, {
+        status: STATUS.ENTRY_FILLED,
+
+        entryPrice: avgPx,
+
+        qty,
+      });
+
+      await this._placeExitsIfMissing({
+        ...tFinal,
+
+        entryPrice: avgPx,
+
+        qty,
+      });
+
+      return;
+    }
+
+    if (isDead(status)) {
+      await updateTrade(tradeId, {
+        status: STATUS.ENTRY_FAILED,
+
+        closeReason: `ENTRY_${status}${msg ? " | " + String(msg) : ""}`,
+      });
+
+      await this._finalizeClosed(tradeId, tFinal.instrument_token);
+
+      return;
+    }
+
+    const cancelOnTimeout =
+      String(env.CANCEL_ENTRY_ON_TIMEOUT || "true") === "true";
+
+    if (cancelOnTimeout) {
+      try {
+        await this._safeCancelOrder(
+          env.DEFAULT_ORDER_VARIETY || "regular",
+          entryOrderId,
+          {
+            purpose: "ENTRY_TIMEOUT",
+
+            tradeId,
+          },
+        );
+
+        await updateTrade(tradeId, {
+          status: STATUS.ENTRY_FAILED,
+
+          closeReason: "ENTRY_TIMEOUT_CANCELLED",
+        });
+
+        await this._finalizeClosed(tradeId, tFinal.instrument_token);
+
+        return;
+      } catch (e) {
+        logger.error(
+          { tradeId, entryOrderId, e: e.message },
+
+          "[entry_watch] timeout cancel failed; will rely on reconcile()",
+        );
+      }
+    }
+
+    logger.warn(
+      { tradeId, entryOrderId, status },
+
+      "[entry_watch] timeout waiting for fill; will rely on reconcile()",
+    );
+  }
+
+  async _watchExitLeg(tradeId, orderId, role) {
+    const oid = String(orderId || "");
+    if (!oid) return;
+
+    const pollMs = Number(env.EXIT_WATCH_POLL_MS || 1000);
+    const maxMs = Number(env.EXIT_WATCH_MS || 20000);
+    const deadline = Date.now() + maxMs;
+
+    while (Date.now() < deadline) {
+      const t = await getTrade(tradeId);
+      if (!t) return;
+
+      if (
+        [
+          STATUS.EXITED_TARGET,
+          STATUS.EXITED_SL,
+          STATUS.ENTRY_FAILED,
+          STATUS.GUARD_FAILED,
+          STATUS.CLOSED,
+        ].includes(t.status)
+      ) {
+        return;
+      }
+
+      let status = null;
+      let last = null;
+
+      if (typeof this.kite.getOrderHistory === "function") {
+        try {
+          const hist = await this.kite.getOrderHistory(oid);
+          last = Array.isArray(hist) ? hist[hist.length - 1] : null;
+          status = String(last?.status || "").toUpperCase();
+          if (last) await this.onOrderUpdate(last);
+        } catch {
+          // ignore
+        }
+      }
+
+      status = String(status || "").toUpperCase();
+      if (status === "COMPLETE") return;
+
+      if (isDead(status)) {
+        // onOrderUpdate should handle the required reactions.
+        return;
+      }
+
+      await sleep(pollMs);
+    }
+
+    logger.warn({ tradeId, orderId: oid, role }, "[exit_watch] timeout");
+  }
+
+  _defaultNoTradeWindows() {
+    // Recommended for scalping
+    return "09:15-09:25,15:20-15:30";
+  }
+
+  _isBlockedByNoTradeWindow() {
+    const tz = env.CANDLE_TZ || "Asia/Kolkata";
+    const now = DateTime.now().setZone(tz);
+    const ranges =
+      String(env.NO_TRADE_WINDOWS || "").trim() ||
+      this._defaultNoTradeWindows();
+
+    const windows = parseTimeWindows(ranges);
+    return isWithinAnyWindow(now, windows);
+  }
+  async _spreadCheck(instrument, opts = {}) {
+    const sampleOnly = !!opts.sampleOnly;
+    const allowWhenDisabled = !!opts.allowWhenDisabled;
+
+    const enabled = String(env.ENABLE_SPREAD_FILTER) === "true";
+    if (!enabled && !(sampleOnly && allowWhenDisabled)) return { ok: true };
+
+    if (typeof this.kite.getQuote !== "function") {
+      return { ok: true, note: "no_getQuote" };
+    }
+
+    const ex = instrument.exchange || env.DEFAULT_EXCHANGE || "NSE";
+    const sym = instrument.tradingsymbol;
+    const key = `${String(ex).toUpperCase()}:${String(sym).toUpperCase()}`;
+
+    try {
+      const resp = await this.kite.getQuote([key]);
+      const q = resp?.[key];
+      const bid = Number(q?.depth?.buy?.[0]?.price);
+      const ask = Number(q?.depth?.sell?.[0]?.price);
+      const ltp = Number(q?.last_price);
+      if (
+        !Number.isFinite(bid) ||
+        !Number.isFinite(ask) ||
+        bid <= 0 ||
+        ask <= 0
+      ) {
+        return { ok: true, note: "no_depth" };
+      }
+      const mid = (bid + ask) / 2;
+      const bps = ((ask - bid) / mid) * 10000;
+      const maxBps = Number.isFinite(Number(opts.maxBps))
+        ? Number(opts.maxBps)
+        : this._getMaxSpreadBps(instrument);
+
+      if (!sampleOnly && enabled && bps > maxBps) {
+        return {
+          ok: false,
+          reason: `SPREAD_TOO_WIDE (${bps.toFixed(1)} bps > ${maxBps})`,
+          meta: { bid, ask, ltp, bps },
+        };
+      }
+
+      return {
+        ok: true,
+        meta: { bid, ask, ltp, bps },
+        note: bps > maxBps ? "spread_wide_sample" : null,
+      };
+    } catch (e) {
+      logger.warn(
+        { e: e.message },
+        "[filters] spread check failed; allowing trade",
+      );
+      return { ok: true, note: "quote_error" };
+    }
+  }
+
+  async _expectedMoveModel({ token, baseIntervalMin, atrPeriod, closeHint }) {
+    const atrMult = Number(env.EXPECTED_MOVE_ATR_MULT || 0.5);
+    const horizonMin = Number(env.EXPECTED_MOVE_HORIZON_MIN || 15);
+
+    // Prefer computing ATR on a realistic horizon interval if it exists; else fall back.
+    const refIntervals = String(env.EXPECTED_MOVE_REF_INTERVALS || "15,5,3,1")
+      .split(",")
+      .map((s) => Number(String(s).trim()))
+      .filter((n) => Number.isFinite(n) && n > 0);
+
+    const candidates = [];
+    const pushUnique = (n) => {
+      const v = Number(n);
+      if (!Number.isFinite(v) || v <= 0) return;
+      if (!candidates.includes(v)) candidates.push(v);
+    };
+
+    pushUnique(horizonMin);
+    for (const n of refIntervals) pushUnique(n);
+    pushUnique(baseIntervalMin);
+
+    const limit = Math.max(60, Number(env.ATR_LOOKBACK_LIMIT || 200));
+    let usedIntervalMin = null;
+    let atr = null;
+    let usedLen = null;
+
+    for (const iv of candidates) {
+      try {
+        const cs = await getRecentCandles(token, iv, limit);
+        if (!cs || cs.length < Math.max(atrPeriod + 5, 30)) continue;
+        const a = atrLast(cs, atrPeriod);
+        if (!Number.isFinite(a) || a <= 0) continue;
+        usedIntervalMin = iv;
+        atr = a;
+        usedLen = cs.length;
+        break;
+      } catch {}
+    }
+
+    // Hard fallback to base interval candle ATR if everything failed
+    if (!Number.isFinite(atr)) {
+      try {
+        const cs = await getRecentCandles(token, baseIntervalMin, limit);
+        if (cs && cs.length) {
+          const a = atrLast(cs, atrPeriod);
+          if (Number.isFinite(a) && a > 0) {
+            usedIntervalMin = baseIntervalMin;
+            atr = a;
+            usedLen = cs.length;
+          }
+        }
+      } catch {}
+    }
+
+    let scaleFactor = 1;
+    const scaleMode = String(
+      env.EXPECTED_MOVE_SCALE_MODE || "SQRT_TIME",
+    ).toUpperCase();
+    if (
+      scaleMode !== "NONE" &&
+      Number.isFinite(usedIntervalMin) &&
+      usedIntervalMin > 0 &&
+      Number.isFinite(horizonMin) &&
+      horizonMin > 0 &&
+      usedIntervalMin !== horizonMin
+    ) {
+      // volatility ~ sqrt(time) scaling
+      scaleFactor = Math.sqrt(horizonMin / usedIntervalMin);
+    }
+
+    const expectedMovePerShare =
+      Number.isFinite(atr) && atr > 0 ? atr * atrMult * scaleFactor : null;
+
+    return {
+      expectedMovePerShare,
+      meta: {
+        horizonMin,
+        atrPeriod,
+        atrMult,
+        baseIntervalMin: Number(baseIntervalMin),
+        usedIntervalMin,
+        usedLen,
+        scaleMode,
+        scaleFactor,
+        atr,
+        closeHint: Number.isFinite(closeHint) ? Number(closeHint) : null,
+      },
+    };
+  }
+
+  async _multiTfTrend(token) {
+    if (String(env.MULTI_TF_ENABLED || "true") !== "true") {
+      return { ok: true, note: "multi_tf_disabled" };
+    }
+
+    const base = Number(env.MULTI_TF_INTERVAL_MIN || 5);
+    const candidates = [base, 3, 5, 15]
+      .map((n) => Number(n))
+      .filter((n) => Number.isFinite(n) && n > 0);
+
+    const limit = Math.max(80, Number(env.MTF_LOOKBACK_LIMIT || 200));
+    const fastLen = Number(env.MULTI_TF_EMA_FAST || 9);
+    const slowLen = Number(env.MULTI_TF_EMA_SLOW || 21);
+
+    let usedIntervalMin = null;
+    let candles = null;
+
+    for (const iv of candidates) {
+      try {
+        const cs = await getRecentCandles(token, iv, limit);
+        if (!cs || cs.length < Math.max(slowLen + 10, 40)) continue;
+        usedIntervalMin = iv;
+        candles = cs;
+        break;
+      } catch {}
+    }
+
+    if (!candles) return { ok: true, note: "multi_tf_no_data" };
+
+    const closes = candles
+      .map((c) => Number(c.close))
+      .filter((x) => Number.isFinite(x));
+
+    if (closes.length < Math.max(slowLen + 5, 30)) {
+      return { ok: true, note: "multi_tf_insufficient_closes" };
+    }
+
+    const emaFast = emaLast(closes, fastLen);
+    const emaSlow = emaLast(closes, slowLen);
+    const lastClose = closes[closes.length - 1];
+
+    let trend = "FLAT";
+    if (Number.isFinite(emaFast) && Number.isFinite(emaSlow)) {
+      if (emaFast > emaSlow) trend = "UP";
+      else if (emaFast < emaSlow) trend = "DOWN";
+    }
+
+    const diff =
+      Number.isFinite(emaFast) && Number.isFinite(emaSlow)
+        ? Math.abs(emaFast - emaSlow)
+        : null;
+    const strengthBps =
+      Number.isFinite(diff) && Number.isFinite(lastClose) && lastClose > 0
+        ? (diff / lastClose) * 10000
+        : null;
+
+    return {
+      ok: true,
+      meta: {
+        usedIntervalMin,
+        emaFastLen: fastLen,
+        emaSlowLen: slowLen,
+        emaFast,
+        emaSlow,
+        lastClose,
+        trend,
+        strengthBps,
+      },
+    };
+  }
+
+  async _multiTfConfirm(token, side) {
+    const info = await this._multiTfTrend(token);
+    if (!info.ok) return info;
+
+    // If disabled/no data, pass through
+    const emaFast = info?.meta?.emaFast;
+    const emaSlow = info?.meta?.emaSlow;
+    if (!Number.isFinite(emaFast) || !Number.isFinite(emaSlow)) {
+      return { ok: true, meta: info?.meta || null };
+    }
+
+    const trendOk = side === "BUY" ? emaFast > emaSlow : emaFast < emaSlow;
+
+    if (!trendOk) {
+      return {
+        ok: false,
+        reason: "MULTI_TF_TREND_MISMATCH",
+        meta: info?.meta || null,
+      };
+    }
+
+    return { ok: true, meta: info?.meta || null };
+  }
+
+  async _regimeFilters({
+    token,
+    side,
+    intervalMin,
+    strategyId,
+    strategyStyle,
+    signalRegime,
+    policy,
+    underlying,
+  }) {
+    if (String(env.REGIME_FILTERS_ENABLED) !== "true") return { ok: true };
+
+    const limit = 250;
+    const candles = await getRecentCandles(token, intervalMin, limit);
+
+    if (!Array.isArray(candles) || candles.length < 30) {
+      return { ok: true, note: "insufficient_candles" };
+    }
+
+    const last = candles[candles.length - 1];
+
+    // Base context for all filters (also feeds cost/edge gating)
+    const close = Number(last.close);
+    const atrPeriod = Number(env.EXPECTED_MOVE_ATR_PERIOD || 14);
+    const atrBase = atrLast(candles, atrPeriod);
+    const atr = atrBase; // FIX: prevent "atr is not defined"
+    const style = String(strategyStyle || "").toUpperCase() || "UNKNOWN";
+    const det = detectRegime({ candles, env, now: new Date() });
+
+    const em = await this._expectedMoveModel({
+      token,
+      baseIntervalMin: intervalMin,
+      atrPeriod,
+      closeHint: close,
+    });
+
+    const effectiveRegime = signalRegime || det?.regime || null;
+
+    const baseMeta = {
+      intervalMin,
+      close: Number.isFinite(close) ? close : null,
+      atr: Number.isFinite(atrBase) ? atrBase : null,
+      atrBase: Number.isFinite(atrBase) ? atrBase : null,
+      expectedMovePerShare: Number.isFinite(em?.expectedMovePerShare)
+        ? Number(em.expectedMovePerShare)
+        : null,
+      expectedMoveMeta: em?.meta || null,
+      regime: effectiveRegime,
+      regimeReason: det?.reason || null,
+      strategyId: strategyId || null,
+      strategyStyle: style,
+    };
+
+    // Strategy-aware regime gating (pro-level, but tunable)
+    if (String(env.STRATEGY_STYLE_REGIME_GATES_ENABLED || "true") === "true") {
+      const reg = baseMeta.regime;
+      if (reg) {
+        const parseList = (s) =>
+          String(s || "")
+            .split(",")
+            .map((x) => x.trim().toUpperCase())
+            .filter(Boolean);
+
+        const allowed =
+          style === "TREND"
+            ? parseList(env.TREND_ALLOWED_REGIMES || "TREND,OPEN")
+            : style === "RANGE"
+              ? parseList(env.RANGE_ALLOWED_REGIMES || "RANGE,OPEN")
+              : style === "OPEN"
+                ? parseList(env.OPEN_ALLOWED_REGIMES || "OPEN,TREND")
+                : parseList("TREND,RANGE,OPEN");
+
+        if (allowed.length && !allowed.includes(String(reg).toUpperCase())) {
+          return {
+            ok: false,
+            reason: `STYLE_REGIME_MISMATCH (${style} in ${reg})`,
+            meta: { ...baseMeta, allowedRegimes: allowed },
+          };
+        }
+      }
+    }
+
+    // Relative volume (last vs avg of last N)
+    if (String(env.ENABLE_REL_VOLUME_FILTER) === "true") {
+      const n = 20;
+      if (candles.length < n + 2)
+        return { ok: false, reason: "REL_VOLUME_INSUFFICIENT_DATA" };
+      const tail = candles.slice(-n - 1, -1);
+      const avg = avgNum(tail.map((c) => Number(c.volume)));
+      const cur = Number(last.volume);
+      if (Number.isFinite(avg) && avg > 0 && Number.isFinite(cur)) {
+        const rel = cur / avg;
+        // Dynamic pacing: scale minRel thresholds up/down while preserving per-style ratios
+        const baseRel = Number(env.MIN_REL_VOLUME ?? 1.0);
+        const dynBase = Number.isFinite(Number(policy?.minRelVolBase))
+          ? Number(policy.minRelVolBase)
+          : baseRel;
+        const scale = baseRel > 0 ? dynBase / baseRel : 1.0;
+
+        const styleRel =
+          style === "TREND"
+            ? Number(env.MIN_REL_VOLUME_TREND ?? baseRel)
+            : style === "RANGE"
+              ? Number(env.MIN_REL_VOLUME_RANGE ?? baseRel)
+              : style === "OPEN"
+                ? Number(env.MIN_REL_VOLUME_OPEN ?? baseRel)
+                : baseRel;
+
+        const minRel = Math.max(0, styleRel * scale);
+
+        if (rel < minRel) {
+          return {
+            ok: false,
+            reason: `REL_VOLUME_TOO_LOW (${rel.toFixed(2)}x)`,
+            meta: { ...baseMeta, rel, cur, avg },
+          };
+        }
+      }
+    }
+    // ATR volatility filter
+    if (String(env.ENABLE_VOLATILITY_FILTER) === "true") {
+      if (Number.isFinite(atr) && Number.isFinite(close) && close > 0) {
+        const atrPct = (atr / close) * 100;
+
+        const baseMinAtrPct = Number(env.MIN_ATR_PCT ?? 0.04);
+
+        // Index underlyings have huge prices; % floors can wrongly block decent ATR.
+        // Convert a points-based floor to % for indices.
+        let minAtrPct = baseMinAtrPct;
+        if (underlying) {
+          const u = String(underlying).toUpperCase();
+          const pointsByUnderlying = {
+            NIFTY: Number(env.MIN_ATR_POINTS_NIFTY ?? 10),
+            BANKNIFTY: Number(env.MIN_ATR_POINTS_BANKNIFTY ?? 20),
+            SENSEX: Number(env.MIN_ATR_POINTS_SENSEX ?? 15),
+          };
+          const minPts = pointsByUnderlying[u];
+          if (Number.isFinite(minPts) && minPts > 0) {
+            minAtrPct = (minPts / close) * 100;
+          }
+        }
+
+        const maxAtrPct = Number(env.MAX_ATR_PCT ?? 2.5);
+
+        if (atrPct < minAtrPct) {
+          return {
+            ok: false,
+            reason: `ATR_TOO_LOW (${atrPct.toFixed(3)}% < ${minAtrPct.toFixed(3)}%)`,
+            meta: {
+              ...baseMeta,
+              atrPct,
+              minAtrPct,
+              underlying: underlying ?? null,
+            },
+          };
+        }
+
+        if (atrPct > maxAtrPct) {
+          return {
+            ok: false,
+            reason: `ATR_TOO_HIGH (${atrPct.toFixed(2)}% > ${maxAtrPct.toFixed(2)}%)`,
+            meta: {
+              ...baseMeta,
+              atrPct,
+              maxAtrPct,
+              underlying: underlying ?? null,
+            },
+          };
+        }
+      }
+    }
+
+    // Range percentile filter (optional)
+    if (String(env.ENABLE_RANGE_PCTL_FILTER) === "true") {
+      const lookback = Math.max(20, Number(env.RANGE_PCTL_LOOKBACK || 50));
+      const ranges = candles
+        .slice(-lookback)
+        .map((c) => {
+          const hi = Number(c.high);
+          const lo = Number(c.low);
+          const cl = Number(c.close);
+          if (
+            !Number.isFinite(hi) ||
+            !Number.isFinite(lo) ||
+            !Number.isFinite(cl) ||
+            cl <= 0
+          )
+            return null;
+          return ((hi - lo) / cl) * 100;
+        })
+        .filter((x) => x != null);
+      if (ranges.length >= 20) {
+        const cur = ranges[ranges.length - 1];
+        const hist = ranges.slice(0, -1);
+        const p = percentileRank(hist, cur);
+        const minP = Number(env.MIN_RANGE_PCTL || 30);
+        const maxP = Number(env.MAX_RANGE_PCTL || 99);
+        if (p < minP)
+          return {
+            ok: false,
+            reason: `RANGE_TOO_LOW_PCTL (${p.toFixed(0)} < ${minP})`,
+            meta: { ...baseMeta, p },
+          };
+        if (p > maxP)
+          return {
+            ok: false,
+            reason: `RANGE_TOO_HIGH_PCTL (${p.toFixed(0)} > ${maxP})`,
+            meta: { ...baseMeta, p },
+          };
+      }
+    }
+
+    // Multi-TF confirmation (strategy-aware)
+    const mtfEnabled = String(env.MULTI_TF_ENABLED || "true") === "true";
+    const mtfMode = String(env.MULTI_TF_MODE || "TREND_ONLY").toUpperCase();
+
+    const shouldConfirm =
+      mtfEnabled &&
+      mtfMode !== "OFF" &&
+      (mtfMode === "ALL" || (mtfMode === "TREND_ONLY" && style !== "RANGE"));
+
+    if (shouldConfirm) {
+      const tf = await this._multiTfConfirm(token, side);
+      if (!tf.ok) {
+        return { ...tf, meta: { ...baseMeta, ...(tf.meta || {}) } };
+      }
+      baseMeta.multiTf = tf.meta || null;
+    } else if (
+      style === "RANGE" &&
+      String(env.RANGE_AVOID_TREND || "false") === "true"
+    ) {
+      // Optional mean-reversion safety: avoid fading into strong higher-TF trend
+      const info = await this._multiTfTrend(token);
+      const strength = info?.meta?.strengthBps;
+      baseMeta.multiTf = info?.meta || null;
+
+      const maxBps = Number(env.RANGE_MAX_TREND_STRENGTH_BPS || 40);
+      if (
+        Number.isFinite(strength) &&
+        Number.isFinite(maxBps) &&
+        strength > maxBps
+      ) {
+        return {
+          ok: false,
+          reason: `RANGE_STRONG_TREND (${Math.round(
+            strength,
+          )}bps > ${Math.round(maxBps)}bps)`,
+          meta: { ...baseMeta },
+        };
+      }
+    }
+
+    return { ok: true, meta: { ...baseMeta } };
+  }
+
+  async _qualityGateStopLoss({
+    entryGuess,
+    stopLoss,
+    side,
+    instrument,
+    minTicks,
+    maxPct,
+  }) {
+    const tick = Number(instrument.tick_size || 0.05);
+    const slDist = Math.abs(Number(entryGuess) - Number(stopLoss));
+    const ticks = tick > 0 ? slDist / tick : slDist;
+
+    const minTicksVal = Number.isFinite(Number(minTicks))
+      ? Number(minTicks)
+      : Number(env.MIN_SL_TICKS || 2);
+    if (Number.isFinite(ticks) && ticks < minTicksVal) {
+      return {
+        ok: false,
+        reason: `SL_TOO_TIGHT (${ticks.toFixed(1)} ticks < ${minTicksVal})`,
+      };
+    }
+
+    const maxPctVal = Number.isFinite(Number(maxPct))
+      ? Number(maxPct)
+      : Number(env.MAX_SL_PCT || 1.0);
+    if (Number.isFinite(entryGuess) && entryGuess > 0) {
+      const pct = (slDist / entryGuess) * 100;
+      if (pct > maxPctVal) {
+        return {
+          ok: false,
+          reason: `SL_TOO_WIDE (${pct.toFixed(2)}% > ${maxPctVal}%)`,
+        };
+      }
+    }
+
+    // Logical sanity
+    if (side === "BUY" && stopLoss >= entryGuess)
+      return { ok: false, reason: "INVALID_SL_BUY" };
+    if (side === "SELL" && stopLoss <= entryGuess)
+      return { ok: false, reason: "INVALID_SL_SELL" };
+
+    return { ok: true };
+  }
+
+  async onSignal(signal) {
+    if (this.activeTradeId) {
+      logger.info(
+        { activeTradeId: this.activeTradeId },
+        "[signal] ignored (active trade exists)",
+      );
+      return;
+    }
+
+    if (this._isBlockedByNoTradeWindow()) {
+      logger.info(
+        { token: signal.instrument_token },
+        "[trade] blocked (no-trade window)",
+      );
+      return;
+    }
+
+    if (String(env.TRADING_ENABLED) !== "true") {
+      logger.info(
+        {
+          token: signal.instrument_token,
+          side: signal.side,
+          reason: signal.reason,
+        },
+        "[trade] dry-run (TRADING_ENABLED=false)",
+      );
+      return;
+    }
+
+    // Dynamic pacing policy (aim ~5-7 trades/day)
+    const policy = computePacingPolicy({
+      env,
+      tradesToday: this.risk.tradesToday,
+      telemetrySnapshot: telemetry.snapshot ? telemetry.snapshot() : null,
+      nowMs: Date.now(),
+    });
+
+    // In OPT mode, we generate signals on an underlying (FUT/SPOT) but execute on an option contract.
+    // Route here so downstream logic (risk, orders, telemetry) is consistent on the executed instrument.
+    let s = signal;
+    const isOptMode = this._isOptMode();
+    if (isOptMode) {
+      const underlyingToken = Number(s.instrument_token);
+      const underlyingSide = String(s.side || "").toUpperCase();
+
+      // Ensure we have a universe snapshot (built at ticker connect, but keep a safe fallback)
+      let uni = getLastFnoUniverse();
+      if (!uni?.universe) {
+        try {
+          uni = await buildFnoUniverse({ kite: this.kite });
+        } catch (e) {
+          logger.warn(
+            { e: e?.message || String(e) },
+            "[options] universe build failed",
+          );
+        }
+      }
+
+      // Underlying LTP for ATM selection
+      const underInstr = await ensureInstrument(this.kite, underlyingToken);
+      const underLtp =
+        (await this._getLtp(underlyingToken, underInstr)) ||
+        Number(s.candle?.close);
+
+      const picked = await pickOptionContractForSignal({
+        kite: this.kite,
+        universe: uni,
+        underlyingToken,
+        underlyingTradingsymbol: underInstr?.tradingsymbol,
+        side: underlyingSide,
+        underlyingLtp: underLtp,
+        maxSpreadBpsOverride: policy?.maxSpreadBpsOpt,
+      });
+
+      // PATCH-10: Hard-focus one underlying (prevents accidental multi-index trading)
+      if (env.FNO_SINGLE_UNDERLYING_ENABLED) {
+        const only = String(
+          env.FNO_SINGLE_UNDERLYING_SYMBOL || "",
+        ).toUpperCase();
+        const got = String(picked?.underlying || "").toUpperCase();
+        if (only && got && got !== only) {
+          logger.warn(
+            { only, got, token: picked.instrument_token },
+            "[options] blocked: picked contract is not primary underlying",
+          );
+          return;
+        }
+      }
+
+      if (!picked || !picked.instrument_token) {
+        logger.warn(
+          { underlyingToken, underlyingSide },
+          "[options] no contract could be picked",
+        );
+        return;
+      }
+
+      // Ensure we subscribe the chosen option contract (so downstream OMS/risk gets ticks)
+      let rt = null;
+      if (typeof this.runtimeAddTokens === "function") {
+        rt = await this.runtimeAddTokens([Number(picked.instrument_token)], {
+          reason: "OPT_SELECTED_CONTRACT",
+          // For options, candle history is important for exits; default: backfill enabled.
+          backfill:
+            String(env.OPT_RUNTIME_SUBSCRIBE_BACKFILL || "true") === "true",
+          // Prefer a slightly deeper backfill for options (per-token override supported by pipeline).
+          daysOverride: Number(env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS_OPT || 2),
+        });
+      }
+
+      const requireSub =
+        String(env.OPT_REQUIRE_SUBSCRIBED_LTP || "false") === "true";
+      if (requireSub && (!rt || !rt.ok)) {
+        logger.info(
+          { token: picked.instrument_token, error: rt?.error },
+          "[trade] blocked (runtime subscribe unavailable)",
+        );
+        return;
+      }
+
+      const warmMs = Number(env.OPT_LTP_WARMUP_MS || 1500);
+      if (rt?.ok && Number.isFinite(warmMs) && warmMs > 0) {
+        await sleep(Math.min(5000, warmMs));
+      }
+
+      s = {
+        ...s,
+        instrument_token: Number(picked.instrument_token),
+        side: "BUY", // long options only (BUY CE/PE)
+        underlying_token: underlyingToken,
+        underlying_side: underlyingSide,
+        underlying_ltp: underLtp,
+        option_meta: picked,
+        reason:
+          `${s.reason || ""} | OPT ${picked.optType} ${picked.strike} ${picked.expiry}`.trim(),
+      };
+    }
+
+    const token = Number(s.instrument_token);
+
+    const trackDecision = (outcome, stage, reason, meta) => {
+      telemetry.recordDecision({
+        signal: s,
+        token,
+        outcome,
+        stage,
+        reason,
+        meta,
+      });
+    };
+
+    trackDecision("RECEIVED", "signal", "RECEIVED", {
+      confidence: s.confidence,
+      regime: s.regime,
+      option: s.option_meta
+        ? {
+            underlying: s.option_meta.underlying,
+            type: s.option_meta.optType,
+            strike: s.option_meta.strike,
+            expiry: s.option_meta.expiry,
+          }
+        : null,
+    });
+    const check = this.risk.canTrade(token);
+    if (!check.ok) {
+      logger.info({ token, reason: check.reason }, "[trade] blocked");
+      return;
+    }
+
+    if (this.risk.getKillSwitch()) {
+      logger.warn("[trade] blocked (kill switch)");
+      return;
+    }
+
+    // Confidence gate (dynamic)
+    const minConf = Number(policy?.minConf ?? env.MIN_SIGNAL_CONFIDENCE ?? 0);
+    const conf = Number(s.confidence);
+    if (Number.isFinite(minConf) && minConf > 0 && Number.isFinite(conf)) {
+      if (conf < minConf) {
+        logger.info(
+          { token: s.instrument_token, conf, minConf },
+          "[trade] blocked (low confidence)",
+        );
+        return;
+      }
+    }
+    const instrument = await ensureInstrument(this.kite, token);
+
+    const tick = Number(instrument.tick_size || 0.05);
+
+    // Normalize side and detect contract type (options)
+    const side = String(s.side || "BUY").toUpperCase();
+    const isOptContract =
+      !!s.option_meta ||
+      String(instrument?.instrument_type || "").toUpperCase() === "CE" ||
+      String(instrument?.instrument_type || "").toUpperCase() === "PE" ||
+      /(?:CE|PE)$/.test(String(instrument?.tradingsymbol || "").toUpperCase());
+
+    // Pro: options default LIMIT; others use global ENTRY_ORDER_TYPE
+    const entryOrderType = String(
+      isOptContract
+        ? env.ENTRY_ORDER_TYPE_OPT || env.ENTRY_ORDER_TYPE || "LIMIT"
+        : env.ENTRY_ORDER_TYPE || "MARKET",
+    ).toUpperCase();
+
+    // Spread filter (use separate threshold for options)
+    const sp = await this._spreadCheck(instrument, {
+      maxBps: s.option_meta
+        ? Number(
+            policy?.maxSpreadBpsOpt ??
+              env.OPT_MAX_SPREAD_BPS ??
+              env.MAX_SPREAD_BPS ??
+              15,
+          )
+        : Number(policy?.maxSpreadBps ?? env.MAX_SPREAD_BPS ?? 15),
+    });
+    if (!sp.ok) {
+      logger.info(
+        { token, reason: sp.reason, meta: sp.meta },
+        "[trade] blocked (spread)",
+      );
+      return;
+    }
+
+    const quoteAtEntry = sp?.meta || null;
+    const expectedEntryPrice =
+      Number(s.side === "BUY" ? quoteAtEntry?.ask : quoteAtEntry?.bid) ||
+      Number(quoteAtEntry?.ltp) ||
+      Number(s.candle?.close);
+
+    // Stop-loss (cash: candle low/high; options: premium %)
+    let entryGuess = expectedEntryPrice;
+    let stopLoss;
+    if (s.option_meta) {
+      const slPct = Number(env.OPT_SL_PCT || 12);
+      const raw = Number(expectedEntryPrice) * (1 - slPct / 100);
+      stopLoss = roundToTick(raw, tick, "down");
+    } else {
+      const slFromCandle =
+        s.side === "BUY" ? Number(s.candle?.low) : Number(s.candle?.high);
+      stopLoss = slFromCandle;
+      if (!Number.isFinite(stopLoss) || stopLoss <= 0)
+        stopLoss = fallbackSL(entryGuess, s.side);
+      if (s.side === "BUY" && stopLoss >= entryGuess)
+        stopLoss = fallbackSL(entryGuess, "BUY");
+      if (s.side === "SELL" && stopLoss <= entryGuess)
+        stopLoss = fallbackSL(entryGuess, "SELL");
+      stopLoss = roundToTick(stopLoss, tick, s.side === "BUY" ? "down" : "up");
+    }
+
+    // stop-loss quality gating (options allow wider % stops)
+    const gate = await this._qualityGateStopLoss({
+      entryGuess,
+      stopLoss,
+      side,
+      instrument,
+      maxPct: s.option_meta ? Number(env.OPT_MAX_SL_PCT || 35) : undefined,
+    });
+    if (!gate.ok) {
+      logger.info({ token, reason: gate.reason }, "[trade] blocked (SL gate)");
+      return;
+    }
+
+    // Regime filters / MTF confirmation
+    const intervalMin = Number(s.intervalMin || s.candle?.interval_min || 1);
+    const regimeToken = Number(s.underlying_token || token);
+    const regimeSide = String(s.underlying_side || s.side);
+    const reg = await this._regimeFilters({
+      token: regimeToken,
+      side: regimeSide,
+      intervalMin,
+      strategyId: s.strategyId,
+      strategyStyle: s.strategyStyle,
+      signalRegime: s.regime,
+      policy,
+      underlying: s?.option_meta?.underlying,
+    });
+    if (!reg.ok) {
+      logger.info(
+        { token, reason: reg.reason, meta: reg.meta },
+        "[trade] blocked (regime)",
+      );
+      return;
+    }
+
+    // ---- Plan builder (dynamic SL + target) ----
+    let plan = null;
+    let plannedTargetPrice = null;
+    let expectedMovePerUnit = null;
+    let planMeta = null;
+
+    if (String(env.PLAN_ENABLED || "false") === "true") {
+      try {
+        const planCandles = await getRecentCandles(
+          regimeToken,
+          intervalMin,
+          Number(env.PLAN_CANDLE_LIMIT || 800),
+        );
+
+        const entryUnderlying = Number(
+          s.option_meta
+            ? s.underlying_ltp || s.candle?.close || 0
+            : quoteAtEntry?.ltp || s.candle?.close || 0,
+        );
+
+        const atr = Number(reg?.meta?.atr);
+        const cl = Number(reg?.meta?.close);
+        const atrPctUnderlying =
+          Number.isFinite(atr) && Number.isFinite(cl) && cl > 0
+            ? (atr / cl) * 100
+            : null;
+
+        plan = buildTradePlan({
+          env,
+          candles: planCandles,
+          intervalMin,
+          side: regimeSide,
+          signalStyle: s.strategyStyle,
+          entryUnderlying,
+          expectedMoveUnderlying: Number(reg?.meta?.expectedMovePerShare),
+          atrPeriod: Number(env.EXPECTED_MOVE_ATR_PERIOD || 14),
+          optionMeta: s.option_meta
+            ? { ...s.option_meta, strategyStyle: s.strategyStyle }
+            : null,
+          entryPremium: s.option_meta ? expectedEntryPrice : null,
+          premiumTick: tick,
+          atrPctUnderlying,
+        });
+
+        if (plan?.ok) {
+          stopLoss = plan.stopLoss;
+          plannedTargetPrice = plan.targetPrice;
+          expectedMovePerUnit = plan.expectedMovePerUnit;
+          planMeta = plan.meta;
+
+          // Re-check SL sanity after plan override
+          const slGate2 = this._qualityGateStopLoss({
+            entryGuess,
+            stopLoss,
+            maxPct: s.option_meta
+              ? Number(env.OPT_MAX_SL_PCT || 35)
+              : Number(env.MAX_SL_PCT || 1.2),
+          });
+          if (!slGate2.ok) {
+            logger.info(
+              { token, reason: slGate2.reason, meta: slGate2.meta },
+              "[trade] blocked (SL plan gate)",
+            );
+            return;
+          }
+        }
+      } catch (e) {
+        logger.warn(
+          { err: e?.message || e },
+          "[plan] failed; falling back to basic SL/target",
+        );
+      }
+    }
+
+    // ---- Adaptive optimizer (strategy×symbol×time-bucket auto-block + dynamic RR) ----
+    const rrBase = Number(plan?.ok ? plan.rr : env.RR_TARGET || 1.0);
+    const opt = optimizer.evaluateSignal({
+      symbol: instrument.tradingsymbol,
+      strategyId: s.strategyId,
+      nowTs: Date.now(),
+      atrBase: reg?.meta?.atrBase || reg?.meta?.atr,
+      close: reg?.meta?.close,
+      rrBase,
+      spreadBps: Number(sp?.meta?.bps || 0),
+      signalRegime: s.regime,
+      strategyStyle: s.strategyStyle,
+      confidence: conf,
+    });
+
+    if (!opt.ok) {
+      logger.info(
+        { token, reason: opt.reason, meta: opt.meta },
+        "[trade] blocked (optimizer)",
+      );
+      trackDecision("BLOCKED", "trade", "BLOCKED", {
+        reason: opt.reason,
+        ...opt.meta,
+      });
+      return;
+    }
+
+    // Optimizer de-weight: confidence multiplier (and optional qty multiplier)
+    const confidenceMult = Number(opt?.meta?.confidenceMult || 1);
+    const qtyMult = Number(opt?.meta?.qtyMult || 1);
+    const confidenceRaw = conf;
+    const confidenceUsed =
+      Number.isFinite(confidenceRaw) && Number.isFinite(confidenceMult)
+        ? confidenceRaw * confidenceMult
+        : confidenceRaw;
+
+    // Re-check confidence after optimizer de-weight (pro behaviour)
+    if (
+      Number.isFinite(minConf) &&
+      minConf > 0 &&
+      Number.isFinite(confidenceUsed)
+    ) {
+      if (confidenceUsed < minConf) {
+        logger.info(
+          {
+            token: s.instrument_token,
+            conf: confidenceRaw,
+            confidenceUsed,
+            minConf,
+            optimizer: opt?.meta || null,
+          },
+          "[trade] blocked (low confidence after optimizer)",
+        );
+        trackDecision("BLOCKED", "trade", "LOW_CONFIDENCE_AFTER_OPT", {
+          conf: confidenceRaw,
+          confidenceUsed,
+          minConf,
+          optimizer: opt?.meta || null,
+          confidenceRaw,
+          confidenceUsed,
+          confidenceMult,
+          qtyMult,
+        });
+        return;
+      }
+    }
+
+    const rrTarget = Number(plan?.ok ? plan.rr : opt?.meta?.rrUsed || rrBase);
+    const qtyMode = String(
+      env.QTY_SIZING_MODE || "RISK_THEN_MARGIN",
+    ).toUpperCase();
+    const _styleForSizing = String(
+      planMeta?.style || s.strategyStyle || "",
+    ).toUpperCase();
+    const _openMult = _styleForSizing.includes("OPEN")
+      ? Number(env.OPEN_RISK_MULT || 0.7)
+      : 1.0;
+    const _riskInrOverride = Number(env.RISK_PER_TRADE_INR || 0) * _openMult;
+
+    // Option SL fitter: if 1-lot risk exceeds cap, tighten SL toward entry to fit.
+    // This avoids frequent LOT_RISK_CAP blocks when lot sizes are large.
+    // We only attempt this for the option-leg (not the underlying future token).
+    if (
+      s.option_meta &&
+      Boolean(env.OPT_SL_FIT_ENABLED) &&
+      Boolean(env.LOT_RISK_CAP_ENFORCE) &&
+      Number(instrument?.lot_size || 1) > 1
+    ) {
+      const lot = Number(instrument.lot_size);
+      const tickSize = Number(instrument.tick_size || tick || 0.05);
+      const epsPct = Number(env.LOT_RISK_CAP_EPS_PCT || 0.02);
+      const capInr = _riskInrOverride * (1 + epsPct);
+      const minTicks = Number(
+        env.OPT_SL_FIT_MIN_TICKS || env.MIN_SL_TICKS || 2,
+      );
+
+      const fit = fitStopLossToLotRiskCap({
+        side,
+        entry: entryGuess,
+        stopLoss,
+        lot,
+        tickSize,
+        capInr,
+        minTicks,
+      });
+
+      if (!fit.ok) {
+        this._logBlockedTrade({
+          token,
+          side,
+          reason: "OPT_SL_FIT_BLOCK",
+          meta: fit.meta || {},
+        });
+        return;
+      }
+
+      if (fit.changed) {
+        const oldSL = stopLoss;
+        stopLoss = fit.stopLoss;
+
+        // Keep planned target consistent with rrTarget if we already have a planned target.
+        if (plannedTargetPrice != null) {
+          const newT = computeTargetFromRR({
+            side,
+            entry: entryGuess,
+            stopLoss,
+            rr: Number(rrTarget || env.RR_TARGET || 2.2),
+            tickSize,
+          });
+          if (newT != null) plannedTargetPrice = newT;
+        }
+
+        this.logger?.info?.(
+          {
+            token,
+            side,
+            entryGuess,
+            oldSL,
+            newSL: stopLoss,
+            lot,
+            capInr,
+            perUnitRiskOld: fit.oldPerUnitRisk,
+            perUnitRiskNew: fit.perUnitRisk,
+            minStopDistance: fit.minStopDistance,
+          },
+          "[options] SL fitted to lot-risk cap",
+        );
+      }
+    }
+
+    // NOTE: RiskEngine.calcQty expects `entryPrice`.
+    // Passing the wrong key here makes qtyByRisk become NaN (and JSON logs show it as null),
+    // which then trips margin sizing and blocks trades incorrectly.
+    const qtyByRisk = this.risk.calcQty({
+      entryPrice: entryGuess,
+      stopLoss,
+      riskInr: _riskInrOverride,
+    });
+
+    // If you want sizing purely from available margin, set:
+    //   QTY_SIZING_MODE=MARGIN
+    // and optionally tune:
+    //   MARGIN_USE_PCT, MARGIN_BUFFER_PCT, MAX_QTY_HARDCAP, MAX_POSITION_VALUE_INR
+    //
+    // In MARGIN mode, we deliberately ignore the risk-based qty and ask the marginSizer
+    // for "as much as possible" within your caps.
+    let qtyWanted =
+      qtyMode === "MARGIN"
+        ? Number(env.MAX_QTY_HARDCAP || env.MAX_QTY || 10000)
+        : qtyByRisk;
+
+    // Lot-aware sizing: if policy forces at least 1 lot, ensure the marginSizer checks margin for >= 1 lot
+    // (otherwise we might validate margin for a smaller qty and then normalize up to a lot later).
+    if (
+      String(env.FNO_MIN_LOT_POLICY || "FORCE_ONE_LOT").toUpperCase() ===
+        "FORCE_ONE_LOT" &&
+      Number(instrument.lot_size || 0) > 1
+    ) {
+      // Guard against NaN (e.g., if a caller ever provides an invalid qtyWanted).
+      const baseQty = Number.isFinite(Number(qtyWanted))
+        ? Number(qtyWanted)
+        : 0;
+      qtyWanted = Math.max(baseQty, Number(instrument.lot_size));
+    }
+
+    const entryParamsForSizing = {
+      exchange: instrument.exchange,
+      tradingsymbol: instrument.tradingsymbol,
+      transaction_type: side,
+      quantity: 1, // placeholder (marginSizer will change it)
+      product: env.DEFAULT_PRODUCT,
+      order_type: "MARKET",
+      validity: "DAY",
+      tag: makeTag("SIZING", "SIZING"),
+    };
+
+    let qty = await marginAwareQty({
+      kite: this.kite,
+      entryParams: entryParamsForSizing,
+      entryPriceGuess: entryGuess,
+      qtyByRisk: qtyWanted,
+    });
+
+    // Derivatives: ensure qty is a multiple of lot size and meets min-lot policy
+    qty = this._normalizeQtyToLot(qty, instrument);
+    if (qty < 1) {
+      logger.warn(
+        {
+          token,
+          side,
+          qtyByRisk,
+          availableMargin: "check /admin/status funds",
+        },
+        "[trade] blocked: insufficient margin for even 1 qty",
+      );
+      return;
+    }
+
+    // Optional optimizer qty de-weight (keeps turnover/costs down for weak edges)
+    if (String(env.OPT_DEWEIGHT_APPLY_TO_QTY || "false") === "true") {
+      if (Number.isFinite(qtyMult) && qtyMult > 0 && qtyMult < 1) {
+        qty = Math.max(1, Math.floor(qty * qtyMult));
+        qty = this._normalizeQtyToLot(qty, instrument);
+      }
+    }
+
+    // PATCH-5: Enforce risk cap AFTER lot-normalization (prevents FORCE_ONE_LOT / rounding from exceeding RISK_PER_TRADE_INR)
+    // This is crucial for derivatives where qty must be a multiple of lot_size.
+    const lotRiskCapEnforce = Boolean(env.LOT_RISK_CAP_ENFORCE);
+    const lotRiskApplyInMargin = Boolean(
+      env.LOT_RISK_CAP_APPLY_IN_MARGIN_MODE ?? true,
+    );
+
+    if (lotRiskCapEnforce && (qtyMode !== "MARGIN" || lotRiskApplyInMargin)) {
+      const entryForRisk = Number(expectedEntryPrice || entryGuess || 0);
+      const perUnitRisk = Math.abs(entryForRisk - Number(stopLoss || 0));
+      const intendedRiskInr = Number(
+        _riskInrOverride || env.RISK_PER_TRADE_INR || 0,
+      );
+      const epsPct = Math.max(0, Number(env.LOT_RISK_CAP_EPS_PCT || 0));
+      const capInr = intendedRiskInr * (1 + epsPct);
+
+      if (
+        Number.isFinite(perUnitRisk) &&
+        perUnitRisk > 0 &&
+        Number.isFinite(capInr) &&
+        capInr > 0
+      ) {
+        const trueRiskInr = perUnitRisk * qty;
+        if (trueRiskInr > capInr) {
+          const lot = Math.max(1, Number(instrument?.lot_size || 1));
+
+          // Compute the max qty that fits inside cap (respecting lot size for derivatives).
+          let newQty =
+            lot > 1
+              ? Math.floor(capInr / (perUnitRisk * lot)) * lot
+              : Math.floor(capInr / perUnitRisk);
+
+          newQty = this._normalizeQtyToLot(newQty, instrument);
+
+          if (newQty < 1) {
+            logger.info(
+              {
+                token,
+                side: side,
+                reason: "LOT_RISK_CAP_BLOCK",
+                meta: {
+                  qty,
+                  trueRiskInr,
+                  capInr,
+                  perUnitRisk,
+                  lot,
+                  qtyMode,
+                  intendedRiskInr,
+                },
+              },
+              "[trade] blocked (lot risk cap after lot-normalization)",
+            );
+            return;
+          }
+
+          logger.warn(
+            {
+              token,
+              side: side,
+              qtyOld: qty,
+              qtyNew: newQty,
+              trueRiskInr,
+              capInr,
+              perUnitRisk,
+              lot,
+              qtyMode,
+              intendedRiskInr,
+            },
+            "[risk] qty reduced to respect lot risk cap",
+          );
+
+          qty = newQty;
+        }
+      }
+    }
+
+    // --- Cost/edge gate (solves "profit smaller than charges" for high-frequency scalping)
+    // Require:
+    //  - planned SL (₹) not too small (MIN_SL_INR)
+    //  - RR target is feasible given volatility (ATR-based expected move)
+    //  - expected move >= K * estimated all-in costs (COST_GATE_MULT)
+    const edge = costGate({
+      entryPrice: expectedEntryPrice,
+      stopLoss,
+      rrTarget: rrTarget,
+      expectedMovePerShare: Number.isFinite(Number(expectedMovePerUnit))
+        ? Number(expectedMovePerUnit)
+        : s.option_meta
+          ? Number(reg?.meta?.expectedMovePerShare) *
+            (String(
+              s.option_meta?.moneyness || env.OPT_MONEYNESS || "ATM",
+            ).toUpperCase() === "ITM"
+              ? Number(env.OPT_DELTA_ITM || 0.65)
+              : String(
+                    s.option_meta?.moneyness || env.OPT_MONEYNESS || "ATM",
+                  ).toUpperCase() === "OTM"
+                ? Number(env.OPT_DELTA_OTM || 0.4)
+                : Number(env.OPT_DELTA_ATM || 0.5))
+          : Number(reg?.meta?.expectedMovePerShare),
+      qty,
+      spreadBps: Number(sp?.meta?.bps || 0),
+      env,
+      instrument,
+    });
+    if (!edge.ok) {
+      logger.info(
+        { token, reason: edge.reason, meta: edge.meta },
+        "[trade] blocked (cost/edge gate)",
+      );
+      return;
+    }
+
+    const tradeId = crypto.randomUUID();
+    const trade = {
+      tradeId,
+      instrument_token: token,
+      intervalMin,
+      instrument,
+      strategyId: s.strategyId,
+      side: side,
+      qty,
+      candle: s.candle,
+      underlying_token: s.underlying_token || null,
+      underlying_side: s.underlying_side || null,
+      option_meta: s.option_meta || null,
+      stopLoss,
+      initialStopLoss: stopLoss,
+      quoteAtEntry,
+      expectedEntryPrice,
+      regimeMeta: reg?.meta || null,
+      costMeta: edge?.meta || null,
+      // planned risk cap used for sizing / gating (₹)
+      riskInr: Number(_riskInrOverride || env.RISK_PER_TRADE_INR || 0),
+      entryOrderType,
+      maxEntrySlippageBps: maxEntrySlipBps,
+      maxEntrySlippageKillBps: maxEntrySlipKillBps,
+      entrySlippageBps: null,
+      rr: rrTarget,
+      plannedTargetPrice: plannedTargetPrice || null,
+      planMeta: planMeta || null,
+      pacingPolicy: policy?.meta || null,
+      optimizer: opt?.meta || null,
+      status: STATUS.ENTRY_PLACED,
+      entryOrderId: null,
+      slOrderId: null,
+      targetOrderId: null,
+      entryPrice: null,
+      exitPrice: null,
+      closeReason: null,
+      targetReplaceCount: 0,
+    };
+
+    await insertTrade(trade);
+
+    // ENTRY order (MARKET by default; optional LIMIT to reduce slippage)
+    const entryParams = {
+      exchange: instrument.exchange,
+      tradingsymbol: instrument.tradingsymbol,
+      transaction_type: side,
+      quantity: qty,
+      product: env.DEFAULT_PRODUCT,
+      order_type: entryOrderType,
+      validity: "DAY",
+      tag: makeTag(tradeId, "ENTRY"),
+    };
+
+    if (entryOrderType === "LIMIT") {
+      // Use top-of-book price from spread check if available.
+      // BUY -> ask; SELL -> bid
+      const px = Number(expectedEntryPrice) || Number(entryGuess);
+      entryParams.price = roundToTick(px, tick, side === "BUY" ? "up" : "down");
+    }
+
+    logger.info({ tradeId, entryParams }, "[trade] placing ENTRY");
+    trackDecision("ENTRY_PLACED", "entry", "ENTRY_PLACED", {
+      tradeId,
+      entryParams,
+    });
+    alert("info", "🟢 ENTRY placing", {
+      tradeId,
+      symbol: instrument.tradingsymbol,
+      side: side,
+      qty,
+      stopLoss,
+      strategyId: s.strategyId,
+    }).catch(() => {});
+
+    let entryOrderId = null;
+    try {
+      const out = await this._safePlaceOrder(
+        env.DEFAULT_ORDER_VARIETY,
+        entryParams,
+        { purpose: "ENTRY", tradeId },
+      );
+      entryOrderId = out.orderId;
+
+      // Pro: if LIMIT entry is not filled quickly, fallback to MARKET (options only)
+      if (
+        isOptContract &&
+        entryOrderType === "LIMIT" &&
+        Boolean(env.ENTRY_LIMIT_FALLBACK_TO_MARKET) &&
+        Number(env.ENTRY_LIMIT_TIMEOUT_MS || 0) > 0
+      ) {
+        this._scheduleEntryLimitFallback({
+          tradeId,
+          entryOrderId,
+          entryParams,
+          timeoutMs: Number(env.ENTRY_LIMIT_TIMEOUT_MS),
+        });
+      }
+    } catch (e) {
+      logger.error({ tradeId, e: e.message }, "[trade] ENTRY place failed");
+      alert("error", "❌ ENTRY rejected/failed", {
+        tradeId,
+        message: e.message,
+      }).catch(() => {});
+      this.risk.markFailure("ENTRY_PLACE_FAILED");
+      await updateTrade(tradeId, {
+        status: STATUS.ENTRY_FAILED,
+        closeReason: "ENTRY_PLACE_FAILED | " + e.message,
+      });
+      await this._finalizeClosed(tradeId, token);
+      return;
+    }
+
+    await updateTrade(tradeId, { entryOrderId, status: STATUS.ENTRY_OPEN });
+    await linkOrder({ order_id: String(entryOrderId), tradeId, role: "ENTRY" });
+    await this._replayOrphanUpdates(entryOrderId);
+
+    this.activeTradeId = tradeId;
+    this.risk.markTradeOpened(token, { tradeId, side: side, qty });
+
+    // watchdog fallback (in case order_update is missing)
+    this._watchEntryUntilDone(tradeId, String(entryOrderId)).catch((e) => {
+      logger.error({ tradeId, e: e.message }, "[entry_watch] failed");
+    });
+  }
+
+  async onOrderUpdate(order) {
+    const orderId = String(order.order_id || order.orderId || "");
+    if (!orderId) return;
+
+    const hit = await findTradeByOrder(orderId);
+    if (!hit) {
+      // Early order_update race: store and replay after link exists.
+      await saveOrphanOrderUpdate({ order_id: orderId, payload: order });
+      logger.warn(
+        { orderId, status: order.status },
+        "[order_update] orphan stored (no link yet)",
+      );
+      return;
+    }
+
+    const { trade, link } = hit;
+    const status = String(order.status || "").toUpperCase();
+
+    // Ignore expected OCO cancels
+    if (
+      (status === "CANCELLED" || status === "CANCELED") &&
+      this.expectedCancelOrderIds.has(orderId)
+    ) {
+      this.expectedCancelOrderIds.delete(orderId);
+      logger.info({ orderId }, "[oco] cancel confirmed");
+      return;
+    }
+
+    logger.info(
+      {
+        tradeId: trade.tradeId,
+        role: link.role,
+        status,
+        orderId,
+        status_message: order.status_message || null,
+        status_message_raw: order.status_message_raw || null,
+      },
+      "[order_update]",
+    );
+
+    // ✅ FIXED: PANIC_EXIT must not reference undefined variables and must not finalize on dead status
+    if (link.role === "PANIC_EXIT") {
+      if (status === "COMPLETE") {
+        const exitPrice = Number(order.average_price || order.price || 0);
+
+        await updateTrade(trade.tradeId, {
+          status: STATUS.CLOSED,
+          exitPrice: exitPrice > 0 ? exitPrice : trade.exitPrice,
+          closeReason: (trade.closeReason || "PANIC_EXIT") + " | FILLED",
+          closedAt: new Date(),
+        });
+
+        alert("warn", "✅ PANIC EXIT filled", {
+          tradeId: trade.tradeId,
+          exitPrice: exitPrice > 0 ? exitPrice : null,
+        }).catch(() => {});
+        await this._bookRealizedPnl(trade.tradeId);
+        await this._finalizeClosed(trade.tradeId, trade.instrument_token);
+        return;
+      }
+
+      // OPEN / PARTIAL: track progress, but do not place SL/TARGET (panic exit is the protection)
+      if (status === "OPEN" || status === "PARTIAL") {
+        const filledNow = Number(order.filled_quantity || 0);
+        if (filledNow > 0) {
+          await updateTrade(trade.tradeId, {
+            panicExitLastStatus: status,
+            panicExitFilledQty: filledNow,
+            panicExitAvgPrice: Number(order.average_price || 0) || null,
+            panicExitLastUpdateAt: new Date(),
+          });
+          alert("warn", "⚠️ PANIC EXIT partial/open (still exiting)", {
+            tradeId: trade.tradeId,
+            status,
+            filledQty: filledNow,
+          }).catch(() => {});
+        }
+        return;
+      }
+
+      if (isDead(status)) {
+        const msg =
+          order.status_message_raw ||
+          order.status_message ||
+          order.message ||
+          "";
+
+        logger.error(
+          { tradeId: trade.tradeId, orderId, status, msg },
+          "[panic] PANIC_EXIT order is dead (position may still be open!)",
+        );
+        alert(
+          "error",
+          "🛑 PANIC EXIT order failed (manual intervention needed)",
+          {
+            tradeId: trade.tradeId,
+            status,
+            msg: msg || null,
+          },
+        ).catch(() => {});
+
+        // IMPORTANT: do NOT finalizeClosed here. Broker position may still be open.
+        await updateTrade(trade.tradeId, {
+          status: STATUS.GUARD_FAILED,
+          closeReason: `PANIC_EXIT_${status}${msg ? " | " + msg : ""}`,
+          panicExitLastStatus: status,
+          panicExitLastUpdateAt: new Date(),
+        });
+        return;
+      }
+
+      // TRIGGER PENDING / other states -> wait
+      return;
+    }
+
+    if (link.role === "ENTRY") {
+      // Guard against out-of-order / duplicate entry updates (e.g., OPEN after COMPLETE, or duplicate COMPLETE)
+      const freshEntryTrade0 = await getTrade(trade.tradeId);
+      const progressedStatus0 = freshEntryTrade0?.status || trade.status;
+
+      const progressedSet0 = [
+        STATUS.ENTRY_FILLED,
+        STATUS.LIVE,
+        STATUS.EXITED_TARGET,
+        STATUS.EXITED_SL,
+        STATUS.ENTRY_FAILED,
+        STATUS.GUARD_FAILED,
+        STATUS.CLOSED,
+      ];
+
+      if (progressedSet0.includes(progressedStatus0)) {
+        // Still record any filled qty/avg on stale updates for bookkeeping, but do NOT place exits again.
+        const filledNow0 = Number(order.filled_quantity || 0);
+        const avgNow0 = Number(order.average_price || 0);
+        if (filledNow0 > 0) {
+          const patch0 = {};
+          if (
+            !Number.isFinite(Number(freshEntryTrade0?.entryPrice)) &&
+            avgNow0 > 0
+          ) {
+            patch0.entryPrice = avgNow0;
+          }
+          const prevQty0 = Number(freshEntryTrade0?.qty || 0);
+          if (!Number.isFinite(prevQty0) || filledNow0 > prevQty0) {
+            patch0.qty = filledNow0;
+          }
+          if (Object.keys(patch0).length) {
+            await updateTrade(trade.tradeId, patch0);
+          }
+        }
+
+        logger.info(
+          {
+            tradeId: trade.tradeId,
+            role: link.role,
+            status,
+            orderId,
+            tradeStatus: progressedStatus0,
+          },
+          "[order_update] ignored (stale/duplicate entry update)",
+        );
+        return;
+      }
+
+      if (status === "COMPLETE") {
+        const avg = Number(
+          order.average_price || trade.entryPrice || trade.candle?.close,
+        );
+        const filledQty = Number(order.filled_quantity || trade.qty);
+
+        const expected = Number(
+          trade.expectedEntryPrice ||
+            trade.quoteAtEntry?.ltp ||
+            trade.candle?.close ||
+            0,
+        );
+        const slipBps =
+          expected > 0 ? ((avg - expected) / expected) * 10000 : null;
+        const slipAbs = slipBps == null ? null : Math.abs(slipBps);
+        const entryType = String(
+          trade.entryOrderType || env.ENTRY_ORDER_TYPE || "MARKET",
+        ).toUpperCase();
+        const guardForLimit =
+          String(env.ENTRY_SLIPPAGE_GUARD_FOR_LIMIT || "false") === "true";
+
+        const isOptContract =
+          !!trade.option_meta ||
+          String(trade.instrument?.instrument_type || "").toUpperCase() ===
+            "CE" ||
+          String(trade.instrument?.instrument_type || "").toUpperCase() ===
+            "PE" ||
+          /(?:CE|PE)$/.test(
+            String(trade.instrument?.tradingsymbol || "").toUpperCase(),
+          );
+
+        const maxBps = Number(
+          trade.maxEntrySlippageBps ||
+            (isOptContract
+              ? env.MAX_ENTRY_SLIPPAGE_BPS_OPT || 120
+              : env.MAX_ENTRY_SLIPPAGE_BPS || 25),
+        );
+        const killBpsBase = Number(
+          trade.maxEntrySlippageKillBps ||
+            (isOptContract
+              ? env.MAX_ENTRY_SLIPPAGE_KILL_BPS_OPT || 250
+              : env.MAX_ENTRY_SLIPPAGE_KILL_BPS || 60),
+        );
+
+        const tick = Number(trade.instrument?.tick_size || 0.05);
+        const ticksAllowance = Number(
+          isOptContract
+            ? env.MAX_ENTRY_SLIPPAGE_TICKS_OPT || 4
+            : env.MAX_ENTRY_SLIPPAGE_TICKS || 2,
+        );
+        const tickBps =
+          expected > 0 && tick > 0 ? (tick / expected) * 10000 : null;
+
+        const effMaxBps =
+          tickBps != null
+            ? Math.max(maxBps, tickBps * Math.max(1, ticksAllowance))
+            : maxBps;
+
+        const effKillBps = Math.max(killBpsBase, effMaxBps * 2);
+
+        await updateTrade(trade.tradeId, {
+          status: STATUS.ENTRY_FILLED,
+          entryPrice: avg,
+          qty: filledQty,
+          entrySlippageBps: slipBps,
+        });
+
+        // Slippage guard (primarily for MARKET entries). Options are noisier; thresholds are segment-aware.
+        if (
+          slipAbs != null &&
+          slipAbs > effMaxBps &&
+          (entryType === "MARKET" || guardForLimit)
+        ) {
+          logger.error(
+            {
+              tradeId: trade.tradeId,
+              entryType,
+              avg,
+              expected,
+              slipBps,
+              effMaxBps,
+              maxBps,
+              tick,
+              ticksAllowance,
+            },
+            "[guard] entry slippage too high -> panic exit",
+          );
+
+          alert("error", "🛑 ENTRY slippage too high -> panic exit", {
+            tradeId: trade.tradeId,
+            entryType,
+            avg,
+            expected,
+            slipBps,
+            effMaxBps,
+            maxBps,
+            tick,
+            ticksAllowance,
+          }).catch(() => {});
+
+          if (slipAbs >= effKillBps && entryType === "MARKET") {
+            this.risk.setKillSwitch(true);
+          }
+
+          await this._panicExit(
+            { ...trade, entryPrice: avg, qty: filledQty },
+            "ENTRY_SLIPPAGE",
+          );
+
+          await updateTrade(trade.tradeId, {
+            status: STATUS.GUARD_FAILED,
+            closeReason: `ENTRY_SLIPPAGE (${slipAbs.toFixed(
+              1,
+            )}bps > ${effMaxBps.toFixed(1)})`,
+          });
+
+          return;
+        }
+
+        alert("info", "✅ ENTRY filled", {
+          tradeId: trade.tradeId,
+          avg,
+          filledQty,
+          slipBps,
+        }).catch(() => {});
+        this.risk.resetFailures();
+
+        // PATCH-10: Post-fill risk recheck (actual fill can make ₹ risk exceed cap)
+        const pf = await this._postFillRiskRecheckAndAdjust({
+          tradeId: trade.tradeId,
+          entryPrice: avg,
+          qty: filledQty,
+        });
+        if (pf && pf.exited) return;
+
+        const freshForExits = (await getTrade(trade.tradeId)) || trade;
+        await this._placeExitsIfMissing({
+          ...trade,
+          ...freshForExits,
+          entryPrice: avg,
+          qty: filledQty,
+        });
+        await this._ensureExitQty(trade.tradeId, filledQty);
+        return;
+      }
+
+      const filledNow = Number(order.filled_quantity || 0);
+      const avgNow = Number(
+        order.average_price || trade.entryPrice || trade.candle?.close || 0,
+      );
+      if ((status === "PARTIAL" || status === "OPEN") && filledNow > 0) {
+        // Place protective exits for the filled quantity (safety first)
+        await updateTrade(trade.tradeId, {
+          status: STATUS.ENTRY_OPEN,
+          entryPrice: avgNow > 0 ? avgNow : trade.entryPrice,
+          qty: filledNow,
+        });
+        await this._placeExitsIfMissing({
+          ...trade,
+          entryPrice: avgNow > 0 ? avgNow : trade.entryPrice,
+          qty: filledNow,
+        });
+        await this._ensureExitQty(trade.tradeId, filledNow);
+        alert("warn", "⚠️ ENTRY partial fill (protecting filled qty)", {
+          tradeId: trade.tradeId,
+          filledQty: filledNow,
+        }).catch(() => {});
+        return;
+      }
+
+      if (isDead(status)) {
+        await updateTrade(trade.tradeId, {
+          status: STATUS.ENTRY_FAILED,
+          closeReason:
+            "ENTRY_" +
+            status +
+            (order.status_message_raw ? " | " + order.status_message_raw : ""),
+        });
+        alert("error", "❌ ENTRY rejected/cancelled/lapsed", {
+          tradeId: trade.tradeId,
+          status,
+          msg: order.status_message_raw || order.status_message || null,
+        }).catch(() => {});
+        const fail = this.risk.markFailure("ENTRY_" + status);
+        if (fail.killed) {
+          alert("error", "🛑 Too many failures -> kill switch", fail).catch(
+            () => {},
+          );
+        }
+        await this._finalizeClosed(trade.tradeId, trade.instrument_token);
+        return;
+      }
+
+      // Ignore out-of-order / stale updates after we already progressed past entry
+      const freshEntryTrade = await getTrade(trade.tradeId);
+      const progressedStatus = freshEntryTrade?.status || trade.status;
+      if (
+        [
+          STATUS.ENTRY_FILLED,
+          STATUS.LIVE,
+          STATUS.EXITED_TARGET,
+          STATUS.EXITED_SL,
+          STATUS.ENTRY_FAILED,
+          STATUS.GUARD_FAILED,
+          STATUS.CLOSED,
+        ].includes(progressedStatus)
+      ) {
+        logger.info(
+          {
+            tradeId: trade.tradeId,
+            role: link.role,
+            status,
+            orderId,
+            tradeStatus: progressedStatus,
+          },
+          "[order_update] ignored (stale entry update)",
+        );
+        return;
+      }
+
+      await updateTrade(trade.tradeId, { status: STATUS.ENTRY_OPEN });
+      return;
+    }
+
+    if (link.role === "TP1") {
+      // TP1 is a partial take-profit. We must transition to runner stage safely.
+      const filledNow = Number(order.filled_quantity || 0);
+      const qtyNow = Number(order.quantity || trade.tp1Qty || trade.qty || 0);
+
+      if (status === "COMPLETE") {
+        return this._onTp1Filled(trade.tradeId, trade, order);
+      }
+
+      // Any partial fill is handled by: cancel remaining TP1 and immediately protect runner qty.
+      if (
+        (status === "PARTIAL" || status === "OPEN") &&
+        filledNow > 0 &&
+        qtyNow > 0
+      ) {
+        return this._onTp1PartialFill(trade.tradeId, trade, order);
+      }
+
+      if (isDead(status)) {
+        const freshTrade = await getTrade(trade.tradeId);
+        const tStatus = freshTrade?.status || trade.status;
+        if (
+          [
+            STATUS.EXITED_TARGET,
+            STATUS.EXITED_SL,
+            STATUS.ENTRY_FAILED,
+            STATUS.CLOSED,
+          ].includes(tStatus)
+        ) {
+          logger.info(
+            {
+              tradeId: trade.tradeId,
+              role: link.role,
+              status,
+              orderId,
+              tradeStatus: tStatus,
+            },
+            "[order_update] ignored (trade already closed)",
+          );
+          return;
+        }
+
+        // TP1 dead -> disable scale-out for this trade and place normal TARGET if missing
+        await updateTrade(trade.tradeId, {
+          tp1OrderId: null,
+          tp1Aborted: true,
+          tp1LastStatus: status,
+        });
+
+        try {
+          const fresh = (await getTrade(trade.tradeId)) || trade;
+          await this._placeExitsIfMissing(fresh);
+          await this._ensureExitQty(trade.tradeId, Number(fresh.qty || 0));
+        } catch (e) {
+          logger.warn(
+            { tradeId: trade.tradeId, e: e.message },
+            "[tp1] fallback exits failed",
+          );
+        }
+        return;
+      }
+
+      return;
+    }
+    if (link.role === "TARGET") {
+      // Partial exit fills are dangerous (remaining qty may be unprotected or double-exited).
+      const filledNow = Number(order.filled_quantity || 0);
+      const qtyNow = Number(order.quantity || trade.qty || 0);
+      if (
+        (status === "PARTIAL" || status === "OPEN") &&
+        filledNow > 0 &&
+        qtyNow > 0 &&
+        filledNow < qtyNow
+      ) {
+        const freshTrade = await getTrade(trade.tradeId);
+        const tStatus = freshTrade?.status || trade.status;
+        if (
+          ![
+            STATUS.EXITED_TARGET,
+            STATUS.EXITED_SL,
+            STATUS.ENTRY_FAILED,
+            STATUS.CLOSED,
+          ].includes(tStatus)
+        ) {
+          return this._guardFail(trade, "TARGET_PARTIAL_FILL");
+        }
+        return;
+      }
+
+      if (status === "COMPLETE")
+        return this._onTargetFilled(trade.tradeId, trade, order);
+
+      if (isDead(status)) {
+        // If the trade is already terminal, ignore late exit-leg events (common after restart / OCO)
+        const freshTrade = await getTrade(trade.tradeId);
+        const tStatus = freshTrade?.status || trade.status;
+        if (
+          [
+            STATUS.EXITED_TARGET,
+            STATUS.EXITED_SL,
+            STATUS.ENTRY_FAILED,
+            STATUS.CLOSED,
+          ].includes(tStatus)
+        ) {
+          logger.info(
+            {
+              tradeId: trade.tradeId,
+              role: link.role,
+              status,
+              orderId,
+              tradeStatus: tStatus,
+            },
+            "[order_update] ignored (trade already closed)",
+          );
+          return;
+        }
+
+        // TARGET dead -> clear and re-place (SL keeps protection)
+        return this._handleDeadTarget(trade, order, "postback");
+      }
+
+      return;
+    }
+
+    if (link.role === "SL") {
+      // Partial SL fills are dangerous (can leave remainder exposed or cause over-exit).
+      const filledNow = Number(order.filled_quantity || 0);
+      const qtyNow = Number(order.quantity || trade.qty || 0);
+      if (
+        (status === "PARTIAL" || status === "OPEN") &&
+        filledNow > 0 &&
+        qtyNow > 0 &&
+        filledNow < qtyNow
+      ) {
+        const freshTrade = await getTrade(trade.tradeId);
+        const tStatus = freshTrade?.status || trade.status;
+        if (
+          ![
+            STATUS.EXITED_TARGET,
+            STATUS.EXITED_SL,
+            STATUS.ENTRY_FAILED,
+            STATUS.CLOSED,
+          ].includes(tStatus)
+        ) {
+          return this._guardFail(trade, "SL_PARTIAL_FILL");
+        }
+        return;
+      }
+
+      if (status === "COMPLETE")
+        return this._onSlFilled(trade.tradeId, trade, order);
+
+      if (isDead(status)) {
+        // If the trade is already terminal, ignore late exit-leg events (common after restart / OCO)
+        const freshTrade = await getTrade(trade.tradeId);
+        const tStatus = freshTrade?.status || trade.status;
+        if (
+          [
+            STATUS.EXITED_TARGET,
+            STATUS.EXITED_SL,
+            STATUS.ENTRY_FAILED,
+            STATUS.CLOSED,
+          ].includes(tStatus)
+        ) {
+          logger.info(
+            {
+              tradeId: trade.tradeId,
+              role: link.role,
+              status,
+              orderId,
+              tradeStatus: tStatus,
+            },
+            "[order_update] ignored (trade already closed)",
+          );
+          return;
+        }
+
+        // SL dead => kill switch + panic exit
+        return this._guardFail(trade, "SL_" + status);
+      }
+
+      return;
+    }
+  }
+
+  async _handleDeadTarget(trade, targetOrder, source) {
+    const tradeId = trade.tradeId;
+    const scaleOutEnabled = this._scaleOutEligible(trade);
+    const keepTp2Resting =
+      scaleOutEnabled &&
+      trade.tp1Done &&
+      String(env.RUNNER_KEEP_TP2_RESTING) === "true";
+    if (
+      scaleOutEnabled &&
+      String(env.DYNAMIC_EXITS_AFTER_TP1_ONLY) === "true" &&
+      !trade.tp1Done
+    )
+      return;
+    const fresh = (await getTrade(tradeId)) || trade;
+
+    // Don't replace if already closed/failed
+    if (
+      [
+        STATUS.EXITED_TARGET,
+        STATUS.EXITED_SL,
+        STATUS.ENTRY_FAILED,
+        STATUS.GUARD_FAILED,
+        STATUS.CLOSED,
+      ].includes(fresh.status)
+    )
+      return;
+
+    const count = Number(fresh.targetReplaceCount || 0);
+    const max = Number(env.TARGET_REPLACE_MAX || 2);
+    if (count >= max) {
+      logger.error(
+        { tradeId, count, max, source },
+        "[target] replace limit reached; keeping SL only",
+      );
+      await updateTrade(tradeId, {
+        targetOrderId: null,
+        closeReason: `TARGET_DEAD_REPLACE_LIMIT_REACHED | last=${String(
+          targetOrder?.status || "",
+        ).toUpperCase()}`,
+        targetReplaceCount: count,
+      });
+      return;
+    }
+
+    logger.warn(
+      {
+        tradeId,
+        source,
+        status: String(targetOrder?.status || "").toUpperCase(),
+      },
+      "[target] dead -> replacing",
+    );
+
+    // Clear targetOrderId first to avoid other logic treating it as active
+    await updateTrade(tradeId, {
+      targetOrderId: null,
+      targetReplaceCount: count + 1,
+    });
+
+    // Place a new target order
+    try {
+      await this._placeTargetOnly({
+        ...fresh,
+        targetOrderId: null,
+        targetReplaceCount: count + 1,
+      });
+    } catch (e) {
+      logger.warn(
+        { tradeId, e: e.message },
+        "[target] replace failed; SL remains active",
+      );
+      await updateTrade(tradeId, {
+        closeReason: `TARGET_REPLACE_FAILED | ${e.message}`,
+      });
+    }
+  }
+
+  async _ensureExitQty(tradeId, desiredQty) {
+    const fresh = await getTrade(tradeId);
+    if (!fresh) return;
+    const qty = Number(desiredQty || fresh.qty || 0);
+    if (qty < 1) return;
+
+    // Adjust SL qty (safety critical)
+    if (fresh.slOrderId && typeof this.kite.modifyOrder === "function") {
+      try {
+        await this._safeModifyOrder(
+          env.DEFAULT_ORDER_VARIETY,
+          fresh.slOrderId,
+          { quantity: qty },
+          { purpose: "SL_QTY_MODIFY", tradeId },
+        );
+        logger.info(
+          { tradeId, slOrderId: fresh.slOrderId, qty },
+          "[trade] SL qty modified",
+        );
+      } catch (e) {
+        logger.error(
+          { tradeId, e: e.message },
+          "[trade] SL qty modify failed -> panic exit",
+        );
+        alert("error", "🛑 SL qty modify failed -> PANIC EXIT", {
+          tradeId,
+          message: e.message,
+        }).catch(() => {});
+        this.risk.setKillSwitch(true);
+        await upsertDailyRisk(todayKey(), {
+          kill: true,
+          reason: "SL_QTY_MODIFY_FAILED",
+          lastTradeId: tradeId,
+        });
+        await this._panicExit(fresh, "SL_QTY_MODIFY_FAILED");
+        return;
+      }
+    }
+
+    // Adjust TARGET qty (nice-to-have)
+    if (fresh.targetOrderId && typeof this.kite.modifyOrder === "function") {
+      try {
+        await this._safeModifyOrder(
+          env.DEFAULT_ORDER_VARIETY,
+          fresh.targetOrderId,
+          { quantity: qty },
+          { purpose: "TARGET_QTY_MODIFY", tradeId },
+        );
+        logger.info(
+          { tradeId, targetOrderId: fresh.targetOrderId, qty },
+          "[trade] TARGET qty modified",
+        );
+      } catch (e) {
+        logger.warn(
+          { tradeId, e: e.message },
+          "[trade] TARGET qty modify failed (continuing)",
+        );
+        alert("warn", "⚠️ TARGET qty modify failed", {
+          tradeId,
+          message: e.message,
+        }).catch(() => {});
+      }
+    }
+  }
+
+  // PATCH-10: After ENTRY fill, re-check risk using avg fill price.
+  // If risk > cap, try to re-fit SL (and optionally target) so the *actual* ₹ risk fits.
+  // If it still cannot fit, optionally panic-exit the trade immediately.
+  async _postFillRiskRecheckAndAdjust({ tradeId, entryPrice, qty }) {
+    try {
+      if (!env.POST_FILL_RISK_RECHECK_ENABLED)
+        return { ok: true, skipped: true };
+
+      const t = await getTrade(tradeId);
+      if (!t) return { ok: true, skipped: true };
+
+      const entry = Number(entryPrice || t.entryPrice || 0);
+      const sl = Number(t.stopLoss || 0);
+      const q = Number(qty || t.qty || 0);
+
+      if (!(entry > 0) || !(sl > 0) || !(q > 0)) {
+        return { ok: true, skipped: true };
+      }
+
+      const capBase = Number(t.riskInr || env.RISK_PER_TRADE_INR || 0);
+      const eps = Math.max(0, Number(env.POST_FILL_RISK_EPS_PCT || 0));
+      const capInr = capBase * (1 + eps);
+
+      const perUnitRisk = Math.abs(entry - sl);
+      const trueRiskInr = perUnitRisk * q;
+
+      if (
+        !Number.isFinite(trueRiskInr) ||
+        !Number.isFinite(capInr) ||
+        capInr <= 0
+      ) {
+        return { ok: true, skipped: true };
+      }
+
+      if (trueRiskInr <= capInr) {
+        await updateTrade(tradeId, {
+          postFillRisk: {
+            ok: true,
+            refit: false,
+            entryPrice: entry,
+            stopLoss: sl,
+            qty: q,
+            trueRiskInr,
+            capInr,
+            ts: new Date().toISOString(),
+          },
+        });
+        return { ok: true, refit: false };
+      }
+
+      const tickSize = Number(t.instrument?.tick_size || 0.05);
+      const minTicks = Math.max(
+        1,
+        Number(env.POST_FILL_RISK_MIN_TICKS || env.OPT_SL_FIT_MIN_TICKS || 2),
+      );
+
+      const fit = fitStopLossToLotRiskCap({
+        side: t.side,
+        entry,
+        stopLoss: sl,
+        // Use actual filled qty (not lot_size) so cap applies to full position size.
+        lot: q,
+        tickSize,
+        capInr,
+        minTicks,
+      });
+
+      if (fit.ok) {
+        const patch = {
+          stopLoss: fit.stopLoss,
+          postFillRisk: {
+            ok: true,
+            refit: true,
+            entryPrice: entry,
+            oldStopLoss: sl,
+            stopLoss: fit.stopLoss,
+            qty: q,
+            trueRiskInr,
+            capInr,
+            fitMeta: fit.meta || null,
+            ts: new Date().toISOString(),
+          },
+        };
+
+        // Optional: keep RR consistent by refitting target from RR_TARGET
+        if (env.POST_FILL_RISK_REFIT_TARGET) {
+          const rr = Number(t.rr || env.RR_TARGET || 1.0);
+          const newTarget = computeTargetFromRR({
+            side: t.side,
+            entry,
+            stopLoss: fit.stopLoss,
+            rr,
+            tickSize,
+          });
+          patch.plannedTargetPrice = newTarget;
+          patch.postFillRisk.newTarget = newTarget;
+        }
+
+        await updateTrade(tradeId, patch);
+
+        alert("warn", "⚠️ Post-fill risk exceeded cap; SL re-fitted", {
+          tradeId,
+          entryPrice: entry,
+          oldStopLoss: sl,
+          newStopLoss: fit.stopLoss,
+          qty: q,
+          trueRiskInr,
+          capInr,
+        }).catch(() => {});
+
+        return { ok: true, refit: true, stopLoss: fit.stopLoss };
+      }
+
+      // Still can't fit risk to cap.
+      await updateTrade(tradeId, {
+        postFillRisk: {
+          ok: false,
+          refit: false,
+          entryPrice: entry,
+          stopLoss: sl,
+          qty: q,
+          trueRiskInr,
+          capInr,
+          reason: fit.reason || "CANNOT_FIT",
+          meta: fit.meta || null,
+          ts: new Date().toISOString(),
+        },
+      });
+
+      const action = String(
+        env.POST_FILL_RISK_FAIL_ACTION || "EXIT",
+      ).toUpperCase();
+      if (action === "EXIT") {
+        alert("error", "🛑 Post-fill risk > cap; panic exit", {
+          tradeId,
+          entryPrice: entry,
+          stopLoss: sl,
+          qty: q,
+          trueRiskInr,
+          capInr,
+          reason: fit.reason || "CANNOT_FIT",
+        }).catch(() => {});
+
+        const fresh = (await getTrade(tradeId)) || t;
+        await this._panicExit(
+          { ...fresh, entryPrice: entry, qty: q },
+          "POST_FILL_RISK_CAP",
+        );
+        await updateTrade(tradeId, {
+          status: STATUS.GUARD_FAILED,
+          closeReason: `POST_FILL_RISK_CAP (${trueRiskInr.toFixed(0)}>${capInr.toFixed(0)})`,
+        });
+        return { ok: false, exited: true, reason: fit.reason || "CANNOT_FIT" };
+      }
+
+      return { ok: false, exited: false, reason: fit.reason || "CANNOT_FIT" };
+    } catch (e) {
+      logger.warn(
+        { tradeId, e: e.message },
+        "[postFillRisk] recheck failed (continuing)",
+      );
+      return { ok: true, skipped: true, error: e.message };
+    }
+  }
+
+  _computeTargetPrice(trade) {
+    if (Number.isFinite(Number(trade?.plannedTargetPrice))) {
+      return Number(trade.plannedTargetPrice);
+    }
+
+    const rr = Number(trade.rr || 1.0);
+    const entryPx = Number(trade.entryPrice || trade.candle?.close);
+    const baseSL = Number(trade.initialStopLoss || trade.stopLoss);
+    const riskPerShare = Math.abs(entryPx - baseSL);
+    const targetPx =
+      trade.side === "BUY"
+        ? entryPx + rr * riskPerShare
+        : entryPx - rr * riskPerShare;
+
+    const tick = Number(trade.instrument.tick_size || 0.05);
+    return roundToTick(targetPx, tick, trade.side === "BUY" ? "up" : "down");
+  }
+
+  async _placeTargetOnly(trade) {
+    const tradeId = trade.tradeId;
+
+    const entryPx = Number(trade.entryPrice || trade.candle?.close);
+    if (!Number.isFinite(entryPx) || entryPx <= 0)
+      throw new Error("missing_entry_price");
+
+    const targetPrice = this._computeTargetPrice(trade);
+    const tgtSide = trade.side === "BUY" ? "SELL" : "BUY";
+
+    const token = Number(trade.instrument_token);
+    const ltp = await this._getLtp(token, trade.instrument);
+
+    const alreadyCrossed =
+      Number.isFinite(ltp) &&
+      ((tgtSide === "BUY" && Number(ltp) <= Number(targetPrice)) ||
+        (tgtSide === "SELL" && Number(ltp) >= Number(targetPrice)));
+
+    const targetParams = {
+      exchange: trade.instrument.exchange,
+      tradingsymbol: trade.instrument.tradingsymbol,
+      transaction_type: tgtSide,
+      quantity: trade.qty,
+      product: env.DEFAULT_PRODUCT,
+      order_type: alreadyCrossed ? "MARKET" : "LIMIT",
+      ...(alreadyCrossed ? {} : { price: targetPrice }),
+      validity: "DAY",
+      tag: makeTag(tradeId, "TARGET"),
+    };
+
+    logger.info({ tradeId, targetParams }, "[trade] placing TARGET");
+    alert("info", "🎯 TARGET placing", {
+      tradeId,
+      targetPrice,
+      qty: trade.qty,
+      order_type: targetParams.order_type,
+    }).catch(() => {});
+
+    if (isHalted()) {
+      logger.warn("[trade] TARGET skipped (halted)");
+      return;
+    }
+
+    const { orderId: targetOrderId } = await this._safePlaceOrder(
+      env.DEFAULT_ORDER_VARIETY,
+      targetParams,
+      { purpose: "TARGET", tradeId },
+    );
+
+    await updateTrade(tradeId, {
+      targetOrderId,
+      targetPrice,
+      status: STATUS.LIVE,
+    });
+    await linkOrder({
+      order_id: String(targetOrderId),
+      tradeId,
+      role: "TARGET",
+    });
+    await this._replayOrphanUpdates(targetOrderId);
+
+    this._watchExitLeg(tradeId, targetOrderId, "TARGET").catch(() => {});
+  }
+  _scaleOutEligible(trade) {
+    const enabled = String(env.SCALE_OUT_ENABLED) === "true";
+    const initQty = Number(trade?.initialQty || trade?.qty || 0);
+    return enabled && initQty >= 2 && !trade?.tp1Aborted;
+  }
+
+  _computeTp1Qty(totalQty) {
+    const total = Number(totalQty);
+    if (!Number.isFinite(total) || total < 2) return null;
+
+    const pct = Number(env.TP1_QTY_PCT || 50);
+    const raw = Math.floor((total * pct) / 100);
+    const tp1Qty = Math.max(1, Math.min(raw, total - 1));
+    const runnerQty = total - tp1Qty;
+    if (runnerQty < 1) return null;
+
+    return { tp1Qty, runnerQty, pct };
+  }
+
+  _computeTp1Price(trade) {
+    const entry = Number(trade?.entryPrice || 0);
+    const sl = Number(trade?.initialStopLoss || trade?.stopLoss || 0);
+    const risk = Math.abs(entry - sl);
+    const mult = Number(env.TP1_R || 1);
+    const tick = Number(trade?.instrument?.tick_size || 0.05);
+
+    if (!Number.isFinite(entry) || !Number.isFinite(sl) || !(risk > 0))
+      return null;
+
+    const raw =
+      trade.side === "BUY" ? entry + mult * risk : entry - mult * risk;
+    return roundToTick(raw, tick, trade.side === "BUY" ? "up" : "down");
+  }
+
+  async _placeTp1Only(trade) {
+    const tradeId = trade.tradeId;
+    const initQty = Number(trade.initialQty || trade.qty || 0);
+    const sizing = this._computeTp1Qty(initQty);
+    if (!sizing) throw new Error("SCALE_OUT_NOT_ELIGIBLE");
+
+    const tp1Price = this._computeTp1Price(trade);
+    if (!tp1Price || tp1Price <= 0) throw new Error("TP1_PRICE_INVALID");
+
+    const exitSide = trade.side === "BUY" ? "SELL" : "BUY";
+    const tokenNow = Number(trade.instrument_token);
+    const ltpNow = await this._getLtp(tokenNow, trade.instrument);
+
+    const crossed =
+      Number.isFinite(ltpNow) &&
+      ((exitSide === "SELL" && Number(ltpNow) >= tp1Price) ||
+        (exitSide === "BUY" && Number(ltpNow) <= tp1Price));
+
+    const params = {
+      exchange: trade.instrument.exchange,
+      tradingsymbol: trade.instrument.tradingsymbol,
+      transaction_type: exitSide,
+      quantity: sizing.tp1Qty,
+      product: env.DEFAULT_PRODUCT,
+      order_type: crossed ? "MARKET" : "LIMIT",
+      ...(crossed ? {} : { price: tp1Price }),
+      validity: "DAY",
+      tag: makeTag(tradeId, "TP1"),
+    };
+
+    logger.info(
+      {
+        tradeId,
+        tp1Price,
+        qty: sizing.tp1Qty,
+        runnerQty: sizing.runnerQty,
+        crossed,
+      },
+      "[trade] placing TP1",
+    );
+    alert("info", "🎯 TP1 placing", {
+      tradeId,
+      tp1Price,
+      tp1Qty: sizing.tp1Qty,
+      runnerQty: sizing.runnerQty,
+      tp1R: Number(env.TP1_R || 1),
+    }).catch(() => {});
+
+    if (isHalted()) {
+      logger.warn("[trade] TP1 skipped (halted)");
+      return;
+    }
+
+    const { orderId: tp1OrderId } = await this._safePlaceOrder(
+      env.DEFAULT_ORDER_VARIETY,
+      params,
+      { purpose: "TP1", tradeId },
+    );
+
+    await updateTrade(tradeId, {
+      tp1OrderId,
+      tp1Price,
+      tp1Qty: sizing.tp1Qty,
+      runnerQty: sizing.runnerQty,
+      tp1Done: false,
+      initialQty: initQty,
+    });
+    await linkOrder({ order_id: String(tp1OrderId), tradeId, role: "TP1" });
+    await this._replayOrphanUpdates(tp1OrderId);
+
+    this._watchExitLeg(tradeId, tp1OrderId, "TP1").catch(() => {});
+  }
+
+  async _placeRunnerTargetOnly(trade) {
+    const tradeId = trade.tradeId;
+    const token = Number(trade.instrument_token);
+    const intervalMin = Number(
+      trade.intervalMin || trade.candle?.interval_min || 1,
+    );
+
+    let candles = [];
+    try {
+      candles = await getRecentCandles(token, intervalMin, 600);
+    } catch {
+      candles = [];
+    }
+
+    const plan = planRunnerTarget({ trade, candles });
+    if (!plan?.price || plan.price <= 0)
+      throw new Error("RUNNER_TARGET_PLAN_FAILED");
+
+    const targetPrice = plan.price;
+    const exitSide = trade.side === "BUY" ? "SELL" : "BUY";
+
+    const ltpNow = await this._getLtp(token, trade.instrument);
+    const crossed =
+      Number.isFinite(ltpNow) &&
+      ((exitSide === "SELL" && Number(ltpNow) >= targetPrice) ||
+        (exitSide === "BUY" && Number(ltpNow) <= targetPrice));
+
+    const params = {
+      exchange: trade.instrument.exchange,
+      tradingsymbol: trade.instrument.tradingsymbol,
+      transaction_type: exitSide,
+      quantity: trade.qty,
+      product: env.DEFAULT_PRODUCT,
+      order_type: crossed ? "MARKET" : "LIMIT",
+      ...(crossed ? {} : { price: targetPrice }),
+      validity: "DAY",
+      tag: makeTag(tradeId, "TP2"),
+    };
+
+    logger.info(
+      {
+        tradeId,
+        targetPrice,
+        qty: trade.qty,
+        mode: plan.mode,
+        crossed,
+        meta: plan.meta,
+      },
+      "[trade] placing RUNNER TARGET",
+    );
+    alert("info", "🏁 Runner target placing", {
+      tradeId,
+      targetPrice,
+      qty: trade.qty,
+      mode: plan.mode,
+      meta: plan.meta,
+    }).catch(() => {});
+
+    if (isHalted()) {
+      logger.warn("[trade] RUNNER TARGET skipped (halted)");
+      return;
+    }
+
+    const { orderId: targetOrderId } = await this._safePlaceOrder(
+      env.DEFAULT_ORDER_VARIETY,
+      params,
+      { purpose: "TARGET", tradeId },
+    );
+
+    await updateTrade(tradeId, {
+      targetOrderId,
+      targetPrice,
+      runnerTargetMode: plan.mode,
+      runnerTargetMeta: plan.meta,
+      status: STATUS.LIVE,
+    });
+    await linkOrder({
+      order_id: String(targetOrderId),
+      tradeId,
+      role: "TARGET",
+    });
+    await this._replayOrphanUpdates(targetOrderId);
+
+    this._watchExitLeg(tradeId, targetOrderId, "TARGET").catch(() => {});
+  }
+
+  async _bookPartialPnlLeg({
+    tradeId,
+    side,
+    entryPrice,
+    exitPrice,
+    qty,
+    label,
+  }) {
+    const entry = Number(entryPrice || 0);
+    const exit = Number(exitPrice || 0);
+    const q = Number(qty || 0);
+    if (
+      !Number.isFinite(entry) ||
+      !Number.isFinite(exit) ||
+      !(q > 0) ||
+      entry <= 0 ||
+      exit <= 0
+    )
+      return;
+
+    const pnl = side === "BUY" ? (exit - entry) * q : (entry - exit) * q;
+
+    const key = todayKey();
+    const cur = await getDailyRisk(key);
+    const realized = Number(cur?.realizedPnl || 0);
+
+    await upsertDailyRisk(key, {
+      realizedPnl: realized + pnl,
+      lastTradeId: tradeId,
+    });
+
+    try {
+      const t = await getTrade(tradeId);
+      const legs = Array.isArray(t?.pnlLegs) ? t.pnlLegs : [];
+      legs.push({
+        label: String(label || "LEG"),
+        qty: q,
+        exitPrice: exit,
+        pnl,
+        at: new Date(),
+      });
+      await updateTrade(tradeId, {
+        pnlLegs: legs,
+        partialRealizedPnl: Number(t?.partialRealizedPnl || 0) + pnl,
+      });
+    } catch {
+      // ignore
+    }
+
+    logger.info(
+      { tradeId, label, pnl, realizedPnl: realized + pnl },
+      "[pnl] booked partial",
+    );
+  }
+
+  async _onTp1PartialFill(tradeId, trade, tp1Order) {
+    const filled = Number(tp1Order.filled_quantity || 0);
+    if (!(filled > 0)) return;
+
+    const oid = String(
+      tp1Order.order_id || tp1Order.orderId || trade.tp1OrderId || "",
+    );
+    if (oid) {
+      // cancel remaining to avoid oversell
+      this.expectedCancelOrderIds.add(String(oid));
+      try {
+        await this._safeCancelOrder(env.DEFAULT_ORDER_VARIETY, oid, {
+          purpose: "TP1_CANCEL_REMAINING_ON_PARTIAL",
+          tradeId,
+        });
+      } catch (e) {
+        logger.warn({ tradeId, e: e.message }, "[tp1] cancel remaining failed");
+      }
+    }
+
+    return this._onTp1Filled(tradeId, trade, tp1Order, {
+      forcedFilledQty: filled,
+    });
+  }
+
+  async _onTp1Filled(tradeId, trade, tp1Order, opts = {}) {
+    const fresh = (await getTrade(tradeId)) || trade;
+    if (!fresh) return;
+
+    const entry = Number(fresh.entryPrice || 0);
+    const initQty = Number(fresh.initialQty || fresh.qty || 0);
+    const filledQty = Number(
+      opts.forcedFilledQty || tp1Order.filled_quantity || fresh.tp1Qty || 0,
+    );
+    const avgExit = Number(
+      tp1Order.average_price || tp1Order.price || fresh.tp1Price || 0,
+    );
+
+    const tp1ExpectedPrice = Number(fresh.tp1Price || tp1Order.price || 0);
+
+    // TP1 spread sample (never blocks)
+    let tp1QuoteAt = null;
+    try {
+      if (String(env.SPREAD_SAMPLE_ON_EXIT || "true") === "true") {
+        const spTp1 = await this._spreadCheck(fresh.instrument, {
+          sampleOnly: true,
+          allowWhenDisabled: true,
+        });
+        tp1QuoteAt = spTp1?.meta || null;
+      }
+    } catch {}
+
+    const tp1SlippageBpsWorse = worseSlippageBps({
+      side: fresh.side,
+      expected: tp1ExpectedPrice,
+      actual: avgExit,
+      leg: "EXIT",
+    });
+
+    const tp1SlippageInrWorse = worseSlippageInr({
+      side: fresh.side,
+      expected: tp1ExpectedPrice,
+      actual: avgExit,
+      qty: filledQty,
+      leg: "EXIT",
+    });
+
+    if (!(entry > 0) || !(avgExit > 0) || !(filledQty > 0)) return;
+
+    const remaining = initQty - filledQty;
+    if (remaining < 1) {
+      // Defensive: if TP1 exits entire qty, close like target.
+      if (fresh.slOrderId) {
+        this.expectedCancelOrderIds.add(String(fresh.slOrderId));
+        try {
+          await this._safeCancelOrder(
+            env.DEFAULT_ORDER_VARIETY,
+            fresh.slOrderId,
+            {
+              purpose: "OCO_CANCEL_SL_ON_TP1_FULL",
+              tradeId,
+            },
+          );
+        } catch {}
+      }
+
+      await updateTrade(tradeId, {
+        tp1Done: true,
+        tp1FilledQty: filledQty,
+        tp1ExitPrice: avgExit,
+        tp1ExpectedPrice,
+        tp1QuoteAt,
+        tp1SlippageBpsWorse,
+        tp1SlippageInrWorse,
+        status: STATUS.EXITED_TARGET,
+        exitPrice: avgExit,
+        exitExpectedPrice: tp1ExpectedPrice,
+        exitQuoteAt: tp1QuoteAt,
+        exitSlippageBpsWorse: tp1SlippageBpsWorse,
+        exitSlippageInrWorse: tp1SlippageInrWorse,
+        closeReason: "TP1_FULL_EXIT",
+      });
+      await this._bookRealizedPnl(tradeId);
+      await this._finalizeClosed(tradeId, fresh.instrument_token);
+      return;
+    }
+
+    // Book partial pnl for TP1 leg
+    await this._bookPartialPnlLeg({
+      tradeId,
+      side: fresh.side,
+      entryPrice: entry,
+      exitPrice: avgExit,
+      qty: filledQty,
+      label: "TP1",
+    });
+
+    // Move to runner stage: reduce qty, move SL to breakeven+buffer, place TP2.
+    await updateTrade(tradeId, {
+      tp1Done: true,
+      tp1FilledQty: filledQty,
+      tp1ExitPrice: avgExit,
+      tp1ExpectedPrice,
+      tp1QuoteAt,
+      tp1SlippageBpsWorse,
+      tp1SlippageInrWorse,
+      tp1FilledAt: new Date(),
+      qty: remaining,
+      runnerQty: remaining,
+    });
+    // Resize + tighten SL to "true breakeven" (+buffer, +estimated per-share fees)
+    const tick = Number(fresh.instrument?.tick_size || 0.05);
+    const bufTicks = Number(
+      env.RUNNER_BE_BUFFER_TICKS || env.DYN_BE_BUFFER_TICKS || 1,
+    );
+    const buffer = bufTicks * tick;
+
+    // Estimate round-trip costs for the remaining (runner) qty.
+    // This prevents BE exits that are still fee-negative on small quantities.
+
+    const entrySpreadBps = Number(fresh?.quoteAtEntry?.bps || 0);
+    const tp1SpreadBps = Number(tp1QuoteAt?.bps || 0);
+    const spreadBpsUsed =
+      entrySpreadBps > 0 && tp1SpreadBps > 0
+        ? (entrySpreadBps + tp1SpreadBps) / 2
+        : entrySpreadBps || tp1SpreadBps || 0;
+    const mult = Number(env.DYN_BE_COST_MULT || 1.0);
+    let costPerShare = 0;
+    let estCostInr = 0;
+    let costMeta = null;
+    try {
+      const est = estimateRoundTripCostInr({
+        entryPrice: entry,
+        qty: remaining,
+        spreadBps: spreadBpsUsed,
+        env,
+        instrument: fresh?.instrument || null,
+      });
+      estCostInr = Number(est?.estCostInr || 0);
+      costMeta = est?.meta || null;
+      if (Number.isFinite(estCostInr) && estCostInr > 0 && remaining > 0) {
+        costPerShare = estCostInr / remaining;
+      }
+    } catch {}
+
+    const rawBe =
+      fresh.side === "BUY"
+        ? entry + mult * costPerShare + buffer
+        : entry - (mult * costPerShare + buffer);
+
+    const be = roundToTick(rawBe, tick, fresh.side === "BUY" ? "up" : "down");
+
+    const curSL = Number(fresh.stopLoss || fresh.initialStopLoss || 0);
+    const newSL =
+      fresh.side === "BUY"
+        ? Math.max(curSL || -Infinity, be)
+        : Math.min(curSL || Infinity, be);
+    if (fresh.slOrderId) {
+      try {
+        await this._safeModifyOrder(
+          env.DEFAULT_ORDER_VARIETY,
+          fresh.slOrderId,
+          { trigger_price: newSL, quantity: remaining },
+          { purpose: "TP1_TO_BE_AND_RESIZE_SL", tradeId },
+        );
+        await updateTrade(tradeId, { stopLoss: newSL });
+        logger.info(
+          { tradeId, stopLoss: newSL, remaining },
+          "[tp1] SL moved to BE+buffer and resized",
+        );
+      } catch (e) {
+        logger.error(
+          { tradeId, e: e.message },
+          "[tp1] SL modify failed -> panic exit",
+        );
+        await this._panicExit(fresh, "TP1_SL_MODIFY_FAILED");
+        return;
+      }
+    }
+
+    // Place runner target (TP2) if missing
+    const after = (await getTrade(tradeId)) || fresh;
+    if (!after.targetOrderId) {
+      await this._placeRunnerTargetOnly(after);
+    }
+
+    await this._ensureExitQty(tradeId, remaining);
+  }
+
+  async _placeExitsIfMissing(trade) {
+    const tradeId = trade.tradeId;
+
+    // prevent duplicate SL/TARGET placement due to concurrent calls
+    if (this.exitPlacementLocks.has(tradeId)) {
+      logger.warn({ tradeId }, "[trade] exits placement skipped (lock)");
+      return;
+    }
+
+    this.exitPlacementLocks.add(tradeId);
+    try {
+      const fresh = await getTrade(tradeId);
+      if (!fresh) return;
+
+      // place SL if missing
+      if (!fresh.slOrderId) {
+        const slSide = trade.side === "BUY" ? "SELL" : "BUY";
+
+        // If SL trigger is already breached (fast move), exit MARKET immediately instead of placing an invalid/instant SL
+        const tokenNow = Number(trade.instrument_token);
+        const ltpNow = await this._getLtp(tokenNow, trade.instrument);
+        const slBreached =
+          Number.isFinite(ltpNow) &&
+          ((slSide === "SELL" && Number(ltpNow) <= Number(trade.stopLoss)) ||
+            (slSide === "BUY" && Number(ltpNow) >= Number(trade.stopLoss)));
+        if (slBreached) {
+          logger.warn(
+            { tradeId, ltpNow, stopLoss: trade.stopLoss, slSide },
+            "[trade] SL already breached -> MARKET exit",
+          );
+          alert("error", "🛑 SL already breached -> MARKET exit", {
+            tradeId,
+            ltp: ltpNow,
+            stopLoss: trade.stopLoss,
+          }).catch(() => {});
+          this.risk.setKillSwitch(true);
+          await upsertDailyRisk(todayKey(), {
+            kill: true,
+            reason: "SL_ALREADY_BREACHED",
+            lastTradeId: tradeId,
+          });
+          await this._panicExit(fresh, "SL_ALREADY_BREACHED");
+          return;
+        }
+
+        const slOrderType = this._getStopLossOrderType(trade.instrument);
+        const slLimitPrice =
+          slOrderType === "SL"
+            ? this._buildStopLossLimitPrice({
+                triggerPrice: trade.stopLoss,
+                exitSide: slSide,
+                instrument: trade.instrument,
+              })
+            : null;
+
+        const slParams = {
+          exchange: trade.instrument.exchange,
+          tradingsymbol: trade.instrument.tradingsymbol,
+          transaction_type: slSide,
+          quantity: trade.qty,
+          product: env.DEFAULT_PRODUCT,
+          order_type: slOrderType,
+          trigger_price: trade.stopLoss,
+          ...(slOrderType === "SL" ? { price: slLimitPrice } : {}),
+          validity: "DAY",
+          tag: makeTag(tradeId, "SL"),
+        };
+
+        logger.info({ tradeId, slParams }, "[trade] placing SL");
+        alert("info", "🛡️ SL placing", {
+          tradeId,
+          stopLoss: trade.stopLoss,
+          qty: trade.qty,
+        }).catch(() => {});
+
+        if (isHalted()) {
+          logger.warn("[trade] SL skipped (halted)");
+          return;
+        }
+
+        let slOrderId = null;
+        try {
+          const out = await this._safePlaceOrder(
+            env.DEFAULT_ORDER_VARIETY,
+            slParams,
+            { purpose: "SL", tradeId },
+          );
+          slOrderId = out.orderId;
+        } catch (e) {
+          const msg = String(e?.message || e);
+
+          // If SL-M is blocked/discontinued (common in F&O / some exchanges), retry with SL (stoploss-limit).
+          if (
+            String(slParams?.order_type || "").toUpperCase() === "SL-M" &&
+            this._isSlmBlockedError(msg)
+          ) {
+            try {
+              const fallbackParams = {
+                ...slParams,
+                order_type: "SL",
+                price: this._buildStopLossLimitPrice({
+                  triggerPrice: trade.stopLoss,
+                  exitSide: slSide,
+                  instrument: trade.instrument,
+                }),
+              };
+
+              logger.warn(
+                { tradeId, msg, fallbackParams },
+                "[trade] SL-M blocked; retrying SL (stoploss-limit)",
+              );
+
+              const out2 = await this._safePlaceOrder(
+                env.DEFAULT_ORDER_VARIETY,
+                fallbackParams,
+                { purpose: "SL", tradeId },
+              );
+              slOrderId = out2.orderId;
+            } catch (e2) {
+              logger.error(
+                { tradeId, e: String(e2?.message || e2) },
+                "[trade] SL retry (SL) failed",
+              );
+            }
+          }
+
+          if (!slOrderId) {
+            logger.error(
+              { tradeId, e: msg },
+              "[trade] SL place failed -> panic exit",
+            );
+            alert("error", "🛑 SL place failed -> PANIC EXIT", {
+              tradeId,
+              message: msg,
+            }).catch(() => {});
+            this.risk.setKillSwitch(true);
+            await upsertDailyRisk(todayKey(), {
+              kill: true,
+              reason: "SL_PLACE_FAILED",
+              lastTradeId: tradeId,
+            });
+            await this._panicExit(fresh, "SL_PLACE_FAILED");
+            return;
+          }
+        }
+        await updateTrade(tradeId, { slOrderId });
+        await linkOrder({ order_id: String(slOrderId), tradeId, role: "SL" });
+        await this._replayOrphanUpdates(slOrderId);
+        alert("info", "✅ SL placed", {
+          tradeId,
+          slOrderId,
+          stopLoss: trade.stopLoss,
+        }).catch(() => {});
+
+        // Immediate verification for SL
+        this._watchExitLeg(tradeId, slOrderId, "SL").catch(() => {});
+      }
+
+      // place TP1 / TARGET (runner) depending on scale-out stage
+      const fresh2 = await getTrade(tradeId);
+      if (!fresh2) return;
+
+      const scaleEnabled = String(env.SCALE_OUT_ENABLED) === "true";
+      const initQty = Number(fresh2.initialQty || fresh2.qty || trade.qty || 0);
+      const eligible = scaleEnabled && initQty >= 2 && !fresh2.tp1Aborted;
+
+      if (eligible) {
+        // Stage 1: TP1 not yet done -> ensure TP1 exists
+        if (!fresh2.tp1Done) {
+          if (!fresh2.tp1OrderId) {
+            try {
+              await this._placeTp1Only({
+                ...trade,
+                ...fresh2,
+                initialQty: initQty,
+              });
+            } catch (e) {
+              logger.warn(
+                { tradeId, e: e.message },
+                "[trade] TP1 place failed -> fallback to normal TARGET",
+              );
+              await updateTrade(tradeId, {
+                tp1Aborted: true,
+                tp1OrderId: null,
+                closeReason: "TP1_PLACE_FAILED | " + e.message,
+              });
+              // fallback to a single target
+              try {
+                await this._placeTargetOnly({
+                  ...trade,
+                  ...fresh2,
+                  initialQty: initQty,
+                });
+              } catch (e2) {
+                logger.warn(
+                  { tradeId, e: e2.message },
+                  "[trade] TARGET place failed (keeping SL only)",
+                );
+                alert("warn", "⚠️ TARGET place failed (SL still active)", {
+                  tradeId,
+                  message: e2.message,
+                }).catch(() => {});
+                await updateTrade(tradeId, {
+                  status: STATUS.LIVE,
+                  closeReason: "TARGET_PLACE_FAILED | " + e2.message,
+                });
+                return;
+              }
+            }
+          }
+        } else {
+          // Stage 2: TP1 done -> ensure runner TARGET exists
+          if (!fresh2.targetOrderId) {
+            try {
+              await this._placeRunnerTargetOnly({
+                ...trade,
+                ...fresh2,
+                initialQty: initQty,
+              });
+            } catch (e) {
+              logger.warn(
+                { tradeId, e: e.message },
+                "[trade] RUNNER TARGET place failed (keeping SL only)",
+              );
+              alert("warn", "⚠️ RUNNER TARGET place failed (SL still active)", {
+                tradeId,
+                message: e.message,
+              }).catch(() => {});
+              await updateTrade(tradeId, {
+                status: STATUS.LIVE,
+                closeReason: "RUNNER_TARGET_PLACE_FAILED | " + e.message,
+              });
+              return;
+            }
+          }
+        }
+      } else {
+        // Regular single-target mode
+        if (!fresh2.targetOrderId) {
+          try {
+            await this._placeTargetOnly({
+              ...trade,
+              ...fresh2,
+              initialQty: initQty,
+            });
+          } catch (e) {
+            logger.warn(
+              { tradeId, e: e.message },
+              "[trade] TARGET place failed (keeping SL only)",
+            );
+            alert("warn", "⚠️ TARGET place failed (SL still active)", {
+              tradeId,
+              message: e.message,
+            }).catch(() => {});
+            // Do not kill-switch; SL is safety critical and is already placed.
+            await updateTrade(tradeId, {
+              status: STATUS.LIVE,
+              closeReason: "TARGET_PLACE_FAILED | " + e.message,
+            });
+            return;
+          }
+        }
+      }
+      await updateTrade(tradeId, { status: STATUS.LIVE });
+    } finally {
+      this.exitPlacementLocks.delete(tradeId);
+    }
+  }
+
+  async _onTargetFilled(tradeId, trade, targetOrder) {
+    // Cancel TP1 if still pending (avoid accidental over-exit)
+    if (trade.tp1OrderId && !trade.tp1Done) {
+      this.expectedCancelOrderIds.add(String(trade.tp1OrderId));
+      try {
+        await this._safeCancelOrder(
+          env.DEFAULT_ORDER_VARIETY,
+          trade.tp1OrderId,
+          {
+            purpose: "OCO_CANCEL_TP1_ON_TARGET",
+            tradeId,
+          },
+        );
+      } catch (e) {
+        logger.warn({ tradeId, e: e.message }, "[oco] cancel TP1 failed");
+      }
+    }
+    if (trade.slOrderId) {
+      this.expectedCancelOrderIds.add(String(trade.slOrderId));
+      try {
+        // ✅ use safe cancel (rate-limit + accounting)
+        await this._safeCancelOrder(
+          env.DEFAULT_ORDER_VARIETY,
+          trade.slOrderId,
+          {
+            purpose: "OCO_CANCEL_SL_ON_TARGET",
+            tradeId,
+          },
+        );
+        logger.info(
+          { tradeId, slOrderId: trade.slOrderId },
+          "[oco] cancelled SL",
+        );
+      } catch (e) {
+        logger.warn({ tradeId, e: e.message }, "[oco] cancel SL failed");
+      }
+    }
+
+    const exitPrice = Number(
+      targetOrder.average_price || targetOrder.price || trade.targetPrice || 0,
+    );
+
+    const exitExpectedPrice = Number(
+      trade.targetPrice || targetOrder.price || 0,
+    );
+
+    // Exit spread sample (never blocks)
+    let exitQuoteAt = null;
+    try {
+      if (String(env.SPREAD_SAMPLE_ON_EXIT || "true") === "true") {
+        const spExit = await this._spreadCheck(trade.instrument, {
+          sampleOnly: true,
+          allowWhenDisabled: true,
+        });
+        exitQuoteAt = spExit?.meta || null;
+      }
+    } catch {}
+
+    const exitSlippageBpsWorse = worseSlippageBps({
+      side: trade.side,
+      expected: exitExpectedPrice,
+      actual: exitPrice,
+      leg: "EXIT",
+    });
+
+    const exitSlippageInrWorse = worseSlippageInr({
+      side: trade.side,
+      expected: exitExpectedPrice,
+      actual: exitPrice,
+      qty: trade.qty,
+      leg: "EXIT",
+    });
+    await updateTrade(tradeId, {
+      status: STATUS.EXITED_TARGET,
+      exitPrice,
+      exitExpectedPrice,
+      exitQuoteAt,
+      exitSlippageBpsWorse,
+      exitSlippageInrWorse,
+      closeReason: "TARGET_HIT",
+    });
+    alert("info", "🏁 TARGET HIT", { tradeId, exitPrice }).catch(() => {});
+    this.risk.resetFailures();
+    await this._bookRealizedPnl(tradeId);
+    await this._finalizeClosed(tradeId, trade.instrument_token);
+  }
+
+  async _onSlFilled(tradeId, trade, slOrder) {
+    // Cancel TP1 if still pending (avoid accidental over-exit)
+    if (trade.tp1OrderId && !trade.tp1Done) {
+      this.expectedCancelOrderIds.add(String(trade.tp1OrderId));
+      try {
+        await this._safeCancelOrder(
+          env.DEFAULT_ORDER_VARIETY,
+          trade.tp1OrderId,
+          {
+            purpose: "OCO_CANCEL_TP1_ON_SL",
+            tradeId,
+          },
+        );
+      } catch (e) {
+        logger.warn({ tradeId, e: e.message }, "[oco] cancel TP1 failed");
+      }
+    }
+    if (trade.targetOrderId) {
+      this.expectedCancelOrderIds.add(String(trade.targetOrderId));
+      try {
+        await this._safeCancelOrder(
+          env.DEFAULT_ORDER_VARIETY,
+          trade.targetOrderId,
+          { purpose: "OCO_CANCEL_TARGET_ON_SL", tradeId },
+        );
+        logger.info(
+          { tradeId, targetOrderId: trade.targetOrderId },
+          "[oco] cancelled TARGET",
+        );
+      } catch (e) {
+        logger.warn({ tradeId, e: e.message }, "[oco] cancel TARGET failed");
+      }
+    }
+
+    const exitPrice = Number(
+      slOrder.average_price || slOrder.trigger_price || trade.stopLoss || 0,
+    );
+
+    const exitExpectedPrice = Number(
+      trade.stopLoss || slOrder.trigger_price || trade.initialStopLoss || 0,
+    );
+
+    // Exit spread sample (never blocks)
+    let exitQuoteAt = null;
+    try {
+      if (String(env.SPREAD_SAMPLE_ON_EXIT || "true") === "true") {
+        const spExit = await this._spreadCheck(trade.instrument, {
+          sampleOnly: true,
+          allowWhenDisabled: true,
+        });
+        exitQuoteAt = spExit?.meta || null;
+      }
+    } catch {}
+
+    const exitSlippageBpsWorse = worseSlippageBps({
+      side: trade.side,
+      expected: exitExpectedPrice,
+      actual: exitPrice,
+      leg: "EXIT",
+    });
+
+    const exitSlippageInrWorse = worseSlippageInr({
+      side: trade.side,
+      expected: exitExpectedPrice,
+      actual: exitPrice,
+      qty: trade.qty,
+      leg: "EXIT",
+    });
+    await updateTrade(tradeId, {
+      status: STATUS.EXITED_SL,
+      exitPrice,
+      exitExpectedPrice,
+      exitQuoteAt,
+      exitSlippageBpsWorse,
+      exitSlippageInrWorse,
+      closeReason: "SL_HIT",
+    });
+    alert("warn", "🛑 SL HIT", { tradeId, exitPrice }).catch(() => {});
+    this.risk.resetFailures();
+    await this._bookRealizedPnl(tradeId);
+    await this._finalizeClosed(tradeId, trade.instrument_token);
+  }
+
+  async _guardFail(trade, reason) {
+    logger.error(
+      { tradeId: trade.tradeId, reason },
+      "[guard] exit leg failed -> kill switch",
+    );
+    alert("error", "🛑 GUARD FAIL (exit leg failed) -> kill switch", {
+      tradeId: trade.tradeId,
+      reason,
+    }).catch(() => {});
+    const f = this.risk.markFailure(reason);
+    if (f.killed)
+      alert("error", "🛑 Failure limit reached -> kill switch", f).catch(
+        () => {},
+      );
+    this.risk.setKillSwitch(true);
+    await updateTrade(trade.tradeId, {
+      status: STATUS.GUARD_FAILED,
+      closeReason: reason,
+    });
+    await upsertDailyRisk(todayKey(), {
+      kill: true,
+      reason,
+      lastTradeId: trade.tradeId,
+    });
+
+    // Best-effort: cancel existing exit legs to reduce risk of over-exit before PANIC order hits.
+    try {
+      const fresh = (await getTrade(trade.tradeId)) || trade;
+      for (const oid of [fresh.slOrderId, fresh.targetOrderId]) {
+        if (!oid) continue;
+        this.expectedCancelOrderIds.add(String(oid));
+        await this._safeCancelOrder(env.DEFAULT_ORDER_VARIETY, oid, {
+          purpose: "GUARD_CANCEL_EXIT_LEG",
+          tradeId: trade.tradeId,
+        });
+      }
+    } catch {}
+
+    // SL/exit leg failed => panic exit immediately (safety critical)
+    await this._panicExit(trade, reason);
+  }
+
+  async _bookRealizedPnl(tradeId) {
+    const t = await getTrade(tradeId);
+    if (!t) return;
+
+    const entry = Number(t.entryPrice || 0);
+    const exit = Number(t.exitPrice || 0);
+    if (
+      !Number.isFinite(entry) ||
+      !Number.isFinite(exit) ||
+      entry <= 0 ||
+      exit <= 0
+    )
+      return;
+
+    const qty = Number(t.qty || 0);
+    const pnl = t.side === "BUY" ? (exit - entry) * qty : (entry - exit) * qty;
+
+    const key = todayKey();
+    const cur = await getDailyRisk(key);
+    const realized = Number(cur?.realizedPnl || 0);
+
+    await upsertDailyRisk(key, {
+      realizedPnl: realized + pnl,
+      lastTradeId: tradeId,
+    });
+    logger.info(
+      { tradeId, pnl, realizedPnl: realized + pnl },
+      "[pnl] booked realized",
+    );
+  }
+
+  async _computeAndPersistFeeMultiple(tradeId) {
+    if (String(env.FEE_MULTIPLE_ENABLED || "true") !== "true") return null;
+
+    const t = await getTrade(tradeId);
+    if (!t) return null;
+
+    const entry = Number(t.entryPrice || 0);
+    const exit = Number(t.exitPrice || 0);
+    const side = String(t.side || "BUY").toUpperCase();
+
+    if (!(entry > 0) || !(exit > 0)) return null;
+
+    const qtyNow = Number(t.qty || 0);
+    const baseQty = Number(t.initialQty || qtyNow || 0);
+    if (!(baseQty > 0)) return null;
+
+    // PnL: include any booked partial legs + the final leg.
+    const partial = Number(t.partialRealizedPnl || 0);
+    const finalLegPnl =
+      side === "BUY" ? (exit - entry) * qtyNow : (entry - exit) * qtyNow;
+
+    const grossPnlInr = partial + finalLegPnl;
+
+    // Expected PnL based on expected entry/exit prices (helps separate charges vs slippage impact)
+    const expectedEntry = Number(
+      t.expectedEntryPrice || t.entryExpectedPrice || 0,
+    );
+    const expectedExit = Number(t.exitExpectedPrice || 0);
+    const tp1Exp = Number(t.tp1ExpectedPrice || 0);
+    const tp1Qty = Number(t.tp1FilledQty || 0);
+
+    let pnlExpectedInr = null;
+    try {
+      const expEntryOk = expectedEntry > 0;
+      const expExitOk = expectedExit > 0;
+      const expTp1Ok = tp1Exp > 0 && tp1Qty > 0;
+
+      let expected = 0;
+      if (expTp1Ok && expEntryOk) {
+        expected +=
+          side === "BUY"
+            ? (tp1Exp - expectedEntry) * tp1Qty
+            : (expectedEntry - tp1Exp) * tp1Qty;
+      }
+      if (expExitOk && expEntryOk) {
+        expected +=
+          side === "BUY"
+            ? (expectedExit - expectedEntry) * qtyNow
+            : (expectedEntry - expectedExit) * qtyNow;
+      }
+      pnlExpectedInr = Number.isFinite(expected) ? expected : null;
+    } catch {
+      pnlExpectedInr = null;
+    }
+
+    const pnlSlippageDeltaInr = Number.isFinite(pnlExpectedInr)
+      ? grossPnlInr - pnlExpectedInr
+      : null;
+
+    // More realistic order count: scale-out usually means ENTRY + TP1 + final exit.
+    const scaleOutUsed =
+      !!t.tp1Done && Number(t.tp1FilledQty || 0) > 0 && baseQty > qtyNow;
+    const execOrders = scaleOutUsed ? 3 : 2;
+
+    const entrySpreadBps = Number(t?.quoteAtEntry?.bps || 0);
+    const exitSpreadBps = Number(t?.exitQuoteAt?.bps || 0);
+    const spreadBpsUsed =
+      entrySpreadBps > 0 && exitSpreadBps > 0
+        ? (entrySpreadBps + exitSpreadBps) / 2
+        : entrySpreadBps || exitSpreadBps || 0;
+
+    let estCostInr = 0;
+    let costMeta = null;
+    try {
+      const est = estimateRoundTripCostInr({
+        entryPrice: entry,
+        qty: baseQty,
+        spreadBps: spreadBpsUsed,
+        env: { ...env, EXPECTED_EXECUTED_ORDERS: execOrders },
+        instrument: t?.instrument || null,
+      });
+      estCostInr = Number(est?.estCostInr || 0);
+      costMeta = est?.meta || null;
+    } catch {}
+
+    const feeMultiple =
+      Number.isFinite(estCostInr) && estCostInr > 0
+        ? grossPnlInr / estCostInr
+        : null;
+
+    const netAfterEstCostsInr = Number.isFinite(estCostInr)
+      ? grossPnlInr - estCostInr
+      : null;
+
+    // Persist on the trade for post-analysis.
+    try {
+      await updateTrade(tradeId, {
+        pnlGrossInr: grossPnlInr,
+        pnlExpectedInr,
+        pnlSlippageDeltaInr,
+        spreadBpsUsed,
+        pnlNetAfterEstCostsInr: netAfterEstCostsInr,
+        estCostsInr: estCostInr,
+        feeMultiple,
+        feeMultipleExecOrders: execOrders,
+        feeMultipleMeta: costMeta,
+      });
+    } catch {}
+
+    // Pro observability: aggregate fee-multiple by strategy and keep a ring of recent trades.
+    try {
+      tradeTelemetry.recordTradeClose({
+        tradeId,
+        strategyId: t.strategyId,
+        side,
+        closeReason: t.closeReason,
+        grossPnlInr,
+        estCostInr,
+        netAfterEstCostsInr,
+        feeMultiple,
+      });
+
+      // Adaptive optimizer: update rolling fee-multiple stats per symbol×strategy×bucket and auto-block weak keys.
+      try {
+        const symbol =
+          t?.instrument?.tradingsymbol ||
+          t?.instrument?.symbol ||
+          t?.instrument?.name ||
+          t?.instrument?.tradingsymbol ||
+          null;
+        optimizer.recordTradeClose({
+          symbol: symbol || "UNKNOWN",
+          strategyId: t.strategyId || "UNKNOWN",
+          feeMultiple,
+          startedAtTs: t?.createdAt
+            ? new Date(t.createdAt).getTime()
+            : Date.now(),
+          nowTs: Date.now(),
+        });
+      } catch {}
+    } catch {}
+
+    logger.info(
+      {
+        tradeId,
+        strategyId: t.strategyId,
+        closeReason: t.closeReason,
+        grossPnlInr,
+        estCostInr,
+        netAfterEstCostsInr,
+        feeMultiple,
+        execOrders,
+      },
+      "[fees] fee-multiple computed",
+    );
+
+    return {
+      feeMultiple,
+      estCostInr,
+      grossPnlInr,
+      netAfterEstCostsInr,
+      execOrders,
+    };
+  }
+
+  async _finalizeClosed(tradeId, instrument_token) {
+    // Preserve terminal statuses for easier debugging (don't always overwrite with CLOSED)
+    const t = await getTrade(tradeId);
+    const terminal = [
+      STATUS.EXITED_TARGET,
+      STATUS.EXITED_SL,
+      STATUS.ENTRY_FAILED,
+    ];
+
+    // Fee-multiple scoring (grossPnL / estimated costs) — helps tune to beat charges.
+    if (t && [STATUS.EXITED_TARGET, STATUS.EXITED_SL].includes(t.status)) {
+      try {
+        await this._computeAndPersistFeeMultiple(tradeId);
+      } catch {}
+    }
+
+    if (t && terminal.includes(t.status)) {
+      await updateTrade(tradeId, { closedAt: new Date() });
+    } else {
+      await updateTrade(tradeId, {
+        status: STATUS.CLOSED,
+        closedAt: new Date(),
+      });
+    }
+
+    this.activeTradeId = null;
+    this.recoveredPosition = null;
+    this.risk.markTradeClosed(Number(instrument_token));
+  }
+
+  async setKillSwitch(enabled, reason) {
+    const en = !!enabled;
+    this.risk.setKillSwitch(en);
+    await upsertDailyRisk(todayKey(), {
+      kill: en,
+      reason: en ? String(reason || "ADMIN") : null,
+    });
+    alert(
+      en ? "error" : "info",
+      en ? "🛑 Kill-switch ENABLED" : "✅ Kill-switch DISABLED",
+      {
+        kill: en,
+        reason: en ? String(reason || "ADMIN") : null,
+      },
+    ).catch(() => {});
+    logger.warn({ kill: en, reason }, "[risk] kill-switch updated");
+  }
+
+  async status() {
+    const active = this.activeTradeId
+      ? await getTrade(this.activeTradeId)
+      : null;
+    const risk = await getDailyRisk(todayKey());
+    return {
+      tradingEnabled: String(env.TRADING_ENABLED) === "true",
+      killSwitch: this.risk.getKillSwitch(),
+      tradesToday: this.risk.tradesToday,
+      activeTradeId: this.activeTradeId,
+      activeTrade: active,
+      recoveredPosition: this.recoveredPosition,
+      dailyRisk: risk,
+      ordersPlacedToday: this.ordersPlacedToday,
+    };
+  }
+}
+
+function fallbackSL(entry, side) {
+  const pct = Number(env.SL_PCT_FALLBACK || 0.3) / 100.0;
+  if (side === "BUY") return entry * (1 - pct);
+  return entry * (1 + pct);
+}
+
+function calcOpenPnl(trade, ltp) {
+  const entry = Number(trade.entryPrice || trade.candle?.close || 0);
+  const qty = Number(trade.qty || 0);
+  if (!entry || !qty) return 0;
+  return trade.side === "BUY" ? (ltp - entry) * qty : (entry - ltp) * qty;
+}
+
+function isDead(status) {
+  const s = String(status || "").toUpperCase();
+  return ["REJECTED", "CANCELLED", "CANCELED", "LAPSED"].includes(s);
+}
+
+function makeTag(tradeId, role) {
+  const base = String(tradeId || "").replaceAll("-", "");
+  const r =
+    String(role || "X")
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, "")
+      .slice(0, 1) || "X";
+  // 20 chars max. Keep role in the tail so ENTRY/SL/TARGET tags are distinct.
+  return `T${base.slice(0, 18)}${r}`.slice(0, 20);
+}
+
+function isRetryablePlaceError(e) {
+  const msg = String(e?.message || e || "").toLowerCase();
+  const status = Number(e?.status || e?.http_code || e?.code || 0);
+  if ([429, 500, 502, 503, 504].includes(status)) return true;
+  const patterns = [
+    "etimedout",
+    "econnreset",
+    "socket hang up",
+    "network",
+    "gateway",
+    "service unavailable",
+    "temporary",
+    "timeout",
+  ];
+  return patterns.some((p) => msg.includes(p));
+}
+
+function normalizeOrderShapeForMatch(x) {
+  return {
+    exchange: String(x.exchange || "").toUpperCase(),
+    tradingsymbol: String(
+      x.tradingsymbol || x.trading_symbol || "",
+    ).toUpperCase(),
+    transaction_type: String(x.transaction_type || "").toUpperCase(),
+    order_type: String(x.order_type || "").toUpperCase(),
+    product: String(x.product || "").toUpperCase(),
+    quantity: Number(x.quantity || 0),
+    price: Number(x.price || 0),
+    trigger_price: Number(x.trigger_price || x.triggerPrice || 0),
+  };
+}
+
+function ordersMatch(a, b) {
+  return (
+    a.exchange === b.exchange &&
+    a.tradingsymbol === b.tradingsymbol &&
+    a.transaction_type === b.transaction_type &&
+    a.order_type === b.order_type &&
+    a.product === b.product &&
+    a.quantity === b.quantity &&
+    nearlyEq(a.price, b.price) &&
+    nearlyEq(a.trigger_price, b.trigger_price)
+  );
+}
+
+function nearlyEq(a, b) {
+  const x = Number(a || 0);
+  const y = Number(b || 0);
+  return Math.abs(x - y) < 1e-6;
+}
+
+function parseTimeWindows(str) {
+  const s = String(str || "").trim();
+  if (!s) return [];
+  const parts = s
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const windows = [];
+  for (const part of parts) {
+    const [a, b] = part.split("-").map((x) => x.trim());
+    if (!a || !b) continue;
+    const tz = env.CANDLE_TZ || "Asia/Kolkata";
+    const sa = DateTime.fromFormat(a, "HH:mm", { zone: tz });
+    const sb = DateTime.fromFormat(b, "HH:mm", { zone: tz });
+    if (!sa.isValid || !sb.isValid) continue;
+    const startMin = sa.hour * 60 + sa.minute;
+    const endMin = sb.hour * 60 + sb.minute;
+    windows.push({ startMin, endMin });
+  }
+  return windows;
+}
+
+function isWithinAnyWindow(dt, windows) {
+  const m = dt.hour * 60 + dt.minute;
+  for (const w of windows || []) {
+    if (w.startMin <= w.endMin) {
+      if (m >= w.startMin && m <= w.endMin) return true;
+    } else {
+      // crosses midnight
+      if (m >= w.startMin || m <= w.endMin) return true;
+    }
+  }
+  return false;
+}
+
+function avgNum(arr) {
+  const xs = (arr || [])
+    .map((n) => Number(n))
+    .filter((n) => Number.isFinite(n));
+  if (!xs.length) return 0;
+  return xs.reduce((a, b) => a + b, 0) / xs.length;
+}
+
+function emaLast(values, period) {
+  const p = Math.max(1, Number(period || 1));
+  const xs = values.map((n) => Number(n)).filter((n) => Number.isFinite(n));
+  if (xs.length < p) return NaN;
+  const k = 2 / (p + 1);
+  let ema = avgNum(xs.slice(0, p));
+  for (let i = p; i < xs.length; i++) {
+    ema = xs[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
+
+function atrLast(candles, period = 14) {
+  const p = Math.max(1, Number(period || 14));
+  if (!Array.isArray(candles) || candles.length < p + 2) return NaN;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i];
+    const prev = candles[i - 1];
+    const hi = Number(c.high);
+    const lo = Number(c.low);
+    const pc = Number(prev.close);
+    if (!Number.isFinite(hi) || !Number.isFinite(lo) || !Number.isFinite(pc))
+      continue;
+    const tr = Math.max(hi - lo, Math.abs(hi - pc), Math.abs(lo - pc));
+    trs.push(tr);
+  }
+  if (trs.length < p) return NaN;
+  // Wilder's ATR: smooth TR
+  let atr = avgNum(trs.slice(0, p));
+  for (let i = p; i < trs.length; i++) {
+    atr = (atr * (p - 1) + trs[i]) / p;
+  }
+  return atr;
+}
+
+function percentileRank(hist, x) {
+  if (!hist || !hist.length) return 50;
+  const vals = hist.slice().sort((a, b) => a - b);
+  const v = Number(x);
+  let less = 0;
+  for (const n of vals) if (n < v) less++;
+  return (less / vals.length) * 100;
+}
+
+module.exports = { TradeManager, STATUS };

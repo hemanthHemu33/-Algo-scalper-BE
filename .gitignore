@@ -1,0 +1,29 @@
+/dev/null
+ /mnt/data/kiteproj_mod/.gitignore
+
+dependencies
+node_modules/
+
+# env files (never commit secrets)
+.env
+.env.*
+.env.example
+
+# logs
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# build artifacts
+/dist
+/build
+/coverage
+
+# archives
+*.zip
+*.tgz

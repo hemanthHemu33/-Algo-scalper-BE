@@ -1,0 +1,826 @@
+const { z } = require("zod");
+const fs = require("fs");
+const path = require("path");
+
+// dotenv is for local development. In production, set env vars in the host (Render/PM2/Docker/K8s).
+// We load .env only if it exists and DOTENV_ENABLED is not "false".
+try {
+  const enabled = String(process.env.DOTENV_ENABLED || "true") !== "false";
+  if (enabled) {
+    const dotenvPath =
+      process.env.DOTENV_PATH || path.join(process.cwd(), ".env");
+    if (fs.existsSync(dotenvPath)) {
+      // eslint-disable-next-line global-require
+      require("dotenv").config({ path: dotenvPath });
+    }
+  }
+} catch {}
+
+const schema = z.object({
+  PORT: z.coerce.number().default(4001),
+  NODE_ENV: z.string().default("development"),
+  LOG_LEVEL: z.string().optional(),
+  ADMIN_API_KEY: z.string().optional(),
+
+  // CORS
+  CORS_ORIGIN: z.string().optional(),
+
+  // Local dotenv loader toggle (config.js pre-loads dotenv using process.env too)
+  DOTENV_ENABLED: z.string().optional(),
+  DOTENV_PATH: z.string().optional(),
+
+  // Observability / telemetry (pro tuning support)
+  TELEMETRY_ENABLED: z.string().default("true"),
+  TELEMETRY_FLUSH_SEC: z.coerce.number().default(60),
+  TELEMETRY_RING_SIZE: z.coerce.number().default(300),
+  TELEMETRY_DB_DAILY_COLLECTION: z.string().default("telemetry_signals_daily"),
+
+  // Rejection histograms (symbol×strategy×time-bucket)
+  TELEMETRY_REJECTIONS_ENABLED: z.string().default("true"),
+  TELEMETRY_REJECTIONS_TOP_KEYS: z.coerce.number().default(200),
+
+  // Trade outcome telemetry (fee-multiple, pnl vs costs)
+  TELEMETRY_TRADES_ENABLED: z.string().default("true"),
+  TELEMETRY_TRADES_DAILY_COLLECTION: z
+    .string()
+    .default("telemetry_trades_daily"),
+  TELEMETRY_TRADES_RING_SIZE: z.coerce.number().default(300),
+
+  // Fee-multiple scoring (grossPnl / estimatedCosts) persisted on closed trades
+  FEE_MULTIPLE_ENABLED: z.string().default("true"),
+
+  // Adaptive optimizer (auto-block weak strategy×symbol×bucket, dynamic RR)
+  OPTIMIZER_ENABLED: z.string().default("true"),
+  OPT_LOOKBACK_N: z.coerce.number().default(60),
+  OPT_MIN_SAMPLES: z.coerce.number().default(20),
+  OPT_BLOCK_FEE_MULTIPLE_AVG_MIN: z.coerce.number().default(3),
+  OPT_BLOCK_TTL_MIN: z.coerce.number().default(120),
+  OPT_BOOTSTRAP_LIMIT: z.coerce.number().default(2000),
+  OPT_BUCKET_OPEN_END: z.string().default("10:00"),
+  OPT_BUCKET_CLOSE_START: z.string().default("15:00"),
+  OPT_LOG_DECISIONS: z.string().default("true"),
+
+  // Pro optimizer extensions (performance-driven strategy control)
+  OPT_BLOCK_SCOPE: z.string().default("BOTH"),
+  OPT_MIN_SAMPLES_KEY: z.coerce.number().default(20),
+  OPT_MIN_SAMPLES_STRATEGY: z.coerce.number().default(20),
+  OPT_DEWEIGHT_ENABLED: z.string().default("true"),
+  OPT_DEWEIGHT_MIN_SAMPLES: z.coerce.number().default(5),
+  OPT_DEWEIGHT_CONF_MIN: z.coerce.number().default(0.5),
+  OPT_DEWEIGHT_QTY_MIN: z.coerce.number().default(0.5),
+  OPT_DEWEIGHT_APPLY_TO_QTY: z.string().default("false"),
+  OPT_SPREAD_PENALTY_BPS: z.coerce.number().default(15),
+  OPT_SPREAD_BLOCK_BPS: z.coerce.number().default(30),
+  OPT_SPREAD_PENALTY_CONF_MULT: z.coerce.number().default(0.85),
+  OPT_SPREAD_BLOCK_ENABLED: z.string().default("false"),
+  OPTIMIZER_BOOTSTRAP_FROM_DB: z.string().default("true"),
+  OPT_BOOTSTRAP_DAYS: z.coerce.number().default(7),
+
+  // Optimizer state persistence (fast restart + stable self-pruning)
+  OPT_STATE_PERSIST: z.string().default("true"),
+  OPT_STATE_COLLECTION: z.string().default("optimizer_state"),
+  OPT_STATE_ID: z.string().default("active"),
+  OPT_STATE_FLUSH_SEC: z.coerce.number().default(15),
+  OPT_STATE_MAX_KEYS: z.coerce.number().default(1500),
+
+  // Regime-aware RR floors
+  RR_TREND_MIN: z.coerce.number().default(1.5),
+  RR_WIDE_SPREAD_MIN: z.coerce.number().default(1.8),
+
+  // Spread sampling on exit (observability)
+  SPREAD_SAMPLE_ON_EXIT: z.string().default("true"),
+
+  // Volatility→RR mapping (ATR% regime)
+  VOL_ATR_PCT_LOW: z.coerce.number().default(0.35),
+  VOL_ATR_PCT_HIGH: z.coerce.number().default(1.0),
+  // Optimizer volatility bucket thresholds (in %)
+  VOL_LOW_PCT: z.coerce.number().default(0.8),
+  VOL_HIGH_PCT: z.coerce.number().default(2.0),
+  RR_VOL_LOW: z.coerce.number().default(1.8),
+  RR_VOL_MED: z.coerce.number().default(1.5),
+  RR_VOL_HIGH: z.coerce.number().default(1.2),
+  RR_MIN: z.coerce.number().default(1.1),
+  RR_MAX: z.coerce.number().default(2.2),
+
+  MONGO_URI: z.string().min(10),
+  MONGO_DB: z.string().min(1),
+
+  TOKENS_COLLECTION: z.string().default("broker_tokens"),
+  TOKEN_FILTER_USER_ID: z.string().optional(),
+  TOKEN_FILTER_API_KEY: z.string().optional(),
+  TOKEN_FIELD: z.string().optional(),
+
+  // Token polling (tokenWatcher)
+  TOKEN_POLL_INTERVAL_MS: z.coerce.number().default(30000),
+
+  KITE_API_KEY: z.string().min(3),
+  KITE_API_SECRET: z.string().optional(),
+  KITE_REDIRECT_SUCCESS_URL: z.string().optional(),
+  KITE_ALLOWED_USER_ID: z.string().optional(),
+
+  // PATCH-7: Quote guard (throttle + chunk + backoff + circuit breaker)
+  QUOTE_GUARD_ENABLED: z.string().default("true"),
+  QUOTE_GUARD_CHUNK_SIZE: z.coerce.number().default(75),
+  QUOTE_GUARD_MAX_INFLIGHT: z.coerce.number().default(1),
+  QUOTE_GUARD_MIN_INTERVAL_MS: z.coerce.number().default(150),
+  QUOTE_GUARD_BUDGET_WINDOW_MS: z.coerce.number().default(10000),
+  QUOTE_GUARD_BUDGET_MAX: z.coerce.number().default(20),
+  QUOTE_GUARD_MAX_RETRIES: z.coerce.number().default(3),
+  QUOTE_GUARD_BACKOFF_BASE_MS: z.coerce.number().default(250),
+  QUOTE_GUARD_BACKOFF_MAX_MS: z.coerce.number().default(5000),
+  QUOTE_GUARD_JITTER_PCT: z.coerce.number().default(0.25),
+  QUOTE_GUARD_BREAKER_FAILS: z.coerce.number().default(4),
+  QUOTE_GUARD_BREAKER_COOLDOWN_MS: z.coerce.number().default(20000),
+
+  SUBSCRIBE_TOKENS: z.string().optional(),
+  SUBSCRIBE_SYMBOLS: z.string().optional(),
+
+  // Strict symbol resolution: error if a symbol cannot be resolved
+  STRICT_SUBSCRIBE_SYMBOLS: z.string().default("false"),
+
+  // ===== F&O universe (Index FUT / OPT) =====
+  FNO_ENABLED: z.string().default("false"),
+  // FUT (index futures) or OPT (buy calls/puts)
+  FNO_MODE: z.string().default("FUT"),
+  // Pro mode: focus one underlying
+  FNO_SINGLE_UNDERLYING_ENABLED: z.coerce.boolean().default(true),
+  FNO_SINGLE_UNDERLYING_SYMBOL: z.string().default("NIFTY"),
+
+  // e.g. NIFTY,BANKNIFTY,SENSEX
+  FNO_UNDERLYINGS: z.string().default("NIFTY,BANKNIFTY,SENSEX"),
+  // Exchanges to scan for derivative contracts
+  FNO_EXCHANGES: z.string().default("NFO,BFO"),
+  // If true, union SUBSCRIBE_SYMBOLS/TOKENS with F&O universe
+  FNO_MERGE_CASH_UNIVERSE: z.string().default("false"),
+  // STRICT blocks if sizing < 1 lot; FORCE_ONE_LOT forces 1 lot (risky)
+  FNO_MIN_LOT_POLICY: z.string().default("STRICT"),
+  // Log selected contracts at startup
+  FNO_LOG_UNIVERSE: z.string().default("true"),
+
+  // Instrument dump cache TTL (seconds)
+  INSTRUMENTS_DUMP_TTL_SEC: z.coerce.number().default(3600),
+
+  // ===== Options (buy CE/PE) routing =====
+  // Underlying source for signals in OPT mode: FUT or SPOT
+  OPT_UNDERLYING_SOURCE: z.string().default("FUT"),
+  // Pick expiry: NEAREST (recommended)
+  OPT_EXPIRY_POLICY: z.string().default("NEAREST"),
+  // Expiry safety (optional)
+  OPT_MIN_DAYS_TO_EXPIRY: z.coerce.number().default(0),
+  // e.g. "14:30" -> avoid expiry-day entries after this time; unset disables
+  OPT_AVOID_EXPIRY_DAY_AFTER: z.string().optional(),
+  // ATM / ITM / OTM selection behavior
+  OPT_MONEYNESS: z.string().default("ATM"),
+  // Strike offset in steps (e.g. +1 = one step OTM for calls, -1 = one step ITM)
+  OPT_STRIKE_OFFSET_STEPS: z.coerce.number().default(0),
+  // Pro scalping: restrict to ATM ± scan steps only (no far strikes)
+  OPT_STRICT_ATM_ONLY: z.coerce.boolean().default(true),
+  // Hard reject if no candidate passes spread/depth/premium gates
+  OPT_PICK_REQUIRE_OK: z.coerce.boolean().default(true),
+  // Debug: attach the top-N option candidates to last pick metadata (0 disables). Max 10.
+  OPT_PICK_DEBUG_TOP_N: z.coerce.number().default(0),
+
+  // Strike step sizes (override if exchange changes lot/steps)
+  OPT_STRIKE_STEP_NIFTY: z.coerce.number().default(50),
+  OPT_STRIKE_STEP_BANKNIFTY: z.coerce.number().default(100),
+  OPT_STRIKE_STEP_SENSEX: z.coerce.number().default(100),
+  // Scan ±N strikes around ATM to find a liquid contract
+  OPT_ATM_SCAN_STEPS: z.coerce.number().default(1),
+
+  // Option-chain snapshot cache
+  OPT_CHAIN_TTL_MS: z.coerce.number().default(1500),
+  // Wider chain sampling around ATM (in strike steps)
+  OPT_CHAIN_STRIKES_AROUND_ATM: z.coerce.number().default(10),
+
+  // Back-compat aliases (older env names)
+  OPT_STRIKE_OFFSET: z.coerce.number().default(0),
+  OPT_STRIKE_SCAN_STEPS: z.coerce.number().default(2),
+
+  // Liquidity / sanity
+  OPT_MIN_PREMIUM: z.coerce.number().default(20),
+  OPT_MAX_PREMIUM: z.coerce.number().default(600),
+  // Underlying-specific premium bands (useful for small capital option buying)
+  OPT_MIN_PREMIUM_NIFTY: z.coerce.number().default(80),
+  OPT_MAX_PREMIUM_NIFTY: z.coerce.number().default(350),
+  OPT_PREMIUM_BAND_ENFORCE_NIFTY: z.coerce.boolean().default(true),
+  OPT_MAX_SPREAD_BPS: z.coerce.number().default(35),
+  // Minimum depth (top of book qty) requirement; 0 disables
+  OPT_MIN_DEPTH_QTY: z.coerce.number().default(0),
+  // Candidate scoring weights (comma-separated k:v; keys: spread,dist,depth,volume,oi)
+  OPT_PICK_SCORE_WEIGHTS: z.string().optional(),
+
+  // Stops for long options (premium-based)
+  OPT_STOP_MODE: z.string().default("PCT"),
+  OPT_SL_PCT: z.coerce.number().default(12),
+  OPT_MAX_SL_PCT: z.coerce.number().default(35),
+  OPT_MIN_SL_INR: z.coerce.number().default(0),
+
+  // Option SL fitter (to make 1-lot risk fit RISK_PER_TRADE_INR caps when lot sizes are large)
+  // If disabled, engine may block trades when 1-lot risk exceeds cap after lot-normalization.
+  OPT_SL_FIT_ENABLED: z.coerce.boolean().default(false),
+  // Minimum SL distance enforced by fitter (in ticks). Helps avoid ultra-tight “0.05 SL” fitting.
+  OPT_SL_FIT_MIN_TICKS: z.coerce.number().default(10),
+
+  // PATCH-4/Options exits — premium-based dynamic exit model (used by DynamicExitManager)
+  OPT_EXIT_MODEL: z.string().default("PREMIUM_PCT"),
+  OPT_EXIT_MAX_HOLD_MIN: z.coerce.number().default(25),
+  OPT_EXIT_ALLOW_WIDEN_SL: z.string().default("true"),
+  OPT_EXIT_WIDEN_WINDOW_MIN: z.coerce.number().default(2),
+  OPT_EXIT_BASE_SL_PCT: z.coerce.number().default(18),
+  OPT_EXIT_BASE_TARGET_PCT: z.coerce.number().default(35),
+  OPT_EXIT_MIN_SL_PCT: z.coerce.number().default(8),
+  OPT_EXIT_MAX_SL_PCT: z.coerce.number().default(35),
+  OPT_EXIT_VOL_LOOKBACK: z.coerce.number().default(20),
+  OPT_EXIT_VOL_REF_PCT: z.coerce.number().default(6),
+  OPT_EXIT_WIDEN_FACTOR_MIN: z.coerce.number().default(0.75),
+  OPT_EXIT_WIDEN_FACTOR_MAX: z.coerce.number().default(1.8),
+  OPT_EXIT_TRAIL_START_PROFIT_PCT: z.coerce.number().default(15),
+  OPT_EXIT_TRAIL_PCT_BASE: z.coerce.number().default(12),
+  OPT_EXIT_TRAIL_PCT_MIN: z.coerce.number().default(6),
+  OPT_EXIT_TRAIL_PCT_MAX: z.coerce.number().default(22),
+
+  // Coarse IV spike/crush heuristics (proxy using underlying move)
+  OPT_IV_NEUTRAL_BPS: z.coerce.number().default(12),
+  OPT_IV_CRUSH_PREMIUM_PCT: z.coerce.number().default(18),
+  OPT_IV_CRUSH_MIN_HOLD_MIN: z.coerce.number().default(3),
+  OPT_IV_SPIKE_PREMIUM_PCT: z.coerce.number().default(25),
+  OPT_IV_SPIKE_TRAIL_PCT: z.coerce.number().default(10),
+  OPT_IV_SPIKE_TP_TO_BID: z.string().default("true"),
+  OPT_IV_SPIKE_TP_BID_TICKS: z.coerce.number().default(1),
+
+  // TradeManager/option routing knobs
+  OPT_REQUIRE_SUBSCRIBED_LTP: z.string().default("false"),
+  OPT_LTP_WARMUP_MS: z.coerce.number().default(1500),
+  OPT_RUNTIME_SUBSCRIBE_BACKFILL: z.string().default("true"),
+  OPT_DYN_EXIT_ALLOW_UNDERLYING_LTP_FETCH: z.string().default("false"),
+
+  CANDLE_INTERVALS: z.string().default("1,3"),
+  CANDLE_COLLECTION_PREFIX: z.string().default("candles_"),
+  CANDLE_TZ: z.string().default("Asia/Kolkata"),
+  MARKET_OPEN: z.string().default("09:15"),
+  MARKET_CLOSE: z.string().default("15:30"),
+
+  // Market holiday calendar (optional) — blocks trading on holidays / weekends and supports special sessions.
+  HOLIDAY_CALENDAR_ENABLED: z.string().default("false"),
+  HOLIDAY_CALENDAR_FILE: z.string().default("config/market_calendar.json"),
+  HOLIDAY_CALENDAR_LOG: z.string().default("true"),
+  // If true, calendar special_sessions can override open/close (e.g., Muhurat trading).
+  SPECIAL_SESSIONS_ENABLED: z.string().default("false"),
+  BACKFILL_DAYS: z.coerce.number().default(3),
+
+  // PATCH-9: Candle retention / TTL indexes (DB growth control)
+  // Enable to automatically create TTL indexes on candle collections (candles_*).
+  // NOTE: TTL will DELETE old candle documents beyond retention window.
+  CANDLE_TTL_ENABLED: z.string().default("false"),
+  // Default retention (days) for intervals not specified in CANDLE_TTL_MAP
+  CANDLE_TTL_DEFAULT_DAYS: z.coerce.number().default(90),
+  // Per-interval retention map (days). Format: "1:30,3:60,5:90"
+  CANDLE_TTL_MAP: z.string().default("1:30,3:60,5:90"),
+  CANDLE_TTL_LOG: z.string().default("true"),
+  // Ensure TTL indexes at startup (recommended)
+  RETENTION_ENSURE_ON_START: z.string().default("true"),
+
+  // Production hardening
+  RECONCILE_INTERVAL_SEC: z.coerce.number().default(60),
+  TICK_QUEUE_MAX: z.coerce.number().default(50),
+  DAILY_LOSS_CHECK_MS: z.coerce.number().default(2000),
+  FORCE_FLATTEN_CHECK_MS: z.coerce.number().default(1000),
+  // Allow REST quote fetch for LTP in daily-loss checker when ticks are sparse
+  DAILY_LOSS_ALLOW_LTP_FETCH: z.string().default("true"),
+
+  // PATCH-3: Recovery safety — always (re)subscribe any broker-side open position tokens
+  // after restarts / reconnects so risk + exits keep receiving LTP and candles.
+  POSITION_RESUBSCRIBE_ENABLED: z.string().default("true"),
+  POSITION_RESUBSCRIBE_ON_RECONNECT: z.string().default("true"),
+  POSITION_RESUBSCRIBE_UNDERLYING: z.string().default("true"),
+  POSITION_RESUBSCRIBE_BACKFILL: z.string().default("true"),
+  POSITION_RESUBSCRIBE_MIN_INTERVAL_SEC: z.coerce.number().default(30),
+  POSITION_RESUBSCRIBE_RESPECT_PRODUCT: z.string().default("false"),
+  // Back-compat alias (older name used in some modules)
+  POSITION_RESUBSCRIBE_PRODUCT_STRICT: z.string().default("false"),
+  POSITION_RESUBSCRIBE_UNDERLYING_REBUILD_COOLDOWN_SEC: z.coerce
+    .number()
+    .default(300),
+
+  // Runtime subscribe (used for OPT mode: subscribe selected option token on-demand)
+  RUNTIME_SUBSCRIBE_ENABLED: z.string().default("true"),
+  RUNTIME_SUBSCRIBE_BACKFILL: z.string().default("true"),
+  RUNTIME_SUBSCRIBE_BACKFILL_DAYS: z.coerce.number().default(1),
+  // Option-specific days override (used when subscribing option token)
+  RUNTIME_SUBSCRIBE_BACKFILL_DAYS_OPT: z.coerce.number().default(2),
+
+  CANDLE_TIMER_FINALIZER_ENABLED: z.string().default("true"),
+  CANDLE_FINALIZER_INTERVAL_MS: z.coerce.number().default(1000),
+  CANDLE_FINALIZE_GRACE_MS: z.coerce.number().default(1500),
+  CANDLE_FINALIZE_MAX_BARS_PER_RUN: z.coerce.number().default(3),
+
+  ALLOW_SYNTHETIC_SIGNALS: z.string().default("false"),
+
+  TRADING_ENABLED: z.string().default("false"),
+  DEFAULT_EXCHANGE: z.string().default("NSE"),
+  DEFAULT_PRODUCT: z.string().default("MIS"),
+  DEFAULT_ORDER_VARIETY: z.string().default("regular"),
+
+  // Optional broker-side market protection for MARKET/SL-M orders.
+  // Set to "-1" (auto) or a percent like "0.5". Leave empty to disable.
+  ENFORCE_MARKET_PROTECTION: z.string().default("true"),
+  MARKET_PROTECTION: z.string().default("-1"),
+  // Stop-loss order type controls
+  // NOTE: Many F&O segments disallow SL-M, so default for derivatives is SL (stoploss-limit).
+  STOPLOSS_ORDER_TYPE_EQ: z.string().default("SL-M"), // equities (NSE cash etc.)
+  STOPLOSS_ORDER_TYPE_FO: z.string().default("SL"), // derivatives (NFO/BFO/CDS/MCX etc.)
+
+  // If STOPLOSS_ORDER_TYPE_* is "SL", we must provide a LIMIT price.
+  // We set it near the trigger to behave like SL-M without violating execution ranges.
+  // Buffer = max(trigger * SL_LIMIT_BUFFER_BPS/10000, tick_size * SL_LIMIT_BUFFER_TICKS, SL_LIMIT_BUFFER_ABS)
+  SL_LIMIT_BUFFER_BPS: z.coerce.number().default(50), // 50 bps = 0.50%
+  SL_LIMIT_BUFFER_TICKS: z.coerce.number().default(10), // minimum buffer in ticks
+  SL_LIMIT_BUFFER_ABS: z.coerce.number().default(0), // absolute ₹ buffer (optional)
+  SL_LIMIT_BUFFER_MAX_BPS: z.coerce.number().default(500), // cap buffer at 5%
+
+  // Panic-exit fallback: if SL trigger is missed, place a stoploss-limit exit near LTP
+  PANIC_EXIT_LIMIT_FALLBACK_ENABLED: z.string().default("true"),
+  PANIC_EXIT_LIMIT_BUFFER_TICKS: z.coerce.number().default(2),
+  PANIC_EXIT_LIMIT_MAX_BPS: z.coerce.number().default(250),
+
+  MAX_ENTRY_SLIPPAGE_BPS: z.coerce.number().default(25),
+  MAX_ENTRY_SLIPPAGE_KILL_BPS: z.coerce.number().default(60),
+
+  // Patch: segment-aware slippage guard (options are noisier / wider spreads)
+  ENTRY_SLIPPAGE_GUARD_FOR_LIMIT: z.string().default("false"),
+  MAX_ENTRY_SLIPPAGE_BPS_OPT: z.coerce.number().default(120),
+  MAX_ENTRY_SLIPPAGE_KILL_BPS_OPT: z.coerce.number().default(250),
+  // Minimum tolerance (in ticks) to prevent false panic-exits due to rounding / tick jumps
+  MAX_ENTRY_SLIPPAGE_TICKS: z.coerce.number().default(2),
+  MAX_ENTRY_SLIPPAGE_TICKS_OPT: z.coerce.number().default(4),
+
+  // Risk limits
+  RISK_PER_TRADE_INR: z.coerce.number().default(450),
+
+  // PATCH-10: Post-fill risk recheck (fills can drift; re-fit SL or exit)
+  POST_FILL_RISK_RECHECK_ENABLED: z.coerce.boolean().default(true),
+  // extra tolerance over the cap (e.g., 0.01 = +1%)
+  POST_FILL_RISK_EPS_PCT: z.coerce.number().default(0.01),
+  // If risk still > cap after re-fit: EXIT (panic close) | KEEP (leave as-is)
+  POST_FILL_RISK_FAIL_ACTION: z.string().default("EXIT"),
+  // If SL is re-fitted, recompute target from RR_TARGET using the new (tighter) risk.
+  POST_FILL_RISK_REFIT_TARGET: z.coerce.boolean().default(true),
+  // Minimum SL distance when re-fitting (in ticks)
+  POST_FILL_RISK_MIN_TICKS: z.coerce.number().default(2),
+
+  // PATCH-5: Lot risk cap enforcement (post lot-normalization)
+  LOT_RISK_CAP_ENFORCE: z.coerce.boolean().default(true),
+  LOT_RISK_CAP_APPLY_IN_MARGIN_MODE: z.string().default("true"),
+  // Tolerance to avoid micro blocks due to rounding (e.g., 0.02 = 2%)
+  LOT_RISK_CAP_EPS_PCT: z.coerce.number().default(0.02),
+  MAX_TRADES_PER_DAY: z.coerce.number().default(5),
+  MAX_OPEN_POSITIONS: z.coerce.number().default(1),
+  SYMBOL_COOLDOWN_SECONDS: z.coerce.number().default(180),
+  DAILY_MAX_LOSS_INR: z.coerce.number().default(1350),
+  AUTO_EXIT_ON_DAILY_LOSS: z.string().default("true"),
+
+  // Trading window (MIS safe)
+  AUTO_FIX_TIME_WINDOWS: z.string().default("false"),
+  STOP_NEW_ENTRIES_AFTER: z.string().default("15:00"), // HH:mm in CANDLE_TZ
+  FORCE_FLATTEN_AT: z.string().default("15:15"), // HH:mm in CANDLE_TZ
+
+  // Additional no-trade windows: comma-separated "HH:mm-HH:mm" ranges
+  // Example: "09:15-09:25,15:20-15:30"
+  NO_TRADE_WINDOWS: z.string().optional(),
+
+  // Reliability guards
+  MAX_CONSECUTIVE_FAILURES: z.coerce.number().default(3),
+
+  // Order rate limits (soft guard; tune per account)
+  MAX_ORDERS_PER_SEC: z.coerce.number().default(10),
+  MAX_ORDERS_PER_MIN: z.coerce.number().default(200),
+  MAX_ORDERS_PER_DAY: z.coerce.number().default(3000),
+
+  // Safe placement retry (only for retryable transport errors and only after de-dup check)
+  ORDER_PLACE_RETRY_MAX: z.coerce.number().default(1),
+  ORDER_PLACE_RETRY_BACKOFF_MS: z.coerce.number().default(250),
+  ORDER_DEDUP_LOOKBACK_SEC: z.coerce.number().default(120),
+
+  // Entry verification (limit entry fill watchdog)
+  ENTRY_WATCH_POLL_MS: z.coerce.number().default(1000),
+  ENTRY_WATCH_MS: z.coerce.number().default(30000),
+  CANCEL_ENTRY_ON_TIMEOUT: z.string().default("true"),
+
+  // Exit leg verification
+  EXIT_WATCH_POLL_MS: z.coerce.number().default(1000),
+  EXIT_WATCH_MS: z.coerce.number().default(20000),
+  TARGET_REPLACE_MAX: z.coerce.number().default(2),
+
+  // Health / monitoring (used by /admin/health/critical)
+  CRITICAL_HEALTH_REQUIRE_TICKER_CONNECTED: z.coerce.boolean().default(true),
+  CRITICAL_HEALTH_FAIL_ON_HALT: z.coerce.boolean().default(true),
+  CRITICAL_HEALTH_FAIL_ON_QUOTE_BREAKER: z.coerce.boolean().default(false),
+  CRITICAL_HEALTH_FAIL_ON_KILL_SWITCH: z.coerce.boolean().default(false),
+  // Grace window for quote breaker (ms). 0 means fail immediately when breaker is open.
+  CRITICAL_HEALTH_QUOTE_BREAKER_GRACE_MS: z.coerce.number().default(0),
+
+  // Telegram alerts (optional)
+  TELEGRAM_ENABLED: z.string().default("false"),
+  TELEGRAM_BOT_TOKEN: z.string().optional(),
+  TELEGRAM_CHAT_ID: z.string().optional(),
+  TELEGRAM_MIN_LEVEL: z.string().default("info"), // info|warn|error
+
+  STRATEGY_ID: z.string().default("ema_cross"),
+
+  // Strategy selection
+  STRATEGIES: z
+    .string()
+    .default(
+      "ema_pullback,vwap_reclaim,orb,bb_squeeze,breakout,volume_spike,fakeout,rsi_fade,wick_reversal",
+    ),
+  SIGNAL_INTERVALS: z.string().default("1"),
+
+  STRATEGY_SELECTOR_ENABLED: z.string().default("false"),
+  STRATEGIES_TREND: z.string().optional(),
+  STRATEGIES_RANGE: z.string().optional(),
+  STRATEGIES_OPEN: z.string().optional(),
+  STRATEGIES_ALWAYS: z.string().optional(),
+
+  SELECTOR_OPEN_WINDOW_MIN: z.coerce.number().default(20),
+  SELECTOR_FAST_EMA: z.coerce.number().default(9),
+  SELECTOR_SLOW_EMA: z.coerce.number().default(21),
+  SELECTOR_RANGE_LOOKBACK: z.coerce.number().default(30),
+  SELECTOR_ATR_PERIOD: z.coerce.number().default(14),
+  SELECTOR_TREND_DIFF_ATR: z.coerce.number().default(0.6),
+  SELECTOR_RANGE_PCT_MAX: z.coerce.number().default(0.012),
+  SELECTOR_RANGE_DIFF_ATR_MAX: z.coerce.number().default(0.25),
+  SELECTOR_VWAP_LOOKBACK: z.coerce.number().default(120),
+
+  // Strategy tuning (optional)
+  PULLBACK_VOL_LOOKBACK: z.coerce.number().default(20),
+  PULLBACK_VOL_MULT: z.coerce.number().default(1.1),
+
+  PULLBACK_BARS: z.coerce.number().default(5),
+
+  BREAKOUT_LOOKBACK: z.coerce.number().default(20),
+  BREAKOUT_VOL_MULT: z.coerce.number().default(1.2),
+
+  VWAP_LOOKBACK: z.coerce.number().default(120),
+  VWAP_VOL_MULT: z.coerce.number().default(1.0),
+  ORB_MINUTES: z.coerce.number().default(15),
+  ORB_VOL_MULT: z.coerce.number().default(1.2),
+
+  // Volume spike strategy
+  VOL_SPIKE_LOOKBACK: z.coerce.number().default(20),
+  VOL_SPIKE_MULT: z.coerce.number().default(2),
+
+  BB_PERIOD: z.coerce.number().default(20),
+  BB_STD: z.coerce.number().default(2),
+  // Back-compat alias (some modules use BB_STDDEV)
+  BB_STDDEV: z.coerce.number().default(2),
+  BB_SQUEEZE_PCT: z.coerce.number().default(0.012),
+  BB_SQUEEZE_VOL_MULT: z.coerce.number().default(1.1),
+
+  // Back-compat aliases (some modules use SQUEEZE_*)
+  SQUEEZE_PCT: z.coerce.number().default(0.012),
+  SQUEEZE_VOL_MULT: z.coerce.number().default(1.1),
+
+  RSI_PERIOD: z.coerce.number().default(14),
+  RSI_OB: z.coerce.number().default(70),
+  RSI_OS: z.coerce.number().default(30),
+
+  // Back-compat aliases (some modules use RSI_OVERBOUGHT/RSI_OVERSOLD)
+  RSI_OVERBOUGHT: z.coerce.number().default(70),
+  RSI_OVERSOLD: z.coerce.number().default(30),
+
+  MOM_VOL_MULT: z.coerce.number().default(1.6),
+  MOM_BODY_FRAC: z.coerce.number().default(0.6),
+
+  FAKEOUT_LOOKBACK: z.coerce.number().default(20),
+  FAKEOUT_VOL_MULT: z.coerce.number().default(1.0),
+
+  FAKEOUT_WICK_FRAC: z.coerce.number().default(0.6),
+  FAKEOUT_MIN_RANGE_FRAC: z.coerce.number().default(0.004),
+
+  WICK_LOOKBACK: z.coerce.number().default(20),
+  WICK_MIN_WICK_FRAC: z.coerce.number().default(0.6),
+  EMA_FAST: z.coerce.number().default(9),
+  EMA_SLOW: z.coerce.number().default(21),
+  RR_TARGET: z.coerce.number().default(1.0),
+  RUNNER_MIN_TARGET_BPS: z.coerce.number().default(0),
+  SL_PCT_FALLBACK: z.coerce.number().default(0.3),
+
+  USE_MARGIN_SIZING: z.string().default("true"),
+  MARGIN_BUFFER_PCT: z.coerce.number().default(5),
+
+  // Position sizing mode:
+  // - RISK_THEN_MARGIN (default): size by RISK_PER_TRADE_INR then downsize if margin is insufficient
+  // - MARGIN: size purely from available margin (subject to caps)
+  // - RISK: size purely from risk (set USE_MARGIN_SIZING=false if you never want margin checks)
+  QTY_SIZING_MODE: z.string().default("RISK_THEN_MARGIN"),
+  // Use only this % of available margin for sizing (extra safety); 100 = use all available (minus buffer)
+  MARGIN_USE_PCT: z.coerce.number().default(100),
+  // Absolute safety cap even when sizing from margin (prevents huge qty on low-priced stocks)
+  MAX_QTY_HARDCAP: z.coerce.number().default(10000),
+
+  // Signal quality / regime filters (real-money recommended)
+  REGIME_FILTERS_ENABLED: z.string().default("true"),
+  MULTI_TF_ENABLED: z.string().default("true"),
+  MULTI_TF_MODE: z.string().default("TREND_ONLY"), // ALL | TREND_ONLY | OFF
+  MULTI_TF_INTERVAL_MIN: z.coerce.number().default(5),
+  MULTI_TF_EMA_FAST: z.coerce.number().default(9),
+  MULTI_TF_EMA_SLOW: z.coerce.number().default(21),
+
+  // Lookback caps (prevents heavy DB reads)
+  MTF_LOOKBACK_LIMIT: z.coerce.number().default(200),
+  ATR_LOOKBACK_LIMIT: z.coerce.number().default(200),
+
+  ENABLE_SPREAD_FILTER: z.string().default("false"),
+  MAX_SPREAD_BPS: z.coerce.number().default(15),
+  // Segment-specific spread caps (optional). If unset, MAX_SPREAD_BPS (or OPT_MAX_SPREAD_BPS for options) is used.
+  MAX_SPREAD_BPS_EQ: z.coerce.number().optional(),
+  MAX_SPREAD_BPS_FUT: z.coerce.number().optional(),
+  MAX_SPREAD_BPS_OPT: z.coerce.number().optional(),
+
+  ENABLE_REL_VOLUME_FILTER: z.string().default("true"),
+  // Strategy-aware thresholds (optional). If unset, engine falls back to MIN_REL_VOLUME.
+  MIN_REL_VOLUME_TREND: z.coerce.number().optional(),
+  MIN_REL_VOLUME_RANGE: z.coerce.number().optional(),
+  MIN_REL_VOLUME_OPEN: z.coerce.number().optional(),
+
+  // Strategy style vs regime alignment (tunable; defaults are safe/pro-like)
+  STRATEGY_STYLE_REGIME_GATES_ENABLED: z.string().default("true"),
+  TREND_ALLOWED_REGIMES: z.string().default("TREND,OPEN"),
+  RANGE_ALLOWED_REGIMES: z.string().default("RANGE,OPEN"),
+  OPEN_ALLOWED_REGIMES: z.string().default("OPEN,TREND"),
+
+  // Mean-reversion safety (optional): block RANGE strategies when higher-TF trend is strong
+  RANGE_AVOID_TREND: z.string().default("false"),
+  RANGE_MAX_TREND_STRENGTH_BPS: z.coerce.number().default(40),
+  MIN_REL_VOLUME: z.coerce.number().default(1.0),
+
+  ENABLE_VOLATILITY_FILTER: z.string().default("true"),
+  MIN_ATR_PCT: z.coerce.number().default(0.05), // % of price
+  MAX_ATR_PCT: z.coerce.number().default(2.5),
+
+  ENABLE_RANGE_PCTL_FILTER: z.string().default("false"),
+  RANGE_PCTL_LOOKBACK: z.coerce.number().default(50),
+  MIN_RANGE_PCTL: z.coerce.number().default(30),
+  MAX_RANGE_PCTL: z.coerce.number().default(99),
+
+  // Stop-loss quality gating
+  MIN_SL_TICKS: z.coerce.number().default(2),
+  MAX_SL_PCT: z.coerce.number().default(1.0),
+
+  // Signal quality gating (reduces overtrading)
+  // Skip signals below this confidence score (0-100). Set to 0 to disable.
+  MIN_SIGNAL_CONFIDENCE: z.coerce.number().default(75),
+
+  // Cost/edge gating (prevents tiny targets that cannot beat costs)
+  ENABLE_COST_GATE: z.string().default("true"),
+  COST_GATE_MULT: z.coerce.number().default(3), // expected move must be >= 3x estimated all-in costs
+  // Planned fee-multiple gate: (plannedProfit @ RR target) / estCosts. 0 disables.
+  FEE_MULTIPLE_PLANNED_MIN: z.coerce.number().default(0),
+  EXPECTED_MOVE_ATR_PERIOD: z.coerce.number().default(14),
+  EXPECTED_MOVE_ATR_MULT: z.coerce.number().default(0.5),
+  // Expected-move horizon: cost gate should match realistic holding time (5–15m)
+  EXPECTED_MOVE_HORIZON_MIN: z.coerce.number().default(15),
+  EXPECTED_MOVE_REF_INTERVALS: z.string().default("15,5,3,1"),
+  EXPECTED_MOVE_SCALE_MODE: z.string().default("SQRT_TIME"), // SQRT_TIME | NONE
+  // Approximate variable charges (STT+exch+SEBI+stamp+GST etc) as bps of turnover (buy+sell)
+  COST_VARIABLE_BPS: z.coerce.number().default(6),
+  COST_VARIABLE_BPS_OPT: z.coerce.number().optional(),
+  COST_VARIABLE_BPS_FUT: z.coerce.number().optional(),
+  COST_VARIABLE_BPS_EQ_DELIVERY: z.coerce.number().optional(),
+  // Slippage estimate for market orders as bps of turnover (buy+sell)
+  COST_SLIPPAGE_BPS: z.coerce.number().default(6),
+  COST_SLIPPAGE_BPS_OPT: z.coerce.number().optional(),
+  COST_SLIPPAGE_BPS_FUT: z.coerce.number().optional(),
+  COST_SLIPPAGE_BPS_EQ_DELIVERY: z.coerce.number().optional(),
+  INCLUDE_SPREAD_IN_COST: z.string().default("true"),
+  INCLUDE_SPREAD_IN_COST_OPT: z.string().optional(),
+  INCLUDE_SPREAD_IN_COST_FUT: z.string().optional(),
+  INCLUDE_SPREAD_IN_COST_EQ_DELIVERY: z.string().optional(),
+  // Brokerage model (Zerodha: min(cap, pct of order value))
+  BROKERAGE_PCT: z.coerce.number().default(0.03),
+  BROKERAGE_MAX_PER_ORDER: z.coerce.number().default(20),
+  // Derivatives (FUT/OPT): flat brokerage per executed order (Zerodha: ₹20/order).
+  BROKERAGE_FNO_PER_ORDER_INR: z.coerce.number().default(20),
+  BROKERAGE_FNO_PER_ORDER_INR_OPT: z.coerce.number().optional(),
+  BROKERAGE_FNO_PER_ORDER_INR_FUT: z.coerce.number().optional(),
+  // Equity delivery: typically ₹0 at Zerodha; override if your plan differs.
+  BROKERAGE_EQ_DELIVERY_PER_ORDER_INR: z.coerce.number().default(0),
+  BROKERAGE_EQ_DELIVERY_PER_ORDER_INR_EQ_DELIVERY: z.coerce.number().optional(),
+  EXPECTED_EXECUTED_ORDERS: z.coerce.number().default(2), // entry + one exit leg
+  EXPECTED_EXECUTED_ORDERS_OPT: z.coerce.number().optional(),
+  EXPECTED_EXECUTED_ORDERS_FUT: z.coerce.number().optional(),
+  EXPECTED_EXECUTED_ORDERS_EQ_DELIVERY: z.coerce.number().optional(),
+
+  // PATCH-6: Cost calibration (post-trade reconciliation adjusts estimator multiplier)
+  COST_CALIBRATION_ENABLED: z.string().default("false"),
+  COST_CALIBRATION_ALPHA: z.coerce.number().default(0.25),
+  COST_CALIBRATION_MULT_MIN: z.coerce.number().default(0.6),
+  COST_CALIBRATION_MULT_MAX: z.coerce.number().default(2.5),
+
+  // Don't take trades where planned SL (risk) in ₹ is too small (costs will dominate)
+  MIN_SL_INR: z.coerce.number().default(300),
+
+  // Softening for small accounts: if risk ₹ is below MIN_SL_INR, only block when
+  // risk ₹ is also below (MIN_SL_INR_COST_MULT * estimated round-trip cost).
+  // Example: with MIN_SL_INR=300 and MIN_SL_INR_COST_MULT=1.5, a ₹250-risk trade
+  // is allowed if estCost is <= ~₹166.
+  MIN_SL_INR_COST_MULT: z.coerce.number().default(1.5),
+
+  // Optional regime gate (copy pros: trend/open only)
+  REGIME_GATE_ENABLED: z.string().default("false"),
+  ALLOWED_REGIMES: z.string().default("OPEN,TREND"),
+
+  // Optional entry order type (MARKET or LIMIT). LIMIT reduces slippage but may miss fills.
+  ENTRY_ORDER_TYPE: z.string().default("MARKET"),
+  // Options-specific entry type (pro: LIMIT)
+  ENTRY_ORDER_TYPE_OPT: z.string().default("LIMIT"),
+  ENTRY_LIMIT_TIMEOUT_MS: z.coerce.number().default(2500),
+  ENTRY_LIMIT_FALLBACK_TO_MARKET: z.coerce.boolean().default(true),
+
+  // Optional simple caps (highly recommended)
+  MAX_QTY: z.coerce.number().optional(),
+  MAX_POSITION_VALUE_INR: z.coerce.number().optional(),
+
+  // Dynamic exit management (trail SL / adjust target)
+  DYNAMIC_EXITS_ENABLED: z.string().default("false"),
+  DYNAMIC_EXIT_MIN_INTERVAL_MS: z.coerce.number().default(5000),
+
+  DYN_ATR_PERIOD: z.coerce.number().default(14),
+  DYN_TRAIL_ATR_MULT: z.coerce.number().default(1.2),
+  DYN_MOVE_SL_TO_BE_AT_R: z.coerce.number().default(0.8),
+  // "True breakeven" = entry +/- estimated per-share cost * mult (avoid fee-negative BE exits)
+  DYN_BE_COST_MULT: z.coerce.number().default(1.0),
+  DYN_BE_BUFFER_TICKS: z.coerce.number().default(1),
+
+  // Start ATR trailing only after trade is meaningfully in profit (reduces noise stopouts)
+  DYN_TRAIL_START_R: z.coerce.number().default(1.0),
+
+  DYN_TRAIL_STEP_TICKS: z.coerce.number().default(2),
+
+  // STATIC | FOLLOW_RR | TIGHTEN_VWAP
+  DYN_TARGET_MODE: z.string().default("STATIC"),
+  DYN_TARGET_RR: z.coerce.number().optional(),
+  DYN_VWAP_LOOKBACK: z.coerce.number().default(120),
+  DYN_TARGET_TIGHTEN_FRAC: z.coerce.number().default(0.6),
+
+  // Pro safety: avoid shrinking targets early (kills avg winner vs fees)
+  DYN_ALLOW_TARGET_TIGHTEN: z.string().default("false"),
+  DYN_TARGET_TIGHTEN_AFTER_R: z.coerce.number().default(1.5),
+
+  // Pro mode: scale-out (TP1 + Runner)
+  SCALE_OUT_ENABLED: z.string().default("false"),
+  TP1_QTY_PCT: z.coerce.number().default(50), // % of position to book at TP1
+  TP1_R: z.coerce.number().default(1.0), // TP1 distance in R (risk units)
+
+  // Runner target planning
+  RUNNER_TARGET_PRIORITY: z.string().default("PIVOT,SWING,ATR,RR"),
+  RUNNER_MIN_RR: z.coerce.number().default(1.5),
+  RUNNER_FALLBACK_RR: z.coerce.number().default(2.0),
+  RUNNER_ATR_MULT: z.coerce.number().default(2.0),
+  RUNNER_SWING_LOOKBACK: z.coerce.number().default(120),
+  RUNNER_VWAP_LOOKBACK: z.coerce.number().default(120),
+  RUNNER_BE_BUFFER_TICKS: z.coerce.number().default(1),
+  RUNNER_KEEP_TP2_RESTING: z.string().default("true"),
+
+  // If true, dynamic exit adjustments start only after TP1 is done (recommended with scale-out).
+  DYNAMIC_EXITS_AFTER_TP1_ONLY: z.string().default("false"),
+
+  // =========================
+  // Dynamic pacing policy (aim trades/day without hard-coded gates)
+  // =========================
+  PACE_POLICY_ENABLED: z.string().default("true"),
+  PACE_TARGET_TRADES_PER_DAY: z.coerce.number().default(6),
+  PACE_MIN_CONF_FLOOR: z.coerce.number().default(62),
+  PACE_MAX_CONF_CEIL: z.coerce.number().default(85),
+  PACE_CONF_STEP: z.coerce.number().default(3),
+  PACE_MIN_SPREAD_FLOOR_BPS: z.coerce.number().default(14),
+  PACE_MAX_SPREAD_CEIL_BPS: z.coerce.number().default(22),
+  PACE_SPREAD_STEP_BPS: z.coerce.number().default(2),
+  PACE_MIN_REL_VOL_FLOOR: z.coerce.number().default(0.45),
+  PACE_MAX_REL_VOL_CEIL: z.coerce.number().default(1.2),
+  PACE_REL_VOL_STEP: z.coerce.number().default(0.05),
+
+  // =========================
+  // Plan builder (dynamic SL/Target from structure + ATR)
+  // =========================
+  PLAN_ENABLED: z.string().default("true"),
+  PLAN_CANDLE_LIMIT: z.coerce.number().default(800),
+  PLAN_SWING_LOOKBACK: z.coerce.number().default(60),
+  PLAN_RANGE_LOOKBACK: z.coerce.number().default(30),
+  PLAN_SL_ATR_K_TREND: z.coerce.number().default(0.8),
+  PLAN_SL_ATR_K_RANGE: z.coerce.number().default(0.6),
+  PLAN_SL_ATR_K_OPEN: z.coerce.number().default(1.0),
+  PLAN_SL_ATR_K_DEFAULT: z.coerce.number().default(0.8),
+  PLAN_TARGET_ATR_M_TREND: z.coerce.number().default(1.4),
+  PLAN_TARGET_ATR_M_RANGE: z.coerce.number().default(0.9),
+  PLAN_TARGET_ATR_M_OPEN: z.coerce.number().default(1.2),
+  PLAN_TARGET_ATR_M_DEFAULT: z.coerce.number().default(1.2),
+  PLAN_SL_NOISE_ATR_MIN_MULT: z.coerce.number().default(0.25),
+  PLAN_TARGET_EXPECTED_MOVE_MULT: z.coerce.number().default(1.3),
+
+  // Min RR by style (pro defaults)
+  STYLE_MIN_RR_TREND: z.coerce.number().default(1.6),
+  STYLE_MIN_RR_RANGE: z.coerce.number().default(1.3),
+  STYLE_MIN_RR_OPEN: z.coerce.number().default(1.4),
+  STYLE_MIN_RR_DEFAULT: z.coerce.number().default(1.4),
+
+  // OPEN bucket sizing
+  OPEN_RISK_MULT: z.coerce.number().default(0.7),
+
+  // =========================
+  // Options: underlying-based mapping helpers
+  // =========================
+  OPT_DELTA_ATM: z.coerce.number().default(0.5),
+  OPT_DELTA_ITM: z.coerce.number().default(0.65),
+  OPT_DELTA_OTM: z.coerce.number().default(0.4),
+  OPT_GAMMA_SCALE_MAX: z.coerce.number().default(1.25),
+  OPT_VOL_REF_ATR_PCT: z.coerce.number().default(0.6),
+});
+
+const env = schema.parse(process.env);
+
+// Back-compat mapping: allow older OPT_* env keys to drive the new canonical keys.
+// We check raw process.env presence so defaults don't accidentally override.
+function hasRawEnv(k) {
+  return (
+    Object.prototype.hasOwnProperty.call(process.env, k) &&
+    process.env[k] !== undefined &&
+    String(process.env[k]).trim() !== ""
+  );
+}
+if (!hasRawEnv("OPT_STRIKE_OFFSET_STEPS") && hasRawEnv("OPT_STRIKE_OFFSET")) {
+  env.OPT_STRIKE_OFFSET_STEPS = Number(env.OPT_STRIKE_OFFSET);
+}
+if (!hasRawEnv("OPT_ATM_SCAN_STEPS") && hasRawEnv("OPT_STRIKE_SCAN_STEPS")) {
+  env.OPT_ATM_SCAN_STEPS = Number(env.OPT_STRIKE_SCAN_STEPS);
+}
+
+// --- Trading window validation (PROD SAFETY) ---
+// We must NEVER trade with an invalid window configuration.
+// If STOP_NEW_ENTRIES_AFTER >= FORCE_FLATTEN_AT:
+//  - In development: you may set AUTO_FIX_TIME_WINDOWS=true to auto-fix safely.
+//  - In production: default is strict (crash early) so you don't run unsafe.
+function parseHHmm(value, name) {
+  const s = String(value || "").trim();
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(s);
+  if (!m)
+    throw new Error(
+      `[config] Invalid time format for ${name}: "${s}" (expected HH:mm)`,
+    );
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+function toHHmm(totalMin) {
+  const mm = Math.max(0, Math.min(23 * 60 + 59, Math.floor(totalMin)));
+  const h = String(Math.floor(mm / 60)).padStart(2, "0");
+  const m = String(mm % 60).padStart(2, "0");
+  return `${h}:${m}`;
+}
+
+(function validateTradingWindows() {
+  const stopEntryMin = parseHHmm(
+    env.STOP_NEW_ENTRIES_AFTER,
+    "STOP_NEW_ENTRIES_AFTER",
+  );
+  const flattenMin = parseHHmm(env.FORCE_FLATTEN_AT, "FORCE_FLATTEN_AT");
+
+  if (stopEntryMin >= flattenMin) {
+    const autoFix = String(env.AUTO_FIX_TIME_WINDOWS || "false") === "true";
+    const fixed = toHHmm(flattenMin - 15);
+
+    const msg =
+      `[config] Invalid time windows: STOP_NEW_ENTRIES_AFTER (${env.STOP_NEW_ENTRIES_AFTER}) ` +
+      `must be earlier than FORCE_FLATTEN_AT (${env.FORCE_FLATTEN_AT}).`;
+
+    if (autoFix) {
+      // eslint-disable-next-line no-console
+      console.warn(`${msg} Auto-fixing STOP_NEW_ENTRIES_AFTER to ${fixed}.`);
+      env.STOP_NEW_ENTRIES_AFTER = fixed;
+    } else {
+      // Fail-fast: never start trading with unsafe windows.
+      throw new Error(
+        `${msg} Fix your .env (recommended: STOP_NEW_ENTRIES_AFTER=15:00, FORCE_FLATTEN_AT=15:15)`,
+      );
+    }
+  }
+})();
+
+const subscribeTokens = Array.from(
+  new Set(
+    String(process.env.SUBSCRIBE_TOKENS || "")
+      .split(",")
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isFinite(n) && n > 0),
+  ),
+);
+
+const subscribeSymbols = Array.from(
+  new Set(
+    String(process.env.SUBSCRIBE_SYMBOLS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  ),
+);
+
+module.exports = { env, subscribeTokens, subscribeSymbols };

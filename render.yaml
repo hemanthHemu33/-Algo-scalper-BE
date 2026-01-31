@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: kite-scalper-engine
+    env: node
+    region: singapore
+    plan: starter
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /ready
+    autoDeploy: false
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      # ---- REQUIRED (set in Render dashboard as secrets) ----
+      # - MONGO_URI
+      # - MONGO_DB
+      # - KITE_API_KEY
+      # - KITE_TOKEN_COLLECTION
+      # ---- SUBSCRIBE ----
+      # - SUBSCRIBE_SYMBOLS (e.g. NSE:RELIANCE)
+      # ---- TRADING ----
+      # - TRADING_ENABLED ("true" when ready)
+      # - DEFAULT_PRODUCT (MIS)
+      # ---- TELEGRAM ----
+      # - TELEGRAM_ENABLED ("true")
+      # - TELEGRAM_BOT_TOKEN
+      # - TELEGRAM_CHAT_ID
