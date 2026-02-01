@@ -19,6 +19,7 @@
     "mongodb": "^6.20.0",
     "pino": "^9.3.2",
     "pino-pretty": "^11.2.2",
+    "socket.io": "^4.7.5",
     "zod": "^3.23.8"
   },
   "devDependencies": {

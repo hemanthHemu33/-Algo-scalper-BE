@@ -13,6 +13,8 @@ const { setSession } = require("./kite/tickerManager");
 const { telemetry } = require("./telemetry/signalTelemetry");
 const { tradeTelemetry } = require("./telemetry/tradeTelemetry");
 const { optimizer } = require("./optimizer/adaptiveOptimizer");
+const http = require("http");
+const { attachSocketServer } = require("./socket/socketServer");
 
 function applyWindowsSrvDnsWorkaround() {
   // Workaround for Node.js Windows SRV DNS regressions that can manifest as:
@@ -140,7 +142,9 @@ async function main() {
   });
 
   const app = buildApp();
-  const server = app.listen(env.PORT, () => {
+  const httpServer = http.createServer(app);
+  const io = attachSocketServer(httpServer);
+  const server = httpServer.listen(env.PORT, () => {
     logger.info({ port: env.PORT }, "server started");
     alert("info", "🚀 Scalper engine started", {
       port: env.PORT,
@@ -152,6 +156,9 @@ async function main() {
     logger.warn({ signal }, "shutdown");
     alert("warn", `🧯 Shutdown signal: ${signal}`, { signal }).catch(() => {});
     try {
+      try {
+        if (io) io.close();
+      } catch {}
       server.close(() => logger.warn("server closed"));
     } catch {}
     setTimeout(() => process.exit(0), 500).unref();

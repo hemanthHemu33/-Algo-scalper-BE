@@ -25,6 +25,15 @@ const schema = z.object({
   // CORS
   CORS_ORIGIN: z.string().optional(),
 
+  // Socket.IO (dashboard streaming)
+  SOCKET_ENABLED: z.string().default("true"),
+  SOCKET_PATH: z.string().default("/socket.io"),
+  WS_STATUS_INTERVAL_MS: z.coerce.number().default(2000),
+  WS_SUBS_INTERVAL_MS: z.coerce.number().default(5000),
+  WS_TRADES_INTERVAL_MS: z.coerce.number().default(2000),
+  WS_CHART_INTERVAL_MS: z.coerce.number().default(1000),
+  WS_CHART_MAX_DELTA: z.coerce.number().default(200),
+
   // Local dotenv loader toggle (config.js pre-loads dotenv using process.env too)
   DOTENV_ENABLED: z.string().optional(),
   DOTENV_PATH: z.string().optional(),

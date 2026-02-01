@@ -134,6 +134,38 @@ async function getRecentCandles(instrument_token, intervalMin, limit = 250) {
   return rows.reverse();
 }
 
+async function getCandlesSince(
+  instrument_token,
+  intervalMin,
+  sinceMs,
+  limit = 200,
+) {
+  const db = getDb();
+  const col = db.collection(collectionName(intervalMin));
+
+  const since = Number(sinceMs);
+  const lim = Number(limit);
+  const safeLimit = Number.isFinite(lim)
+    ? Math.min(2000, Math.max(1, lim))
+    : 200;
+
+  if (!Number.isFinite(since) || since <= 0) {
+    // Fallback: behave like recent candles when since is missing
+    return getRecentCandles(instrument_token, intervalMin, safeLimit);
+  }
+
+  const rows = await col
+    .find({
+      instrument_token: Number(instrument_token),
+      ts: { $gte: new Date(since) },
+    })
+    .sort({ ts: 1 })
+    .limit(safeLimit)
+    .toArray();
+
+  return rows;
+}
+
 module.exports = {
   collectionName,
   ttlDaysForInterval,
@@ -141,4 +173,5 @@ module.exports = {
   upsertCandle,
   insertManyCandles,
   getRecentCandles,
+  getCandlesSince,
 };
