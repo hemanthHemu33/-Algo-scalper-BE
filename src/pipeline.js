@@ -322,6 +322,14 @@ function buildPipeline({ kite, tickerCtrl }) {
     }, "onOrderUpdate");
   }
 
+  async function ocoReconcile() {
+    if (typeof trader.positionFirstReconcile !== "function") return;
+    return enqueue(
+      () => trader.positionFirstReconcile("oco_timer"),
+      "ocoReconcile",
+    );
+  }
+
   async function setKillSwitch(enabled, reason) {
     // Persist kill-switch in DB via TradeManager so it survives restarts.
     if (typeof trader.setKillSwitch === "function") {
@@ -363,6 +371,7 @@ function buildPipeline({ kite, tickerCtrl }) {
     onTicks,
     onOrderUpdate,
     reconcile,
+    ocoReconcile,
     setKillSwitch,
     status,
     trader,

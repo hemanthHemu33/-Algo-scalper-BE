@@ -82,5 +82,14 @@
       "name": "Diwali Laxmi Pujan (Sunday) \u2013 Muhurat session may be announced"
     }
   ],
-  "special_sessions": []
+  "special_sessions": [
+    {
+      "date": "2026-02-01",
+      "name": "Union Budget 2026 live trading session",
+      "allowTrading": true,
+      "open": "09:15",
+      "close": "15:30",
+      "stopNewEntriesAfter": "15:00"
+    }
+  ]
 }

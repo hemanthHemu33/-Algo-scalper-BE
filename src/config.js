@@ -264,6 +264,13 @@ const schema = z.object({
   // Minimum SL distance enforced by fitter (in ticks). Helps avoid ultra-tight “0.05 SL” fitting.
   OPT_SL_FIT_MIN_TICKS: z.coerce.number().default(10),
 
+  // PLAN/Options exits — premium-aware initial SL/TP (plan builder uses option candles when available)
+  OPT_PLAN_PREMIUM_AWARE: z.coerce.boolean().default(true),
+  OPT_PLAN_PREM_CANDLE_LIMIT: z.coerce.number().default(800),
+  OPT_PLAN_PREM_ATR_PERIOD: z.coerce.number().default(14),
+  OPT_PLAN_PREM_ATR_K: z.coerce.number().default(1.1),
+  OPT_PLAN_PREM_ATR_M: z.coerce.number().default(1.8),
+
   // PATCH-4/Options exits — premium-based dynamic exit model (used by DynamicExitManager)
   OPT_EXIT_MODEL: z.string().default("PREMIUM_PCT"),
   OPT_EXIT_MAX_HOLD_MIN: z.coerce.number().default(25),
@@ -678,7 +685,8 @@ const schema = z.object({
   // Options-specific entry type (pro: LIMIT)
   ENTRY_ORDER_TYPE_OPT: z.string().default("LIMIT"),
   ENTRY_LIMIT_TIMEOUT_MS: z.coerce.number().default(2500),
-  ENTRY_LIMIT_FALLBACK_TO_MARKET: z.coerce.boolean().default(true),
+  // Safety: do NOT auto-convert LIMIT -> MARKET. If you accept slippage, set ENTRY_ORDER_TYPE_OPT=MARKET explicitly.
+  ENTRY_LIMIT_FALLBACK_TO_MARKET: z.coerce.boolean().default(false),
 
   // Optional simple caps (highly recommended)
   MAX_QTY: z.coerce.number().optional(),

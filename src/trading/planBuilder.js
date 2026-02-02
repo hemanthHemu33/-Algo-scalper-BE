@@ -1,4 +1,5 @@
 const { DateTime } = require("luxon");
+const { buildPremiumAwareOptionPlan } = require("./optionPremiumPlanner");
 
 /**
  * Pro-style plan builder:
@@ -237,6 +238,7 @@ function daysToExpiry(optionMeta) {
 function buildTradePlan({
   env,
   candles,
+  premiumCandles,
   intervalMin,
   side, // underlying BUY/SELL
   signalStyle,
@@ -437,6 +439,11 @@ function buildTradePlan({
     if (!Number.isFinite(premEntry) || premEntry <= 0)
       return { ok: false, reason: "bad_premium_entry" };
 
+    const t = safeNum(premiumTick, 0.05);
+
+    // ----------------------------
+    // 1) Underlying -> premium map (fallback / reference)
+    // ----------------------------
     const delta = safeNum(optionMeta?.delta, null);
     const gamma = safeNum(optionMeta?.gamma, null);
 
@@ -460,13 +467,14 @@ function buildTradePlan({
         ? clamp(atrPct / volRef, 0.6, 1.8)
         : 1.0;
 
-    // Tighten stop near expiry/high vol (safer)
-    const stopScale = clamp(1 - 0.25 * near - 0.1 * (volFactor - 1), 0.65, 1.0);
-    const targetScale = clamp(
-      1 + 0.15 * near,
+    // Near expiry / high vol => premium is whippy (gamma + IV noise).
+    // Widen SL a bit (avoid churn). Keep target mildly conservative.
+    const stopScale = clamp(
+      1 + 0.2 * near + 0.15 * (volFactor - 1),
       1.0,
-      safeNum(env.OPT_GAMMA_SCALE_MAX, 1.25),
+      safeNum(env.OPT_GAMMA_SCALE_MAX, 1.35),
     );
+    const targetScale = clamp(1 - 0.05 * near, 0.85, 1.15);
 
     const underlyingRisk = Math.abs(entryU - stopU);
     const underlyingReward = Math.abs(targetU - entryU);
@@ -479,56 +487,131 @@ function buildTradePlan({
       return linear + convex;
     };
 
-    const premDrop = mapMove(underlyingRisk) * stopScale;
-    const premGain = mapMove(underlyingReward) * targetScale;
+    const premDropMapped = mapMove(underlyingRisk) * stopScale;
+    const premGainMapped = mapMove(underlyingReward) * targetScale;
 
-    let stopP = premEntry - premDrop;
-    let targetP = premEntry + premGain;
+    let stopP_mapped = premEntry - premDropMapped;
+    let targetP_mapped = premEntry + premGainMapped;
 
     // Max loss cap on premium
     const maxSlPct = safeNum(env.OPT_MAX_SL_PCT, 35);
     const maxDrop = premEntry * (maxSlPct / 100);
-    if (premEntry - stopP > maxDrop) stopP = premEntry - maxDrop;
+    if (premEntry - stopP_mapped > maxDrop) stopP_mapped = premEntry - maxDrop;
 
-    const t = safeNum(premiumTick, 0.05);
-    stopP = roundToTick(stopP, t, "down");
-    targetP = roundToTick(targetP, t, "up");
+    stopP_mapped = roundToTick(stopP_mapped, t, "down");
+    targetP_mapped = roundToTick(targetP_mapped, t, "up");
 
-    if (stopP >= premEntry)
-      stopP = roundToTick(
-        premEntry - Math.max(0.05, premEntry * 0.08),
+    if (stopP_mapped >= premEntry)
+      stopP_mapped = roundToTick(
+        premEntry - Math.max(t * 4, premEntry * 0.08),
         t,
         "down",
       );
-    if (targetP <= premEntry)
-      targetP = roundToTick(
-        premEntry + Math.max(0.05, premEntry * 0.12),
+    if (targetP_mapped <= premEntry)
+      targetP_mapped = roundToTick(
+        premEntry + Math.max(t * 4, premEntry * 0.12),
         t,
         "up",
       );
 
-    const Rp = Math.abs(premEntry - stopP);
-    const rrP = Math.abs(targetP - premEntry) / (Rp || 1e-9);
+    const Rp_mapped = Math.abs(premEntry - stopP_mapped);
+    const rrP_mapped =
+      Math.abs(targetP_mapped - premEntry) / (Rp_mapped || 1e-9);
+
+    // ----------------------------
+    // 2) Premium-aware plan (preferred when candles exist)
+    // ----------------------------
+    const enablePremiumAware =
+      String(env.OPT_PLAN_PREMIUM_AWARE ?? "true") !== "false";
+    const premPlan = enablePremiumAware
+      ? buildPremiumAwareOptionPlan({
+          env,
+          side: "BUY", // option-leg is long (BUY) even if underlying leg is SELL for puts
+          entryPremium: premEntry,
+          premiumTick: t,
+          premiumCandles,
+          optionMeta,
+          rrMin: minRr,
+        })
+      : { ok: false, reason: "disabled" };
+
+    let stopP = stopP_mapped;
+    let targetP = targetP_mapped;
+    let rrP = rrP_mapped;
+
+    if (premPlan.ok) {
+      // Avoid too-tight stops: pick the wider (more room) stop.
+      stopP = Math.min(stopP_mapped, Number(premPlan.stopLoss));
+
+      // Re-apply max loss cap (rare but safe)
+      if (premEntry - stopP > maxDrop) stopP = premEntry - maxDrop;
+      stopP = roundToTick(stopP, t, "down");
+
+      const Rp = Math.abs(premEntry - stopP);
+      const minTarget = premEntry + minRr * (Rp || 0);
+
+      // Avoid unrealistic targets: prefer the closer target, but enforce minRR.
+      const closerTarget = Math.min(
+        targetP_mapped,
+        Number(premPlan.targetPrice),
+      );
+
+      targetP = Math.max(closerTarget, minTarget);
+      targetP = roundToTick(targetP, t, "up");
+
+      rrP = Math.abs(targetP - premEntry) / (Rp || 1e-9);
+
+      expectedMovePerUnit = Math.abs(targetP - premEntry);
+
+      meta.option = {
+        modelUsed: "PREMIUM_AWARE_BLEND",
+        absDelta,
+        delta: Number.isFinite(delta) ? delta : null,
+        gamma: Number.isFinite(gamma) ? gamma : null,
+        daysToExpiry: Number.isFinite(dte) ? dte : null,
+        volFactor,
+        entryPremium: premEntry,
+        mapped: {
+          stopScale,
+          targetScale,
+          stopPremium: stopP_mapped,
+          targetPremium: targetP_mapped,
+          rrPremium: rrP_mapped,
+        },
+        premiumAware: premPlan.meta || null,
+        final: {
+          stopPremium: stopP,
+          targetPremium: targetP,
+          rrPremium: rrP,
+        },
+      };
+    } else {
+      expectedMovePerUnit = Math.abs(targetP_mapped - premEntry);
+
+      meta.option = {
+        modelUsed: "DELTA_GAMMA_MAP_ONLY",
+        absDelta,
+        delta: Number.isFinite(delta) ? delta : null,
+        gamma: Number.isFinite(gamma) ? gamma : null,
+        daysToExpiry: Number.isFinite(dte) ? dte : null,
+        stopScale,
+        targetScale,
+        entryPremium: premEntry,
+        stopPremium: stopP_mapped,
+        targetPremium: targetP_mapped,
+        rrPremium: rrP_mapped,
+        volFactor,
+        premiumAware: premPlan.ok ? premPlan.meta : null,
+      };
+
+      stopP = stopP_mapped;
+      targetP = targetP_mapped;
+      rrP = rrP_mapped;
+    }
 
     stop = stopP;
     target = targetP;
     rrFinal = rrP;
-
-    expectedMovePerUnit = Number.isFinite(em) ? em * absDelta : null;
-
-    meta.option = {
-      absDelta,
-      delta: Number.isFinite(delta) ? delta : null,
-      gamma: Number.isFinite(gamma) ? gamma : null,
-      daysToExpiry: Number.isFinite(dte) ? dte : null,
-      stopScale,
-      targetScale,
-      entryPremium: premEntry,
-      stopPremium: stopP,
-      targetPremium: targetP,
-      rrPremium: rrP,
-      volFactor,
-    };
   }
 
   return {

@@ -23,6 +23,7 @@ let tickQueue = [];
 let draining = false;
 
 let reconcileTimer = null;
+let ocoReconcileTimer = null;
 
 // Track ALL subscribed tokens (base universe + runtime position tokens)
 let subscribedTokens = new Set();
@@ -214,17 +215,42 @@ async function ensureActivePositionSubscriptions({
   return { ok: true, added: missing };
 }
 
+function startOcoReconcileLoop() {
+  if (ocoReconcileTimer) return;
+  const everySec = Number(env.OCO_RECONCILE_INTERVAL_SEC || 5);
+  if (!Number.isFinite(everySec) || everySec <= 0) return;
+
+  ocoReconcileTimer = setInterval(
+    () => {
+      if (!tickerConnected) return;
+      if (!pipeline || typeof pipeline.ocoReconcile !== "function") return;
+      pipeline.ocoReconcile().catch(() => {});
+    },
+    Math.max(1, everySec) * 1000,
+  );
+}
+
+function stopOcoReconcileLoop() {
+  if (ocoReconcileTimer) {
+    clearInterval(ocoReconcileTimer);
+    ocoReconcileTimer = null;
+  }
+}
+
 function stopReconcileLoop() {
   if (reconcileTimer) {
     clearInterval(reconcileTimer);
     reconcileTimer = null;
   }
+  stopOcoReconcileLoop();
 }
 
 function startReconcileLoop() {
   stopReconcileLoop();
   const sec = _num(env.RECONCILE_INTERVAL_SEC, 60);
   if (!Number.isFinite(sec) || sec <= 0) return;
+
+  startOcoReconcileLoop();
 
   reconcileTimer = setInterval(() => {
     if (!pipeline) return;

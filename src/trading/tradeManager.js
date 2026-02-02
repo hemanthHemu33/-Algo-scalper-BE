@@ -7,7 +7,7 @@ const { telemetry } = require("../telemetry/signalTelemetry");
 const { tradeTelemetry } = require("../telemetry/tradeTelemetry");
 const { marginAwareQty } = require("./marginSizer");
 const { alert } = require("../alerts/alertService");
-const { isHalted } = require("../runtime/halt");
+const { halt, isHalted } = require("../runtime/halt");
 const { getDb } = require("../db");
 const { ensureInstrument } = require("../instruments/instrumentRepo");
 const { getLastFnoUniverse, buildFnoUniverse } = require("../fno/fnoUniverse");
@@ -119,6 +119,15 @@ class TradeManager {
     this.lastPriceByToken = new Map(); // token -> ltp
     this.activeTradeId = null; // single-stock mode
     this.recoveredPosition = null; // set when positions exist but trade state missing
+
+    // OCO race safety: remember the most recently closed trade for a short window
+    // so we can detect and clean up late exit fills (double-fill) and leftover exit orders.
+    this.lastClosedTradeId = null;
+    this.lastClosedToken = null;
+    this.lastClosedAt = 0;
+
+    // Prevent overlapping OCO reconcile ticks
+    this._ocoReconcileInFlight = false;
 
     // Prevent duplicate SL/TARGET placement (concurrent calls)
     this.exitPlacementLocks = new Set(); // tradeId -> locked?
@@ -745,7 +754,7 @@ class TradeManager {
     }
   }
 
-  async _panicExit(trade, reason) {
+  async _panicExit(trade, reason, opts = {}) {
     const tradeId = trade?.tradeId;
     try {
       if (!tradeId) return;
@@ -760,7 +769,8 @@ class TradeManager {
         return;
       }
 
-      if (isHalted()) {
+      const allowWhenHalted = !!opts.allowWhenHalted;
+      if (isHalted() && !allowWhenHalted) {
         logger.warn({ tradeId }, "[panic] skipped (halted)");
         return;
       }
@@ -1166,6 +1176,244 @@ class TradeManager {
     // 5) Normal reconciliation for active trades from DB
     for (const t of actives) {
       await this._reconcileTrade(t, byId, posQtyByToken);
+    }
+  }
+
+  async _cancelRemainingExitsOnce(trade, reason) {
+    const tradeId = trade?.tradeId;
+    if (!tradeId) return;
+
+    // Avoid spamming cancel requests every tick
+    if (trade.ocoCleanupAt) return;
+
+    await updateTrade(tradeId, {
+      ocoCleanupAt: new Date(),
+      ocoCleanupReason: String(reason || "OCO_CLEANUP"),
+    });
+
+    const variety = String(env.DEFAULT_ORDER_VARIETY || "regular");
+    const ids = [
+      trade.slOrderId,
+      trade.targetOrderId,
+      trade.tp1OrderId,
+      trade.tp2OrderId,
+    ].filter(Boolean);
+
+    for (const oid of ids) {
+      try {
+        this.expectedCancelOrderIds.add(String(oid));
+        await this._safeCancelOrder(variety, oid, {
+          purpose: "OCO_CLEANUP_CANCEL",
+          tradeId,
+          reason: String(reason || "OCO_CLEANUP"),
+        });
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  async _handleOcoDoubleFill(trade, filledRole, order) {
+    const tradeId = trade?.tradeId;
+    const token = Number(trade?.instrument_token);
+    const orderId = order?.order_id;
+
+    logger.error(
+      { tradeId, token, filledRole, orderId, status: trade?.status },
+      "[oco] DOUBLE-FILL detected (both exits may have filled) -> emergency flatten + halt",
+    );
+
+    alert(
+      "error",
+      "🚨 OCO DOUBLE-FILL detected (exit race) -> flatten + halt",
+      { tradeId, token, filledRole, orderId, status: trade?.status },
+    ).catch(() => {});
+
+    try {
+      await updateTrade(tradeId, {
+        ocoDoubleFillDetected: true,
+        ocoDoubleFillRole: String(filledRole || ""),
+        ocoDoubleFillOrderId: orderId ? String(orderId) : null,
+        ocoDoubleFillAt: new Date(),
+      });
+    } catch {}
+
+    await this.setKillSwitch(true, "OCO_DOUBLE_FILL");
+    await this._panicExit(trade, "OCO_DOUBLE_FILL", { allowWhenHalted: true });
+    await halt("OCO_DOUBLE_FILL", { tradeId, token, filledRole, orderId });
+  }
+
+  async positionFirstReconcile(source = "oco_tick") {
+    // Position-first reconciler:
+    // - if position is flat -> cancel remaining exits
+    // - if position is reversed / over-exited -> emergency flatten + halt
+
+    const enabled =
+      String(env.OCO_POSITION_RECONCILER_ENABLED || "true") !== "false";
+    if (!enabled) return;
+
+    if (this._ocoReconcileInFlight) return;
+    this._ocoReconcileInFlight = true;
+    try {
+      if (!this.kite || typeof this.kite.getPositions !== "function") return;
+
+      const winSec = Number(env.OCO_RECENT_CLOSED_WINDOW_SEC || 120);
+      const now = Date.now();
+
+      const watchTradeIds = [];
+      if (this.activeTradeId) watchTradeIds.push(this.activeTradeId);
+      if (
+        this.lastClosedTradeId &&
+        this.lastClosedTradeId !== this.activeTradeId &&
+        winSec > 0 &&
+        now - Number(this.lastClosedAt || 0) <= winSec * 1000
+      ) {
+        watchTradeIds.push(this.lastClosedTradeId);
+      }
+      if (!watchTradeIds.length) return;
+
+      // Fetch positions once
+      let positions;
+      try {
+        positions = await this.kite.getPositions();
+      } catch (e) {
+        logger.warn(
+          { e: e?.message || String(e) },
+          "[oco] getPositions failed",
+        );
+        return;
+      }
+
+      const net = positions?.net || positions?.day || [];
+      const posQtyByToken = new Map();
+      for (const p of net || []) {
+        const tok = Number(p?.instrument_token);
+        if (!Number.isFinite(tok)) continue;
+        const q = Number(p?.quantity ?? p?.net_quantity ?? 0);
+        if (!Number.isFinite(q)) continue;
+        posQtyByToken.set(tok, q);
+      }
+
+      for (const tradeId of watchTradeIds) {
+        const trade = await getTrade(tradeId);
+        if (!trade) continue;
+        const token = Number(trade.instrument_token);
+        const netQty = Number(posQtyByToken.get(token) || 0);
+        const expectedQty = Math.abs(Number(trade.qty || 0));
+        const expectedSign =
+          String(trade.side || "").toUpperCase() === "SELL" ? -1 : 1;
+
+        // If trade is terminal, we expect broker position == 0
+        const isTerminal = [
+          STATUS.EXITED_TARGET,
+          STATUS.EXITED_SL,
+          STATUS.ENTRY_FAILED,
+          STATUS.CLOSED,
+        ].includes(trade.status);
+
+        if (netQty === 0) {
+          // cancel any remaining exits ASAP (reduces accidental re-entry via dangling SL/TGT)
+          if (
+            trade.slOrderId ||
+            trade.targetOrderId ||
+            trade.tp1OrderId ||
+            trade.tp2OrderId
+          ) {
+            await this._cancelRemainingExitsOnce(
+              trade,
+              `POSITION_FLAT_${source}`,
+            );
+          }
+
+          // If trade still thinks it's active, this is a state mismatch -> stop trading (safest)
+          if (
+            [STATUS.ENTRY_FILLED, STATUS.LIVE, STATUS.GUARD_FAILED].includes(
+              trade.status,
+            )
+          ) {
+            logger.error(
+              { tradeId, token, status: trade.status },
+              "[oco] broker position flat while trade is active (state mismatch)",
+            );
+            await this.setKillSwitch(true, "OCO_BROKER_POSITION_FLAT");
+            await upsertDailyRisk(todayKey(), {
+              kill: true,
+              reason: "OCO_BROKER_POSITION_FLAT",
+              lastTradeId: tradeId,
+            });
+            // Best-effort close record so engine does not keep thinking we have a position
+            await updateTrade(tradeId, {
+              status: STATUS.CLOSED,
+              closeReason: "OCO_BROKER_POSITION_FLAT",
+              closedAt: new Date(),
+            });
+            await this._finalizeClosed(tradeId, token);
+          }
+          continue;
+        }
+
+        // Non-zero position: if trade is terminal, this is leftover exposure.
+        if (isTerminal) {
+          logger.error(
+            { tradeId, token, netQty, status: trade.status },
+            "[oco] broker position non-zero after trade is terminal (leftover exposure)",
+          );
+          await this.setKillSwitch(true, "OCO_LEFTOVER_POSITION_AFTER_CLOSE");
+          await updateTrade(tradeId, {
+            ocoResidualPosition: netQty,
+            ocoResidualDetectedAt: new Date(),
+          });
+          await this._panicExit(trade, "OCO_LEFTOVER_POSITION_AFTER_CLOSE", {
+            allowWhenHalted: true,
+          });
+          await halt("OCO_LEFTOVER_POSITION_AFTER_CLOSE", {
+            tradeId,
+            token,
+            netQty,
+            source,
+          });
+          continue;
+        }
+
+        // Active trade: detect sign flip (double-exit OCO race) or size anomaly
+        const flipped = expectedSign * netQty < 0;
+        const tooBig = expectedQty > 0 && Math.abs(netQty) > expectedQty;
+
+        if (flipped || tooBig) {
+          logger.error(
+            {
+              tradeId,
+              token,
+              netQty,
+              expectedQty,
+              expectedSign,
+              status: trade.status,
+            },
+            "[oco] position mismatch (possible double-exit / over-exit)",
+          );
+          await this.setKillSwitch(true, "OCO_POSITION_MISMATCH");
+          await updateTrade(tradeId, {
+            ocoMismatchDetectedAt: new Date(),
+            ocoMismatchNetQty: netQty,
+            ocoMismatchExpectedQty: expectedQty,
+            ocoMismatchExpectedSign: expectedSign,
+          });
+          await this._panicExit(trade, "OCO_POSITION_MISMATCH", {
+            allowWhenHalted: true,
+          });
+          await halt("OCO_POSITION_MISMATCH", {
+            tradeId,
+            token,
+            netQty,
+            expectedQty,
+            expectedSign,
+            source,
+          });
+          continue;
+        }
+      }
+    } finally {
+      this._ocoReconcileInFlight = false;
     }
   }
 
@@ -2755,6 +3003,18 @@ class TradeManager {
           Number(env.PLAN_CANDLE_LIMIT || 800),
         );
 
+        // For options, also fetch option-premium candles (premium-aware exits)
+        let premiumCandles = null;
+        if (s.option_meta) {
+          premiumCandles = await getRecentCandles(
+            token, // option token (not underlying)
+            intervalMin,
+            Number(
+              env.OPT_PLAN_PREM_CANDLE_LIMIT || env.PLAN_CANDLE_LIMIT || 800,
+            ),
+          );
+        }
+
         const entryUnderlying = Number(
           s.option_meta
             ? s.underlying_ltp || s.candle?.close || 0
@@ -2771,6 +3031,7 @@ class TradeManager {
         plan = buildTradePlan({
           env,
           candles: planCandles,
+          premiumCandles,
           intervalMin,
           side: regimeSide,
           signalStyle: s.strategyStyle,
@@ -3884,8 +4145,53 @@ class TradeManager {
         return;
       }
 
-      if (status === "COMPLETE")
+      if (status === "COMPLETE") {
+        // OCO race safety: if SL already filled (or trade already closed), this TARGET fill can flip position.
+        const freshTrade = await getTrade(trade.tradeId);
+        const tStatus = freshTrade?.status || trade.status;
+        if ([STATUS.EXITED_SL, STATUS.CLOSED].includes(tStatus)) {
+          logger.error(
+            {
+              tradeId: trade.tradeId,
+              role: link.role,
+              status,
+              orderId,
+              tradeStatus: tStatus,
+            },
+            "[oco] double-exit detected (TARGET filled after SL/close)",
+          );
+          await updateTrade(trade.tradeId, {
+            ocoDoubleFillDetectedAt: new Date(),
+            ocoDoubleFillRole: "TARGET",
+            ocoDoubleFillTradeStatus: tStatus,
+          });
+          await this.setKillSwitch(true, "OCO_DOUBLE_FILL");
+          await this._panicExit(freshTrade || trade, "OCO_DOUBLE_FILL_TARGET", {
+            allowWhenHalted: true,
+          });
+          await halt("OCO_DOUBLE_FILL", {
+            tradeId: trade.tradeId,
+            role: "TARGET",
+            orderId,
+          });
+          return;
+        }
+        // Duplicate update for already-target-exited trades -> ignore
+        if (tStatus === STATUS.EXITED_TARGET) {
+          logger.info(
+            {
+              tradeId: trade.tradeId,
+              role: link.role,
+              status,
+              orderId,
+              tradeStatus: tStatus,
+            },
+            "[order_update] duplicate TARGET complete ignored",
+          );
+          return;
+        }
         return this._onTargetFilled(trade.tradeId, trade, order);
+      }
 
       if (isDead(status)) {
         // If the trade is already terminal, ignore late exit-leg events (common after restart / OCO)
@@ -3944,8 +4250,53 @@ class TradeManager {
         return;
       }
 
-      if (status === "COMPLETE")
+      if (status === "COMPLETE") {
+        // OCO race safety: if TARGET already filled (or trade already closed), this SL fill can flip position.
+        const freshTrade = await getTrade(trade.tradeId);
+        const tStatus = freshTrade?.status || trade.status;
+        if ([STATUS.EXITED_TARGET, STATUS.CLOSED].includes(tStatus)) {
+          logger.error(
+            {
+              tradeId: trade.tradeId,
+              role: link.role,
+              status,
+              orderId,
+              tradeStatus: tStatus,
+            },
+            "[oco] double-exit detected (SL filled after TARGET/close)",
+          );
+          await updateTrade(trade.tradeId, {
+            ocoDoubleFillDetectedAt: new Date(),
+            ocoDoubleFillRole: "SL",
+            ocoDoubleFillTradeStatus: tStatus,
+          });
+          await this.setKillSwitch(true, "OCO_DOUBLE_FILL");
+          await this._panicExit(freshTrade || trade, "OCO_DOUBLE_FILL_SL", {
+            allowWhenHalted: true,
+          });
+          await halt("OCO_DOUBLE_FILL", {
+            tradeId: trade.tradeId,
+            role: "SL",
+            orderId,
+          });
+          return;
+        }
+        // Duplicate update for already-sl-exited trades -> ignore
+        if (tStatus === STATUS.EXITED_SL) {
+          logger.info(
+            {
+              tradeId: trade.tradeId,
+              role: link.role,
+              status,
+              orderId,
+              tradeStatus: tStatus,
+            },
+            "[order_update] duplicate SL complete ignored",
+          );
+          return;
+        }
         return this._onSlFilled(trade.tradeId, trade, order);
+      }
 
       if (isDead(status)) {
         // If the trade is already terminal, ignore late exit-leg events (common after restart / OCO)
@@ -5526,6 +5877,13 @@ class TradeManager {
         closedAt: new Date(),
       });
     }
+
+    // Track last closed trade briefly (helps detect OCO races that flip positions after close)
+    try {
+      this.lastClosedTradeId = tradeId;
+      this.lastClosedToken = Number(instrument_token);
+      this.lastClosedAt = Date.now();
+    } catch {}
 
     this.activeTradeId = null;
     this.recoveredPosition = null;
