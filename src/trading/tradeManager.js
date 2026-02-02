@@ -2795,7 +2795,13 @@ class TradeManager {
 
       if (!picked || !picked.instrument_token) {
         logger.warn(
-          { underlyingToken, underlyingSide },
+          {
+            underlyingToken,
+            underlyingSide,
+            reason: picked?.reason,
+            message: picked?.message,
+            meta: picked?.meta,
+          },
           "[options] no contract could be picked",
         );
         return;
@@ -2908,6 +2914,26 @@ class TradeManager {
         ? env.ENTRY_ORDER_TYPE_OPT || env.ENTRY_ORDER_TYPE || "LIMIT"
         : env.ENTRY_ORDER_TYPE || "MARKET",
     ).toUpperCase();
+
+    // Slippage guard thresholds (segment-aware)
+    // FIX: Previously we referenced maxEntrySlipBps/maxEntrySlipKillBps later in this method
+    // but only defined them inside the reconcile() path, causing "maxEntrySlipBps is not defined".
+    const maxEntrySlipBps = Number(
+      isOptContract
+        ? Number(
+            env.MAX_ENTRY_SLIPPAGE_BPS_OPT || env.MAX_ENTRY_SLIPPAGE_BPS || 120,
+          )
+        : Number(env.MAX_ENTRY_SLIPPAGE_BPS || 25),
+    );
+    const maxEntrySlipKillBps = Number(
+      isOptContract
+        ? Number(
+            env.MAX_ENTRY_SLIPPAGE_KILL_BPS_OPT ||
+              env.MAX_ENTRY_SLIPPAGE_KILL_BPS ||
+              250,
+          )
+        : Number(env.MAX_ENTRY_SLIPPAGE_KILL_BPS || 60),
+    );
 
     // Spread filter (use separate threshold for options)
     const sp = await this._spreadCheck(instrument, {

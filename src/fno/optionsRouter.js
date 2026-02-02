@@ -1,9 +1,16 @@
 const { DateTime } = require("luxon");
 const { env } = require("../config");
 const { logger } = require("../logger");
-const { getInstrumentsDump, parseCsvList, uniq } = require("../instruments/instrumentRepo");
+const {
+  getInstrumentsDump,
+  parseCsvList,
+  uniq,
+} = require("../instruments/instrumentRepo");
 const { pickBestExpiryISO } = require("./expiryPolicy");
-const { getOptionChainSnapshot, setLastOptionPick } = require("./optionChainCache");
+const {
+  getOptionChainSnapshot,
+  setLastOptionPick,
+} = require("./optionChainCache");
 
 function parseDate(v) {
   if (!v) return null;
@@ -24,7 +31,12 @@ function _dteDays(expiryISO) {
   const tz = env.CANDLE_TZ || "Asia/Kolkata";
   const e = String(expiryISO || "").slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(e)) return null;
-  const exp = DateTime.fromISO(e, { zone: tz }).set({ hour: 15, minute: 30, second: 0, millisecond: 0 });
+  const exp = DateTime.fromISO(e, { zone: tz }).set({
+    hour: 15,
+    minute: 30,
+    second: 0,
+    millisecond: 0,
+  });
   if (!exp.isValid) return null;
   const now = DateTime.now().setZone(tz);
   const hours = exp.diff(now, "hours").hours;
@@ -49,8 +61,12 @@ function strikeStepFallback(underlying) {
 function getPremiumBandForUnderlying(underlying) {
   const u = String(underlying || "").toUpperCase();
   if (u === "NIFTY") {
-    const minPrem = Number(env.OPT_MIN_PREMIUM_NIFTY ?? env.OPT_MIN_PREMIUM ?? 80);
-    const maxPrem = Number(env.OPT_MAX_PREMIUM_NIFTY ?? env.OPT_MAX_PREMIUM ?? 350);
+    const minPrem = Number(
+      env.OPT_MIN_PREMIUM_NIFTY ?? env.OPT_MIN_PREMIUM ?? 80,
+    );
+    const maxPrem = Number(
+      env.OPT_MAX_PREMIUM_NIFTY ?? env.OPT_MAX_PREMIUM ?? 350,
+    );
     const enforce = Boolean(env.OPT_PREMIUM_BAND_ENFORCE_NIFTY ?? true);
     return { minPrem, maxPrem, enforce };
   }
@@ -75,7 +91,12 @@ function resolveUnderlyingFromUniverse({ universe, token, tradingsymbol }) {
   const t = Number(token);
   for (const [u, c] of Object.entries(uni.contracts)) {
     if (Number(c.instrument_token) === t) return u;
-    if (tradingsymbol && String(c.tradingsymbol).toUpperCase() === String(tradingsymbol).toUpperCase()) return u;
+    if (
+      tradingsymbol &&
+      String(c.tradingsymbol).toUpperCase() ===
+        String(tradingsymbol).toUpperCase()
+    )
+      return u;
   }
   return null;
 }
@@ -83,7 +104,11 @@ function resolveUnderlyingFromUniverse({ universe, token, tradingsymbol }) {
 function detectStrikeStepFromRows(rows, fallbackStep) {
   // Detect common strike spacing for a specific expiry slice.
   const strikes = Array.from(
-    new Set((rows || []).map((r) => Number(r.strike)).filter((n) => Number.isFinite(n) && n > 0)),
+    new Set(
+      (rows || [])
+        .map((r) => Number(r.strike))
+        .filter((n) => Number.isFinite(n) && n > 0),
+    ),
   ).sort((a, b) => a - b);
 
   if (strikes.length < 5) return fallbackStep;
@@ -146,7 +171,9 @@ function parseWeights(spec) {
   if (!s) return out;
   for (const part of s.split(",")) {
     const [kRaw, vRaw] = part.split(":");
-    const k = String(kRaw || "").trim().toLowerCase();
+    const k = String(kRaw || "")
+      .trim()
+      .toLowerCase();
     const v = Number(vRaw);
     if (!k) continue;
     if (Number.isFinite(v)) out[k] = v;
@@ -223,7 +250,9 @@ function scoreCandidate({
 }
 
 function _median(nums) {
-  const a = (nums || []).filter((x) => Number.isFinite(x)).sort((x, y) => x - y);
+  const a = (nums || [])
+    .filter((x) => Number.isFinite(x))
+    .sort((x, y) => x - y);
   if (!a.length) return null;
   const mid = Math.floor(a.length / 2);
   return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
@@ -234,7 +263,9 @@ function computeOiWallContext({ rows, optType, desiredStrike, step }) {
   const strikes = Math.max(1, Number(env.OPT_OI_WALL_STRIKES ?? 2));
   const requireChange = Boolean(env.OPT_OI_WALL_REQUIRE_CHANGE ?? true);
 
-  const ois = (rows || []).map((r) => Number(r.oi)).filter((x) => Number.isFinite(x) && x > 0);
+  const ois = (rows || [])
+    .map((r) => Number(r.oi))
+    .filter((x) => Number.isFinite(x) && x > 0);
   const med = _median(ois);
   if (!(med > 0)) return { medianOi: med, wall: null };
 
@@ -249,7 +280,11 @@ function computeOiWallContext({ rows, optType, desiredStrike, step }) {
     const oi = Number(row.oi);
     const oiCh = Number(row.oi_change);
     if (!Number.isFinite(oi) || oi <= 0) continue;
-    const okChange = requireChange ? (Number.isFinite(oiCh) ? oiCh > 0 : false) : true;
+    const okChange = requireChange
+      ? Number.isFinite(oiCh)
+        ? oiCh > 0
+        : false
+      : true;
     if (!okChange) continue;
     if (!best || oi > best.oi) {
       best = { strike: k, oi, oi_change: Number.isFinite(oiCh) ? oiCh : null };
@@ -282,9 +317,15 @@ async function pickOptionContractForSignal({
 
   const underlying = String(u || "").toUpperCase();
   if (!underlying) {
-    throw new Error(
-      `[options] cannot resolve underlying for token=${underlyingToken} symbol=${underlyingTradingsymbol}`,
+    logger.warn(
+      { underlyingToken, underlyingTradingsymbol },
+      "[options] cannot resolve underlying",
     );
+    return {
+      ok: false,
+      reason: "UNDERLYING_NOT_RESOLVED",
+      message: `[options] cannot resolve underlying for token=${underlyingToken} symbol=${underlyingTradingsymbol}`,
+    };
   }
 
   const dir = String(side || "").toUpperCase();
@@ -307,7 +348,14 @@ async function pickOptionContractForSignal({
   }
 
   if (!optionRows.length) {
-    throw new Error(`[options] no ${optType} rows found for ${underlying}`);
+    logger.warn({ underlying, optType }, "[options] no option rows found");
+    return {
+      ok: false,
+      reason: "NO_OPTION_ROWS",
+      message: `[options] no ${optType} rows found for ${underlying}`,
+      underlying,
+      optType,
+    };
   }
 
   // Build expiry set
@@ -324,7 +372,17 @@ async function pickOptionContractForSignal({
   if (picked?.expiryISO) expiryISO = picked.expiryISO;
 
   if (!expiryISO) {
-    throw new Error(`[options] no valid upcoming expiry found for ${underlying} ${optType}`);
+    logger.warn(
+      { underlying, optType },
+      "[options] no valid upcoming expiry found",
+    );
+    return {
+      ok: false,
+      reason: "NO_VALID_EXPIRY",
+      message: `[options] no valid upcoming expiry found for ${underlying} ${optType}`,
+      underlying,
+      optType,
+    };
   }
 
   const slice = optionRows.filter((r) => {
@@ -373,21 +431,45 @@ async function pickOptionContractForSignal({
   if (!env.OPT_STRICT_ATM_ONLY) {
     if (candidates.length < Math.max(6, offsets.length)) {
       const rest = Array.from(byStrike.entries())
-        .map(([strike, row]) => ({ strike, row, dist: Math.abs(strike - desiredStrike) }))
+        .map(([strike, row]) => ({
+          strike,
+          row,
+          dist: Math.abs(strike - desiredStrike),
+        }))
         .sort((a, b) => a.dist - b.dist)
         .slice(0, Math.max(20, wide * 2 + 1))
         .map((x) => x.row);
 
       for (const r of rest) {
-        if (candidates.find((c) => String(c.tradingsymbol) === String(r.tradingsymbol))) continue;
+        if (
+          candidates.find(
+            (c) => String(c.tradingsymbol) === String(r.tradingsymbol),
+          )
+        )
+          continue;
         candidates.push(r);
-        if (candidates.length >= Math.min(35, Math.max(20, wide * 2 + 1))) break;
+        if (candidates.length >= Math.min(35, Math.max(20, wide * 2 + 1)))
+          break;
       }
     }
   }
 
   if (!candidates.length) {
-    throw new Error(`[options] no candidates for ${underlying} ${optType} ${expiryISO}`);
+    logger.warn(
+      { underlying, optType, expiry: expiryISO, atm, desiredStrike, step },
+      "[options] no candidates in strike scan",
+    );
+    return {
+      ok: false,
+      reason: "NO_STRIKE_CANDIDATES",
+      message: `[options] no candidates for ${underlying} ${optType} ${expiryISO}`,
+      underlying,
+      optType,
+      expiry: expiryISO,
+      atm,
+      desiredStrike,
+      step,
+    };
   }
 
   const ttlMs = Number(env.OPT_CHAIN_TTL_MS || 1500);
@@ -405,12 +487,22 @@ async function pickOptionContractForSignal({
   });
 
   const band = getPremiumBandForUnderlying(underlying);
-  const minPrem = Number(Number.isFinite(Number(minPremiumOverride)) ? minPremiumOverride : band.minPrem);
-  const maxPrem = Number(Number.isFinite(Number(maxPremiumOverride)) ? maxPremiumOverride : band.maxPrem);
+  const minPrem = Number(
+    Number.isFinite(Number(minPremiumOverride))
+      ? minPremiumOverride
+      : band.minPrem,
+  );
+  const maxPrem = Number(
+    Number.isFinite(Number(maxPremiumOverride))
+      ? maxPremiumOverride
+      : band.maxPrem,
+  );
   const enforcePremBand = Boolean(band.enforce);
 
   const maxBps = Number(
-    Number.isFinite(Number(maxSpreadBpsOverride)) ? maxSpreadBpsOverride : env.OPT_MAX_SPREAD_BPS || 35,
+    Number.isFinite(Number(maxSpreadBpsOverride))
+      ? maxSpreadBpsOverride
+      : env.OPT_MAX_SPREAD_BPS || 35,
   );
   const minDepth = Number(env.OPT_MIN_DEPTH_QTY || 0);
 
@@ -423,7 +515,9 @@ async function pickOptionContractForSignal({
   const gammaMax = Number(env.OPT_GAMMA_MAX ?? 0.004);
   const gammaGateDteDays = Number(env.OPT_GAMMA_GATE_DTE_DAYS ?? 0.5);
   const dteDays = _dteDays(expiryISO);
-  const gammaGateActive = Number.isFinite(dteDays) ? dteDays <= gammaGateDteDays : false;
+  const gammaGateActive = Number.isFinite(dteDays)
+    ? dteDays <= gammaGateDteDays
+    : false;
 
   const spreadRiseBlockBps = Number(env.OPT_SPREAD_RISE_BLOCK_BPS ?? 8);
 
@@ -444,7 +538,10 @@ async function pickOptionContractForSignal({
   // Optional debug payload (kept OFF by default)
   // Helps you see why a specific option was picked (top N candidates).
   // Set OPT_PICK_DEBUG_TOP_N=5 (max 10) to include a small top-candidates list in the pick metadata.
-  const debugTopN = Math.max(0, Math.min(Number(env.OPT_PICK_DEBUG_TOP_N || 0), 10));
+  const debugTopN = Math.max(
+    0,
+    Math.min(Number(env.OPT_PICK_DEBUG_TOP_N || 0), 10),
+  );
 
   const scored = (chain?.snapshot?.rows || [])
     .map((r) => {
@@ -452,11 +549,18 @@ async function pickOptionContractForSignal({
       const bps = Number(r.spread_bps);
       const bpsCh = Number(r.spread_bps_change);
 
-      const premOk = Number.isFinite(ltp) ? ltp >= minPrem && ltp <= maxPrem : true;
+      const premOk = Number.isFinite(ltp)
+        ? ltp >= minPrem && ltp <= maxPrem
+        : true;
       const spreadOk = Number.isFinite(bps) ? bps <= maxBps : true;
-      const spreadTrendOk = Number.isFinite(bpsCh) ? bpsCh <= spreadRiseBlockBps : true;
+      const spreadTrendOk = Number.isFinite(bpsCh)
+        ? bpsCh <= spreadRiseBlockBps
+        : true;
 
-      const depthOk = Number(minDepth) > 0 ? Number(r.depth_qty_top || 0) >= Number(minDepth) : true;
+      const depthOk =
+        Number(minDepth) > 0
+          ? Number(r.depth_qty_top || 0) >= Number(minDepth)
+          : true;
 
       const delta = Number(r.delta);
       const deltaAbs = Number.isFinite(delta) ? Math.abs(delta) : null;
@@ -465,7 +569,8 @@ async function pickOptionContractForSignal({
         : true; // If greeks missing, don't hard-block.
 
       const gamma = Number(r.gamma);
-      const gammaOk = gammaGateActive && Number.isFinite(gamma) ? gamma <= gammaMax : true;
+      const gammaOk =
+        gammaGateActive && Number.isFinite(gamma) ? gamma <= gammaMax : true;
 
       const ivPts = Number(r.iv_pts);
       const ivCh = Number(r.iv_change_pts);
@@ -530,7 +635,9 @@ async function pickOptionContractForSignal({
           ivPts: Number.isFinite(ivPts) ? ivPts : null,
           ivChangePts: Number.isFinite(ivCh) ? ivCh : null,
           spreadBpsChange: Number.isFinite(bpsCh) ? bpsCh : null,
-          oiWall: oiWall ? { ...oiWall, medianOi: oiContext?.medianOi ?? null } : null,
+          oiWall: oiWall
+            ? { ...oiWall, medianOi: oiContext?.medianOi ?? null }
+            : null,
         },
       };
     })
@@ -552,10 +659,84 @@ async function pickOptionContractForSignal({
   });
 
   if (eligible.length === 0) {
-    const why = requireOk ? "no OK candidate (spread/depth/greeks/oi gates)" : "no candidate in premium band";
-    throw new Error(
-      `[options] ${why} for ${underlying} ${optType} (minPrem=${minPrem}, maxPrem=${maxPrem}, maxBps=${maxBps}, minDepth=${minDepth})`,
+    const why = requireOk
+      ? "no OK candidate (spread/depth/greeks/oi gates)"
+      : "no candidate in premium band";
+
+    const msg = `[options] ${why} for ${underlying} ${optType} (minPrem=${minPrem}, maxPrem=${maxPrem}, maxBps=${maxBps}, minDepth=${minDepth})`;
+
+    const debugTop =
+      debugTopN > 0
+        ? scored.slice(0, debugTopN).map((x) => ({
+            tradingsymbol: x.row.tradingsymbol,
+            strike: Number(x.row.strike),
+            ltp: Number(x.row.ltp),
+            spread_bps: Number(x.row.spread_bps),
+            depth_qty_top: Number(x.row.depth_qty_top || 0),
+            delta: Number(x.row.delta),
+            gamma: Number(x.row.gamma),
+            iv_pts: Number(x.row.iv_pts),
+            score: Number(x.score),
+            ok: !!x.ok,
+            premOk: !!x.premOk,
+            spreadOk: !!x.spreadOk,
+            spreadTrendOk: !!x.spreadTrendOk,
+            depthOk: !!x.depthOk,
+            deltaOk: !!x.deltaOk,
+            gammaOk: !!x.gammaOk,
+            ivOk: !!x.ivOk,
+            ivTrendOk: !!x.ivTrendOk,
+          }))
+        : undefined;
+
+    logger.warn(
+      {
+        underlying,
+        optType,
+        expiry: expiryISO,
+        atm,
+        desiredStrike,
+        step,
+        requireOk,
+        minPrem,
+        maxPrem,
+        maxBps,
+        minDepth,
+        topCandidates: debugTop,
+      },
+      "[options] no eligible candidate",
     );
+
+    return {
+      ok: false,
+      reason: requireOk ? "NO_OK_CANDIDATE" : "NO_PREMIUM_BAND_CANDIDATE",
+      message: msg,
+      underlying,
+      optType,
+      expiry: expiryISO,
+      atmStrike: atm,
+      desiredStrike,
+      strikeStep: step,
+      premiumBand: { minPrem, maxPrem, enforced: enforcePremBand },
+      meta: {
+        micro: { maxBps, spreadRiseBlockBps, minDepth },
+        deltaBand: enforceDeltaBand
+          ? { min: deltaMin, max: deltaMax, target: deltaTarget }
+          : null,
+        iv: {
+          maxPts: ivMaxPts,
+          dropBlockPts: ivDropBlockPts,
+          neutralPts: ivNeutralPts,
+        },
+        gamma: {
+          max: gammaMax,
+          gateActive: gammaGateActive,
+          gateDteDays: gammaGateDteDays,
+        },
+        oiContext,
+        topCandidates: debugTop,
+      },
+    };
   }
 
   const best = eligible[0];
@@ -632,8 +813,14 @@ async function pickOptionContractForSignal({
       policy: picked?.policy || null,
       dteDays: Number.isFinite(dteDays) ? dteDays : null,
       gammaGateActive,
-      deltaBand: enforceDeltaBand ? { min: deltaMin, max: deltaMax, target: deltaTarget } : null,
-      iv: { maxPts: ivMaxPts, dropBlockPts: ivDropBlockPts, neutralPts: ivNeutralPts },
+      deltaBand: enforceDeltaBand
+        ? { min: deltaMin, max: deltaMax, target: deltaTarget }
+        : null,
+      iv: {
+        maxPts: ivMaxPts,
+        dropBlockPts: ivDropBlockPts,
+        neutralPts: ivNeutralPts,
+      },
       micro: { maxBps, spreadRiseBlockBps, minDepth },
       oiContext,
       weights,
