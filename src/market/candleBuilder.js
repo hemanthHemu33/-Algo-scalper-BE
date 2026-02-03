@@ -105,6 +105,11 @@ class CandleBuilder {
     return closed;
   }
 
+  getCurrentCandle(token, intervalMin) {
+    const key = `${Number(token)}:${Number(intervalMin)}`;
+    return this.current.get(key) || null;
+  }
+
   finalizeDue(now = new Date(), opts = {}) {
     const graceMs = Number(opts.graceMs ?? 1500);
     const maxBars = Number(opts.maxBars ?? 3);

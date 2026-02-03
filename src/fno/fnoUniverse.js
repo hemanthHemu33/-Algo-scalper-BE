@@ -1,6 +1,7 @@
 const { DateTime } = require("luxon");
 const { env } = require("../config");
 const { logger } = require("../logger");
+const { isExpiryAllowed } = require("./expiryPolicy");
 const {
   getInstrumentsDump,
   parseCsvList,
@@ -36,17 +37,33 @@ function bestRowByNearestExpiry(rows) {
   const today = parseDate(todayYMD());
   let best = null;
   let bestExp = null;
+  let fallback = null;
+  let fallbackExp = null;
   for (const r of rows || []) {
     const exp = parseDate(r.expiry);
     if (!exp) continue;
     // choose expiry today or later
     if (today && exp < today) continue;
+    if (!fallbackExp || exp < fallbackExp) {
+      fallbackExp = exp;
+      fallback = r;
+    }
+
+    const policy = isExpiryAllowed({
+      expiryISO: r.expiry,
+      env,
+      nowMs: Date.now(),
+      minDaysToExpiry: env.FNO_MIN_DAYS_TO_EXPIRY,
+      avoidExpiryDayAfter: env.FNO_AVOID_EXPIRY_DAY_AFTER,
+    });
+    if (!policy.ok) continue;
+
     if (!bestExp || exp < bestExp) {
       bestExp = exp;
       best = r;
     }
   }
-  return best;
+  return best || fallback;
 }
 
 async function pickNearestFuture(kite, underlying, exchanges) {

@@ -9,7 +9,10 @@ const { CandleBuilder } = require("./market/candleBuilder");
 const { CandleWriteBuffer } = require("./market/candleWriteBuffer");
 const { ensureIndexes } = require("./market/candleStore");
 const { backfillCandles } = require("./market/backfill");
-const { evaluateOnCandleClose } = require("./strategy/strategyEngine");
+const {
+  evaluateOnCandleClose,
+  evaluateOnCandleTick,
+} = require("./strategy/strategyEngine");
 const { RiskEngine } = require("./risk/riskEngine");
 const { TradeManager } = require("./trading/tradeManager");
 const { telemetry } = require("./telemetry/signalTelemetry");
@@ -36,6 +39,7 @@ function buildPipeline({ kite, tickerCtrl }) {
   // In OPT mode we may subscribe option tokens at runtime for execution/exits.
   // Strategy evaluation must stay limited to the original underlying universe.
   let signalTokensSet = new Set();
+  const tickSignalState = new Map();
 
   // Separate queue for runtime subscription/backfills (avoid deadlocks with main serial queue)
   let subsSerial = Promise.resolve();
@@ -254,6 +258,21 @@ function buildPipeline({ kite, tickerCtrl }) {
         continue;
       }
 
+      const suppressClose =
+        String(env.SIGNAL_TICK_CONFIRM_ENABLED || "false") === "true" &&
+        String(env.SIGNAL_TICK_CONFIRM_SUPPRESS_CLOSE || "true") !== "false";
+      if (suppressClose) {
+        const key = `${tok}:${Number(c.interval_min || 0)}`;
+        const st = tickSignalState.get(key);
+        const candleTs = c?.ts ? new Date(c.ts).getTime() : null;
+        if (
+          Number.isFinite(candleTs) &&
+          st?.lastSignalCandleTs === candleTs
+        ) {
+          continue;
+        }
+      }
+
       const signal = await evaluateOnCandleClose({
         instrument_token: c.instrument_token,
         intervalMin: c.interval_min,
@@ -280,6 +299,90 @@ function buildPipeline({ kite, tickerCtrl }) {
           meta: { confidence: signal.confidence, regime: signal.regime },
         });
         await trader.onSignal(signal);
+      }
+    }
+  }
+
+  async function handleTickSignals(candleTicks) {
+    if (String(env.SIGNAL_TICK_CONFIRM_ENABLED || "false") !== "true") return;
+
+    const throttleMs = Number(env.SIGNAL_TICK_CONFIRM_THROTTLE_MS || 1500);
+    const nowMs = Date.now();
+
+    for (const t of candleTicks || []) {
+      const tok = Number(t.instrument_token);
+      if (!Number.isFinite(tok)) continue;
+      if (signalTokensSet.size && !signalTokensSet.has(tok)) continue;
+
+      for (const intervalMin of intervals) {
+        const live = candleBuilder.getCurrentCandle(tok, intervalMin);
+        if (!live?.ts) continue;
+
+        if (
+          String(env.ALLOW_SYNTHETIC_SIGNALS || "false") !== "true" &&
+          (live.synthetic || (live.source && live.source !== "live"))
+        ) {
+          continue;
+        }
+
+        const key = `${tok}:${intervalMin}`;
+        const st = tickSignalState.get(key) || {};
+        const candleTs = new Date(live.ts).getTime();
+
+        if (
+          Number.isFinite(st.lastSignalCandleTs) &&
+          st.lastSignalCandleTs === candleTs
+        ) {
+          continue;
+        }
+
+        if (
+          Number.isFinite(st.lastEvalMs) &&
+          throttleMs > 0 &&
+          nowMs - st.lastEvalMs < throttleMs
+        ) {
+          continue;
+        }
+
+        tickSignalState.set(key, {
+          ...st,
+          lastEvalMs: nowMs,
+          lastCandleTs: candleTs,
+        });
+
+        const signal = await evaluateOnCandleTick({
+          instrument_token: tok,
+          intervalMin,
+          liveCandle: live,
+        });
+
+        if (signal) {
+          logger.info(
+            {
+              token: signal.instrument_token,
+              side: signal.side,
+              reason: signal.reason,
+              strategyId: signal.strategyId,
+              confidence: signal.confidence,
+              regime: signal.regime,
+              stage: signal.stage,
+            },
+            "[signal:tick]",
+          );
+          telemetry.recordDecision({
+            signal,
+            token: signal.instrument_token,
+            outcome: "DISPATCHED",
+            stage: "pipeline_tick",
+            reason: signal.reason,
+            meta: { confidence: signal.confidence, regime: signal.regime },
+          });
+          await trader.onSignal(signal);
+          tickSignalState.set(key, {
+            ...tickSignalState.get(key),
+            lastSignalCandleTs: candleTs,
+          });
+        }
       }
     }
   }
@@ -352,6 +455,7 @@ function buildPipeline({ kite, tickerCtrl }) {
 
     const closed = candleBuilder.onTicks(candleTicks);
     await handleClosedCandles(closed);
+    await handleTickSignals(candleTicks);
   }
 
   async function onTicks(ticks) {
