@@ -11,9 +11,16 @@ async function readLatestTokenDoc() {
   if (env.TOKEN_FILTER_API_KEY) filter.api_key = env.TOKEN_FILTER_API_KEY;
 
   const doc = await col
-    .find(filter)
-    .sort({ updatedAt: -1, createdAt: -1, _id: -1 })
-    .limit(1)
+    .aggregate([
+      { $match: filter },
+      {
+        $addFields: {
+          sortUpdatedAt: { $ifNull: ["$updatedAt", "$createdAt"] },
+        },
+      },
+      { $sort: { sortUpdatedAt: -1, createdAt: -1, _id: -1 } },
+      { $limit: 1 },
+    ])
     .next();
 
   // IMPORTANT: Don't crash the engine if there is no token yet.
@@ -44,6 +51,10 @@ async function readLatestTokenDoc() {
       filter,
       collection: env.TOKENS_COLLECTION,
     };
+  }
+
+  if (doc && !doc.updatedAt && doc.createdAt) {
+    doc.updatedAt = doc.createdAt;
   }
 
   return { doc, accessToken: String(accessToken) };
