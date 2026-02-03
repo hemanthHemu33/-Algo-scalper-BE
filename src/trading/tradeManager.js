@@ -608,6 +608,33 @@ class TradeManager {
     return null;
   }
 
+  async _checkLateFillAfterCancel(orderId) {
+    const oid = String(orderId || "");
+    if (!oid) return null;
+
+    const attempts = Math.max(
+      1,
+      Number(env.ENTRY_TIMEOUT_LATE_FILL_ATTEMPTS || 2),
+    );
+    const delayMs = Math.max(
+      0,
+      Number(env.ENTRY_TIMEOUT_LATE_FILL_DELAY_MS || 400),
+    );
+
+    let latest = null;
+
+    for (let i = 0; i < attempts; i += 1) {
+      latest = await this._getOrderStatus(oid);
+      const status = String(latest?.status || "").toUpperCase();
+      if (status === "COMPLETE" || isDead(status)) return latest;
+      if (i < attempts - 1 && delayMs > 0) {
+        await sleep(delayMs);
+      }
+    }
+
+    return latest;
+  }
+
   async _slWatchdogFire(tradeId, cause = "timeout") {
     if (this._slWatchdogInFlight) return;
     this._slWatchdogInFlight = true;
@@ -1068,9 +1095,44 @@ class TradeManager {
     return null;
   }
 
-  async _replayOrphanUpdates(orderId) {
+  async _replayOrphanUpdates(orderId, opts = {}) {
     const oid = String(orderId || "");
     if (!oid) return;
+    const attempt = Number(opts.attempt || 0);
+    const maxAttempts = Math.max(
+      1,
+      Number(env.ORPHAN_REPLAY_MAX_ATTEMPTS || 4),
+    );
+    const delayMs = Math.max(
+      0,
+      Number(env.ORPHAN_REPLAY_DELAY_MS || 250),
+    );
+
+    try {
+      const linkCheck = await findTradeByOrder(oid);
+      if (!linkCheck?.link) {
+        if (attempt < maxAttempts) {
+          setTimeout(() => {
+            this._replayOrphanUpdates(oid, { attempt: attempt + 1 }).catch(
+              (e) => {
+                logger.warn(
+                  { orderId: oid, e: e.message },
+                  "[orphan] replay retry failed",
+                );
+              },
+            );
+          }, delayMs);
+        } else {
+          logger.warn(
+            { orderId: oid },
+            "[orphan] replay skipped; link not ready",
+          );
+        }
+        return;
+      }
+    } catch (e) {
+      logger.warn({ orderId: oid, e: e.message }, "[orphan] link check failed");
+    }
     try {
       const payloads = await popOrphanOrderUpdates(oid);
       if (!payloads.length) return;
@@ -2419,14 +2481,47 @@ class TradeManager {
           },
         );
 
-        await updateTrade(tradeId, {
-          status: STATUS.ENTRY_FAILED,
+        const late = await this._checkLateFillAfterCancel(entryOrderId);
+        const lateStatus = String(late?.status || "").toUpperCase();
+        const lateOrder = late?.order || {};
+        if (lateStatus === "COMPLETE") {
+          const avgPx = Number(
+            lateOrder.average_price ||
+              tFinal.expectedEntryPrice ||
+              tFinal.entryPrice ||
+              0,
+          );
+          const qty = Number(lateOrder.filled_quantity || tFinal.qty || 0);
+          await updateTrade(tradeId, {
+            status: STATUS.ENTRY_FILLED,
+            entryPrice: avgPx,
+            qty,
+          });
+          await this._placeExitsIfMissing({
+            ...tFinal,
+            entryPrice: avgPx,
+            qty,
+          });
+          return;
+        }
 
-          closeReason: "ENTRY_TIMEOUT_CANCELLED",
-        });
+        if (isDead(lateStatus)) {
+          const msgLate =
+            lateOrder.status_message_raw || lateOrder.status_message || null;
+          await updateTrade(tradeId, {
+            status: STATUS.ENTRY_FAILED,
+            closeReason: `ENTRY_${lateStatus}${
+              msgLate ? " | " + String(msgLate) : ""
+            }`,
+          });
+        } else {
+          await updateTrade(tradeId, {
+            status: STATUS.ENTRY_FAILED,
+            closeReason: "ENTRY_TIMEOUT_CANCELLED",
+          });
+        }
 
         await this._finalizeClosed(tradeId, tFinal.instrument_token);
-
         return;
       } catch (e) {
         logger.error(
