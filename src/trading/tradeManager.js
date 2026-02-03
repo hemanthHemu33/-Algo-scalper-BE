@@ -41,6 +41,7 @@ const {
   findTradeByOrder,
   saveOrphanOrderUpdate,
   popOrphanOrderUpdates,
+  appendOrderLog,
   upsertDailyRisk,
   getDailyRisk,
 } = require("./tradeStore");
@@ -4529,6 +4530,15 @@ class TradeManager {
     if (!orderId) return;
 
     const hit = await findTradeByOrder(orderId);
+    const status = String(order.status || "").toUpperCase();
+    try {
+      await appendOrderLog({
+        order_id: orderId,
+        tradeId: hit?.trade?.tradeId || null,
+        status,
+        payload: order,
+      });
+    } catch {}
     if (!hit) {
       // Early order_update race: store and replay after link exists.
       await saveOrphanOrderUpdate({ order_id: orderId, payload: order });
@@ -4540,7 +4550,6 @@ class TradeManager {
     }
 
     const { trade, link } = hit;
-    const status = String(order.status || "").toUpperCase();
 
     // Ignore expected OCO cancels
     if (

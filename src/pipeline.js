@@ -16,6 +16,7 @@ const {
 const { RiskEngine } = require("./risk/riskEngine");
 const { TradeManager } = require("./trading/tradeManager");
 const { telemetry } = require("./telemetry/signalTelemetry");
+const { marketHealth } = require("./market/marketHealth");
 
 function buildPipeline({ kite, tickerCtrl }) {
   const intervals = (env.CANDLE_INTERVALS || "1,3")
@@ -428,6 +429,9 @@ function buildPipeline({ kite, tickerCtrl }) {
     return closeTs >= open && closeTs <= close;
   }
   async function processTicksOnce(ticks) {
+    try {
+      marketHealth.onTicks(ticks || []);
+    } catch {}
     // tick->trader (LTP updates + throttled risk checks)
     for (const t of ticks || []) {
       try {

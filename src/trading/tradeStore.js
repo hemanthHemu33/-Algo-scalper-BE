@@ -4,6 +4,7 @@ const TRADES = "trades";
 const ORDER_LINKS = "order_links";
 const DAILY_RISK = "daily_risk";
 const ORPHAN_ORDER_UPDATES = "orphan_order_updates";
+const ORDER_LOGS = "order_logs";
 // Patch-6: cost calibration & reconciliations (post-trade cost model tuning)
 const COST_CALIBRATION = "cost_calibration";
 const COST_RECONCILIATIONS = "cost_reconciliations";
@@ -17,6 +18,8 @@ async function ensureTradeIndexes() {
     .createIndex({ order_id: 1 }, { unique: true });
   await db.collection(ORDER_LINKS).createIndex({ tradeId: 1 });
   await db.collection(DAILY_RISK).createIndex({ date: 1 }, { unique: true });
+  await db.collection(ORDER_LOGS).createIndex({ order_id: 1, createdAt: -1 });
+  await db.collection(ORDER_LOGS).createIndex({ tradeId: 1, createdAt: -1 });
 
   // Cost calibration (one doc per segmentKey)
   await db
@@ -118,6 +121,32 @@ async function popOrphanOrderUpdates(order_id) {
   return rows.map((r) => r.payload).filter(Boolean);
 }
 
+async function appendOrderLog({ order_id, tradeId, status, payload }) {
+  const db = getDb();
+  const oid = String(order_id || "");
+  if (!oid) return;
+  await db.collection(ORDER_LOGS).insertOne({
+    order_id: oid,
+    tradeId: tradeId || null,
+    status: status || null,
+    payload: payload || null,
+    createdAt: new Date(),
+  });
+}
+
+async function getOrderLogs({ order_id, tradeId, limit = 200 }) {
+  const db = getDb();
+  const query = {};
+  if (order_id) query.order_id = String(order_id);
+  if (tradeId) query.tradeId = tradeId;
+  return db
+    .collection(ORDER_LOGS)
+    .find(query)
+    .sort({ createdAt: -1 })
+    .limit(Math.max(1, Math.min(limit, 500)))
+    .toArray();
+}
+
 async function upsertDailyRisk(date, patch) {
   const db = getDb();
   await db.collection(DAILY_RISK).updateOne(
@@ -140,6 +169,7 @@ module.exports = {
   ORDER_LINKS,
   DAILY_RISK,
   ORPHAN_ORDER_UPDATES,
+  ORDER_LOGS,
   COST_CALIBRATION,
   COST_RECONCILIATIONS,
   ensureTradeIndexes,
@@ -151,6 +181,8 @@ module.exports = {
   findTradeByOrder,
   saveOrphanOrderUpdate,
   popOrphanOrderUpdates,
+  appendOrderLog,
+  getOrderLogs,
   upsertDailyRisk,
   getDailyRisk,
 };

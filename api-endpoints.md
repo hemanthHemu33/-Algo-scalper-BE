@@ -871,3 +871,77 @@ curl -H "x-api-key: $ADMIN_API_KEY" http://localhost:4001/admin/status
 ```bash
 curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:4001/admin/config
 ```
+
+---
+
+## Pro dashboard extensions
+
+These endpoints support the pro dashboard features (equity, positions, OMS, risk, telemetry, execution quality, market health, audit logs, alerting, RBAC).
+
+### `GET /admin/account/equity`
+
+Returns the latest equity snapshot and a rolling equity curve.
+
+### `GET /admin/positions`
+
+Returns live positions with average price, P&L, exposure, and per-position risk (when available).
+
+### `GET /admin/orders`
+
+Returns current order list with lifecycle status.
+
+### `GET /admin/orders/history?orderId=...`
+
+Returns broker order history for a given order.
+
+### `GET /admin/orders/logs?orderId=...&tradeId=...&limit=...`
+
+Returns order update logs persisted by the OMS.
+
+### `GET /admin/risk/limits`
+
+Returns portfolio-level risk limits plus current exposure usage.
+
+### `POST /admin/risk/limits`
+
+Updates risk limits (admin-only).
+
+### `GET /admin/strategy/kpis`
+
+Returns strategy-level KPIs (win rate, expectancy, Sharpe, max drawdown, average hold time).
+
+### `GET /admin/execution/quality`
+
+Returns execution quality stats (slippage vs. signal price, fill rate, rejection reasons).
+
+### `GET /admin/market/health`
+
+Returns market data health (feed lag by symbol and data-gap metrics).
+
+### `GET /admin/audit/logs`
+
+Returns audit & compliance logs for admin actions.
+
+### `GET /admin/alerts/channels`
+
+List alerting channels.
+
+### `POST /admin/alerts/channels`
+
+Add alerting channels (webhook/email/SMS stubs).
+
+### `DELETE /admin/alerts/channels/:id`
+
+Remove alerting channel.
+
+### `GET /admin/alerts/incidents`
+
+List recent alert incidents.
+
+### `POST /admin/alerts/test`
+
+Send a test notification.
+
+### `GET /admin/rbac`
+
+Returns RBAC configuration (roles/permissions).

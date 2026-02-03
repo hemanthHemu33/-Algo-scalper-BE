@@ -12,6 +12,26 @@ const { tradeTelemetry } = require("./telemetry/tradeTelemetry");
 const { optimizer } = require("./optimizer/adaptiveOptimizer");
 const { getLastFnoUniverse } = require("./fno/fnoUniverse");
 const { costCalibrator } = require("./trading/costCalibrator");
+const { equityService } = require("./account/equityService");
+const { buildPositionsSnapshot } = require("./trading/positionService");
+const {
+  getOrdersSnapshot,
+  getOrderHistory,
+  getOrderLogsSnapshot,
+} = require("./trading/orderService");
+const { getRiskLimits, setRiskLimits } = require("./risk/riskLimits");
+const { getStrategyKpis } = require("./telemetry/strategyKpi");
+const { getExecutionQuality } = require("./execution/executionStats");
+const { marketHealth } = require("./market/marketHealth");
+const { recordAudit, listAuditLogs } = require("./audit/auditLog");
+const {
+  listChannels,
+  addChannel,
+  removeChannel,
+  listIncidents,
+  emitNotification,
+} = require("./alerts/notificationCenter");
+const { buildRbac } = require("./security/rbac");
 const {
   describeRetention,
   ensureRetentionIndexes,
@@ -165,10 +185,31 @@ function buildApp() {
 
   // Protect ALL /admin/* endpoints
   app.use("/admin", buildAdminAuth());
+  const rbac = buildRbac();
+  app.use("/admin", rbac.roleMiddleware);
+  const requirePerm = rbac.requirePermission;
+
+  function actorFromReq(req) {
+    return (
+      req.header("x-user") ||
+      req.header("x-user-id") ||
+      req.header("x-api-key") ||
+      null
+    );
+  }
+
+  function getKiteClient() {
+    try {
+      const pipeline = getPipeline();
+      return pipeline?.trader?.kite || null;
+    } catch {
+      return null;
+    }
+  }
 
   // Optional: FE can exchange request_token (if your Kite redirect_url points to FE).
   // In production, this endpoint is protected by ADMIN_API_KEY (same as other /admin routes).
-  app.post("/admin/kite/session", async (req, res) => {
+  app.post("/admin/kite/session", requirePerm("admin"), async (req, res) => {
     const requestToken = req.body?.request_token;
     if (!requestToken) {
       return res
@@ -193,7 +234,7 @@ function buildApp() {
     }
   });
 
-  app.get("/admin/config", (req, res) => {
+  app.get("/admin/config", requirePerm("read"), (req, res) => {
     res.json({
       tradingEnabled: env.TRADING_ENABLED,
       tokensCollection: env.TOKENS_COLLECTION,
@@ -234,7 +275,7 @@ function buildApp() {
 
   // PATCH-10: Critical health endpoint (for monitors / Render health checks)
   // Returns 200 when system is safe-to-trade, else 503 with concrete reasons.
-  app.get("/admin/health/critical", async (req, res) => {
+  app.get("/admin/health/critical", requirePerm("read"), async (req, res) => {
     try {
       const ticker = getTickerStatus();
       const halted = isHalted();
@@ -308,7 +349,7 @@ function buildApp() {
     }
   });
 
-  app.get("/admin/status", async (req, res) => {
+  app.get("/admin/status", requirePerm("read"), async (req, res) => {
     try {
       const pipeline = getPipeline();
       const s = await pipeline.status();
@@ -329,7 +370,7 @@ function buildApp() {
   });
 
   // Market calendar diagnostics
-  app.get("/admin/market/calendar", (req, res) => {
+  app.get("/admin/market/calendar", requirePerm("read"), (req, res) => {
     try {
       const meta = getMarketCalendarMeta();
       res.json({ ok: true, meta });
@@ -338,17 +379,27 @@ function buildApp() {
     }
   });
 
-  app.post("/admin/market/calendar/reload", async (req, res) => {
-    try {
-      const meta = await reloadMarketCalendar();
-      res.json({ ok: true, meta });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e?.message || String(e) });
-    }
-  });
+  app.post(
+    "/admin/market/calendar/reload",
+    requirePerm("admin"),
+    async (req, res) => {
+      try {
+        const meta = await reloadMarketCalendar();
+        await recordAudit({
+          actor: actorFromReq(req),
+          action: "market_calendar_reload",
+          resource: "market",
+          status: "ok",
+        });
+        res.json({ ok: true, meta });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e?.message || String(e) });
+      }
+    },
+  );
 
   // PATCH-6: Cost calibration snapshot + recent reconciliation runs
-  app.get("/admin/cost/calibration", async (req, res) => {
+  app.get("/admin/cost/calibration", requirePerm("read"), async (req, res) => {
     try {
       const snap = costCalibrator.snapshot();
       const recent = await costCalibrator.recentRuns(10);
@@ -358,16 +409,30 @@ function buildApp() {
     }
   });
 
-  app.post("/admin/cost/calibration/reload", async (req, res) => {
-    try {
-      const r = await costCalibrator.reloadFromDb();
-      res.json({ ok: true, result: r, calibration: costCalibrator.snapshot() });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e?.message || String(e) });
-    }
-  });
+  app.post(
+    "/admin/cost/calibration/reload",
+    requirePerm("admin"),
+    async (req, res) => {
+      try {
+        const r = await costCalibrator.reloadFromDb();
+        await recordAudit({
+          actor: actorFromReq(req),
+          action: "cost_calibration_reload",
+          resource: "trading",
+          status: "ok",
+        });
+        res.json({
+          ok: true,
+          result: r,
+          calibration: costCalibrator.snapshot(),
+        });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e?.message || String(e) });
+      }
+    },
+  );
 
-  app.get("/admin/subscriptions", (req, res) => {
+  app.get("/admin/subscriptions", requirePerm("read"), (req, res) => {
     try {
       const tokens = getSubscribedTokens ? getSubscribedTokens() : [];
       res.json({ ok: true, count: tokens.length, tokens });
@@ -378,7 +443,7 @@ function buildApp() {
 
   // FE: recent candles for chart
   // GET /admin/candles/recent?token=123&intervalMin=1&limit=300
-  app.get("/admin/candles/recent", async (req, res) => {
+  app.get("/admin/candles/recent", requirePerm("read"), async (req, res) => {
     try {
       const token = Number(req.query.token);
       const intervalMin = Number(
@@ -405,7 +470,7 @@ function buildApp() {
   });
 
   // PATCH-9: DB retention (TTL) visibility + manual ensure
-  app.get("/admin/db/retention", async (req, res) => {
+  app.get("/admin/db/retention", requirePerm("read"), async (req, res) => {
     try {
       const r = await describeRetention();
       res.json(r);
@@ -414,18 +479,28 @@ function buildApp() {
     }
   });
 
-  app.post("/admin/db/retention/ensure", async (req, res) => {
-    try {
-      const out = await ensureRetentionIndexes({ log: true });
-      const after = await describeRetention();
-      res.json({ ok: true, result: out, after });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e?.message || String(e) });
-    }
-  });
+  app.post(
+    "/admin/db/retention/ensure",
+    requirePerm("admin"),
+    async (req, res) => {
+      try {
+        const out = await ensureRetentionIndexes({ log: true });
+        const after = await describeRetention();
+        await recordAudit({
+          actor: actorFromReq(req),
+          action: "db_retention_ensure",
+          resource: "db",
+          status: "ok",
+        });
+        res.json({ ok: true, result: out, after });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e?.message || String(e) });
+      }
+    },
+  );
 
   // Derivatives universe snapshot (FUT or OPT underlying subscription)
-  app.get("/admin/fno", (req, res) => {
+  app.get("/admin/fno", requirePerm("read"), (req, res) => {
     try {
       const u = getLastFnoUniverse();
       res.json(u || { ok: true, enabled: false, universe: null });
@@ -434,10 +509,17 @@ function buildApp() {
     }
   });
 
-  app.post("/admin/kill", async (req, res) => {
+  app.post("/admin/kill", requirePerm("trade"), async (req, res) => {
     const enabled = !!(req.body && req.body.enabled);
     try {
       await getPipeline().setKillSwitch(enabled, "ADMIN");
+      await recordAudit({
+        actor: actorFromReq(req),
+        action: "kill_switch",
+        resource: "trading",
+        status: "ok",
+        meta: { enabled },
+      });
       res.json({ ok: true, kill: enabled });
     } catch (e) {
       res.status(503).json({ ok: false, error: e.message });
@@ -445,16 +527,22 @@ function buildApp() {
   });
 
   // Reset runtime HALT (does NOT disable kill-switch). Useful after fixing a bad session/API error.
-  app.post("/admin/halt/reset", async (req, res) => {
+  app.post("/admin/halt/reset", requirePerm("admin"), async (req, res) => {
     try {
       resetHalt();
+      await recordAudit({
+        actor: actorFromReq(req),
+        action: "halt_reset",
+        resource: "runtime",
+        status: "ok",
+      });
       res.json({ ok: true, halted: false, haltInfo: null });
     } catch (e) {
       res.status(503).json({ ok: false, error: e.message });
     }
   });
 
-  app.get("/admin/trades/recent", async (req, res) => {
+  app.get("/admin/trades/recent", requirePerm("read"), async (req, res) => {
     try {
       const limitRaw = Number(req.query.limit || 10);
       const limit = Number.isFinite(limitRaw)
@@ -475,21 +563,268 @@ function buildApp() {
     }
   });
 
+  // Account / equity service
+  app.get("/admin/account/equity", requirePerm("read"), async (req, res) => {
+    try {
+      const kite = getKiteClient();
+      const data = await equityService.snapshot({ kite });
+      res.json({ ok: true, ...data });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  // Live positions snapshot
+  app.get("/admin/positions", requirePerm("read"), async (req, res) => {
+    try {
+      const kite = getKiteClient();
+      const rows = await buildPositionsSnapshot({ kite });
+      res.json({ ok: true, rows });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  // Orders & OMS endpoints
+  app.get("/admin/orders", requirePerm("read"), async (req, res) => {
+    try {
+      const kite = getKiteClient();
+      const rows = await getOrdersSnapshot({ kite });
+      res.json({ ok: true, rows });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  app.get("/admin/orders/history", requirePerm("read"), async (req, res) => {
+    try {
+      const orderId = req.query.orderId || req.query.order_id;
+      if (!orderId) {
+        return res.status(400).json({ ok: false, error: "missing_order_id" });
+      }
+      const kite = getKiteClient();
+      const rows = await getOrderHistory({ kite, orderId });
+      res.json({ ok: true, rows });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  app.get("/admin/orders/logs", requirePerm("read"), async (req, res) => {
+    try {
+      const orderId = req.query.orderId || req.query.order_id;
+      const tradeId = req.query.tradeId || req.query.trade_id || null;
+      const limit = Number(req.query.limit || 200);
+      const rows = await getOrderLogsSnapshot({
+        orderId,
+        tradeId,
+        limit,
+      });
+      res.json({ ok: true, rows });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  // Risk limits (portfolio-level)
+  app.get("/admin/risk/limits", requirePerm("read"), async (req, res) => {
+    try {
+      const limits = await getRiskLimits();
+      const positions = await buildPositionsSnapshot({ kite: getKiteClient() });
+      const exposureBySymbol = {};
+      for (const p of positions) {
+        const key = p.tradingsymbol || String(p.instrument_token || "");
+        exposureBySymbol[key] =
+          (exposureBySymbol[key] || 0) + (p.exposureInr || 0);
+      }
+      res.json({
+        ok: true,
+        ...limits,
+        usage: {
+          openPositions: positions.length,
+          exposureBySymbol,
+        },
+      });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  app.post("/admin/risk/limits", requirePerm("admin"), async (req, res) => {
+    try {
+      const limits = await setRiskLimits(req.body || {});
+      await recordAudit({
+        actor: actorFromReq(req),
+        action: "risk_limits_update",
+        resource: "risk",
+        status: "ok",
+        meta: limits,
+      });
+      res.json({ ok: true, limits });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  // Strategy telemetry (KPIs)
+  app.get("/admin/strategy/kpis", requirePerm("read"), async (req, res) => {
+    try {
+      const limit = Number(req.query.limit || 500);
+      const data = await getStrategyKpis({ limit });
+      res.json({ ok: true, ...data });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  // Execution quality stats
+  app.get("/admin/execution/quality", requirePerm("read"), async (req, res) => {
+    try {
+      const limit = Number(req.query.limit || 500);
+      const data = await getExecutionQuality({ limit });
+      res.json({ ok: true, ...data });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  // Market data health
+  app.get("/admin/market/health", requirePerm("read"), (req, res) => {
+    try {
+      const tokens = req.query.tokens
+        ? String(req.query.tokens)
+            .split(",")
+            .map((t) => Number(t.trim()))
+            .filter((n) => Number.isFinite(n))
+        : null;
+      const data = marketHealth.snapshot({ tokens });
+      res.json({ ok: true, ...data });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  // Audit & compliance logs
+  app.get("/admin/audit/logs", requirePerm("read"), async (req, res) => {
+    try {
+      const limit = Number(req.query.limit || 100);
+      const rows = await listAuditLogs({ limit });
+      res.json({ ok: true, rows });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  // Alerting/notification channels
+  app.get("/admin/alerts/channels", requirePerm("read"), async (req, res) => {
+    try {
+      const rows = await listChannels();
+      res.json({ ok: true, rows });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  app.post("/admin/alerts/channels", requirePerm("admin"), async (req, res) => {
+    try {
+      const channel = await addChannel(req.body || {});
+      await recordAudit({
+        actor: actorFromReq(req),
+        action: "alerts_channel_add",
+        resource: "alerts",
+        status: "ok",
+        meta: { id: channel._id, type: channel.type },
+      });
+      res.json({ ok: true, channel });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  app.delete(
+    "/admin/alerts/channels/:id",
+    requirePerm("admin"),
+    async (req, res) => {
+      try {
+        await removeChannel(req.params.id);
+        await recordAudit({
+          actor: actorFromReq(req),
+          action: "alerts_channel_remove",
+          resource: "alerts",
+          status: "ok",
+          meta: { id: req.params.id },
+        });
+        res.json({ ok: true });
+      } catch (e) {
+        res.status(500).json({ ok: false, error: e?.message || String(e) });
+      }
+    },
+  );
+
+  app.get("/admin/alerts/incidents", requirePerm("read"), async (req, res) => {
+    try {
+      const limit = Number(req.query.limit || 100);
+      const rows = await listIncidents({ limit });
+      res.json({ ok: true, rows });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  app.post("/admin/alerts/test", requirePerm("admin"), async (req, res) => {
+    try {
+      const payload = {
+        type: req.body?.type || "test",
+        message: req.body?.message || "Test notification",
+        severity: req.body?.severity || "info",
+        meta: req.body?.meta || null,
+      };
+      const out = await emitNotification(payload);
+      await recordAudit({
+        actor: actorFromReq(req),
+        action: "alerts_test",
+        resource: "alerts",
+        status: "ok",
+        meta: payload,
+      });
+      res.json({ ok: true, ...out });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  // RBAC configuration visibility
+  app.get("/admin/rbac", requirePerm("read"), (req, res) => {
+    res.json({
+      ok: true,
+      enabled: rbac.enabled,
+      header: rbac.header,
+      defaultRole: rbac.defaultRole,
+      roles: rbac.roles,
+    });
+  });
+
   // Telemetry endpoints (signal observability)
-  app.get("/admin/telemetry/snapshot", (req, res) => {
+  app.get("/admin/telemetry/snapshot", requirePerm("read"), (req, res) => {
     res.json({ ok: true, data: telemetry.snapshot() });
   });
 
-  app.post("/admin/telemetry/flush", async (req, res) => {
+  app.post("/admin/telemetry/flush", requirePerm("admin"), async (req, res) => {
     try {
       const out = await telemetry.flush();
+      await recordAudit({
+        actor: actorFromReq(req),
+        action: "telemetry_flush",
+        resource: "telemetry",
+        status: "ok",
+      });
       res.json({ ok: true, ...out });
     } catch (e) {
       res.status(503).json({ ok: false, error: e?.message || String(e) });
     }
   });
 
-  app.get("/admin/telemetry/daily", async (req, res) => {
+  app.get("/admin/telemetry/daily", requirePerm("read"), async (req, res) => {
     try {
       const dk = req.query.dayKey;
       const doc = await telemetry.readDailyFromDb(dk);
@@ -500,35 +835,53 @@ function buildApp() {
   });
 
   // Trade telemetry endpoints (fee-multiple + pnl vs costs)
-  app.get("/admin/trade-telemetry/snapshot", (req, res) => {
-    res.json({ ok: true, data: tradeTelemetry.snapshot() });
-  });
+  app.get(
+    "/admin/trade-telemetry/snapshot",
+    requirePerm("read"),
+    (req, res) => {
+      res.json({ ok: true, data: tradeTelemetry.snapshot() });
+    },
+  );
 
-  app.post("/admin/trade-telemetry/flush", async (req, res) => {
-    try {
-      const out = await tradeTelemetry.flush();
-      res.json({ ok: true, ...out });
-    } catch (e) {
-      res.status(503).json({ ok: false, error: e?.message || String(e) });
-    }
-  });
+  app.post(
+    "/admin/trade-telemetry/flush",
+    requirePerm("admin"),
+    async (req, res) => {
+      try {
+        const out = await tradeTelemetry.flush();
+        await recordAudit({
+          actor: actorFromReq(req),
+          action: "trade_telemetry_flush",
+          resource: "telemetry",
+          status: "ok",
+        });
+        res.json({ ok: true, ...out });
+      } catch (e) {
+        res.status(503).json({ ok: false, error: e?.message || String(e) });
+      }
+    },
+  );
 
-  app.get("/admin/trade-telemetry/daily", async (req, res) => {
-    try {
-      const dk = req.query.dayKey;
-      const doc = await tradeTelemetry.readDailyFromDb(dk);
-      res.json({
-        ok: !!doc,
-        dayKey: dk || tradeTelemetry.snapshot().dayKey,
-        doc,
-      });
-    } catch (e) {
-      res.status(503).json({ ok: false, error: e?.message || String(e) });
-    }
-  });
+  app.get(
+    "/admin/trade-telemetry/daily",
+    requirePerm("read"),
+    async (req, res) => {
+      try {
+        const dk = req.query.dayKey;
+        const doc = await tradeTelemetry.readDailyFromDb(dk);
+        res.json({
+          ok: !!doc,
+          dayKey: dk || tradeTelemetry.snapshot().dayKey,
+          doc,
+        });
+      } catch (e) {
+        res.status(503).json({ ok: false, error: e?.message || String(e) });
+      }
+    },
+  );
 
   // Adaptive optimizer endpoints (fee-multiple tuning)
-  app.get("/admin/optimizer/snapshot", (req, res) => {
+  app.get("/admin/optimizer/snapshot", requirePerm("read"), (req, res) => {
     try {
       res.json({ ok: true, data: optimizer.snapshot() });
     } catch (e) {
@@ -537,7 +890,7 @@ function buildApp() {
   });
 
   // Alias for convenience (dashboards often expect /admin/optimizer)
-  app.get("/admin/optimizer", (req, res) => {
+  app.get("/admin/optimizer", requirePerm("read"), (req, res) => {
     try {
       res.json({ ok: true, data: optimizer.snapshot() });
     } catch (e) {
@@ -546,27 +899,53 @@ function buildApp() {
   });
 
   // Force persistence flush (DB-persisted optimizer state)
-  app.post("/admin/optimizer/flush", async (req, res) => {
-    try {
-      const out = await optimizer.flushState({ force: true });
-      res.json({ ok: true, ...out });
-    } catch (e) {
-      res.status(503).json({ ok: false, error: e?.message || String(e) });
-    }
-  });
+  app.post(
+    "/admin/optimizer/flush",
+    requirePerm("admin"),
+    async (req, res) => {
+      try {
+        const out = await optimizer.flushState({ force: true });
+        await recordAudit({
+          actor: actorFromReq(req),
+          action: "optimizer_flush",
+          resource: "optimizer",
+          status: "ok",
+        });
+        res.json({ ok: true, ...out });
+      } catch (e) {
+        res.status(503).json({ ok: false, error: e?.message || String(e) });
+      }
+    },
+  );
 
-  app.post("/admin/optimizer/reload", async (req, res) => {
-    try {
-      const out = await optimizer.reloadFromDb();
-      res.json({ ok: true, ...out });
-    } catch (e) {
-      res.status(503).json({ ok: false, error: e?.message || String(e) });
-    }
-  });
+  app.post(
+    "/admin/optimizer/reload",
+    requirePerm("admin"),
+    async (req, res) => {
+      try {
+        const out = await optimizer.reloadFromDb();
+        await recordAudit({
+          actor: actorFromReq(req),
+          action: "optimizer_reload",
+          resource: "optimizer",
+          status: "ok",
+        });
+        res.json({ ok: true, ...out });
+      } catch (e) {
+        res.status(503).json({ ok: false, error: e?.message || String(e) });
+      }
+    },
+  );
 
-  app.post("/admin/optimizer/reset", (req, res) => {
+  app.post("/admin/optimizer/reset", requirePerm("admin"), (req, res) => {
     try {
       optimizer.reset();
+      void recordAudit({
+        actor: actorFromReq(req),
+        action: "optimizer_reset",
+        resource: "optimizer",
+        status: "ok",
+      });
       res.json({ ok: true });
     } catch (e) {
       res.status(503).json({ ok: false, error: e?.message || String(e) });
@@ -574,7 +953,7 @@ function buildApp() {
   });
 
   // Rejection histograms (symbol×strategy×timeBucket) for tuning
-  app.get("/admin/rejections", async (req, res) => {
+  app.get("/admin/rejections", requirePerm("read"), async (req, res) => {
     try {
       const top = Number(req.query.top) || undefined;
       const dk = req.query.dayKey;
