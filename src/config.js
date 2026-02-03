@@ -21,6 +21,9 @@ const schema = z.object({
   NODE_ENV: z.string().default("development"),
   LOG_LEVEL: z.string().optional(),
   ADMIN_API_KEY: z.string().optional(),
+  RBAC_ENABLED: z.string().default("false"),
+  RBAC_HEADER: z.string().default("x-role"),
+  RBAC_DEFAULT_ROLE: z.string().default("admin"),
 
   // CORS
   CORS_ORIGIN: z.string().optional(),
@@ -140,6 +143,7 @@ const schema = z.object({
   QUOTE_GUARD_JITTER_PCT: z.coerce.number().default(0.25),
   QUOTE_GUARD_BREAKER_FAILS: z.coerce.number().default(4),
   QUOTE_GUARD_BREAKER_COOLDOWN_MS: z.coerce.number().default(20000),
+  MARKET_HEALTH_GAP_MS: z.coerce.number().default(2000),
 
   SUBSCRIBE_TOKENS: z.string().optional(),
   SUBSCRIBE_SYMBOLS: z.string().optional(),
@@ -454,6 +458,8 @@ const schema = z.object({
   SYMBOL_COOLDOWN_SECONDS: z.coerce.number().default(180),
   DAILY_MAX_LOSS_INR: z.coerce.number().default(1350),
   AUTO_EXIT_ON_DAILY_LOSS: z.string().default("true"),
+  RISK_MAX_DRAWDOWN_INR: z.coerce.number().default(2700),
+  RISK_MAX_EXPOSURE_PER_SYMBOL_INR: z.coerce.number().default(150000),
 
   // Trading window (MIS safe)
   AUTO_FIX_TIME_WINDOWS: z.string().default("false"),
