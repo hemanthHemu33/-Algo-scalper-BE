@@ -165,6 +165,10 @@ const schema = z.object({
   FNO_MIN_LOT_POLICY: z.string().default("STRICT"),
   // Log selected contracts at startup
   FNO_LOG_UNIVERSE: z.string().default("true"),
+  // Avoid ultra-short DTE futures unless explicitly allowed
+  FNO_MIN_DAYS_TO_EXPIRY: z.coerce.number().default(0),
+  // e.g. "12:00" -> skip expiry-day futures entries after this time; unset disables
+  FNO_AVOID_EXPIRY_DAY_AFTER: z.string().optional(),
 
   // Instrument dump cache TTL (seconds)
   INSTRUMENTS_DUMP_TTL_SEC: z.coerce.number().default(3600),
@@ -254,9 +258,14 @@ const schema = z.object({
 
   // Stops for long options (premium-based)
   OPT_STOP_MODE: z.string().default("PCT"),
+  // Option SL mode: PREMIUM_PCT (default) or UNDERLYING_ATR (delta/gamma aware)
+  OPT_SL_MODE: z.string().default("PREMIUM_PCT"),
   OPT_SL_PCT: z.coerce.number().default(12),
   OPT_MAX_SL_PCT: z.coerce.number().default(35),
   OPT_MIN_SL_INR: z.coerce.number().default(0),
+  // When OPT_SL_MODE=UNDERLYING_ATR, compute premium risk from underlying ATR * mult
+  OPT_SL_UNDERLYING_ATR_MULT: z.coerce.number().default(1.0),
+  OPT_SL_UNDERLYING_MIN_TICKS: z.coerce.number().default(6),
 
   // Option SL fitter (to make 1-lot risk fit RISK_PER_TRADE_INR caps when lot sizes are large)
   // If disabled, engine may block trades when 1-lot risk exceeds cap after lot-normalization.
@@ -310,6 +319,10 @@ const schema = z.object({
   CANDLE_INTERVALS: z.string().default("1,3"),
   CANDLE_COLLECTION_PREFIX: z.string().default("candles_"),
   CANDLE_TZ: z.string().default("Asia/Kolkata"),
+  // Optional tick-based signal confirmation (intra-candle)
+  SIGNAL_TICK_CONFIRM_ENABLED: z.string().default("false"),
+  SIGNAL_TICK_CONFIRM_THROTTLE_MS: z.coerce.number().default(1500),
+  SIGNAL_TICK_CONFIRM_SUPPRESS_CLOSE: z.string().default("true"),
   MARKET_OPEN: z.string().default("09:15"),
   MARKET_CLOSE: z.string().default("15:30"),
 

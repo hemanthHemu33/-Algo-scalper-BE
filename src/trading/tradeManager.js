@@ -3681,19 +3681,6 @@ class TradeManager {
       stopLoss = roundToTick(stopLoss, tick, s.side === "BUY" ? "down" : "up");
     }
 
-    // stop-loss quality gating (options allow wider % stops)
-    const gate = await this._qualityGateStopLoss({
-      entryGuess,
-      stopLoss,
-      side,
-      instrument,
-      maxPct: s.option_meta ? Number(env.OPT_MAX_SL_PCT || 35) : undefined,
-    });
-    if (!gate.ok) {
-      logger.info({ token, reason: gate.reason }, "[trade] blocked (SL gate)");
-      return;
-    }
-
     // Regime filters / MTF confirmation
     const intervalMin = Number(s.intervalMin || s.candle?.interval_min || 1);
     const regimeToken = Number(s.underlying_token || token);
@@ -3713,6 +3700,47 @@ class TradeManager {
         { token, reason: reg.reason, meta: reg.meta },
         "[trade] blocked (regime)",
       );
+      return;
+    }
+
+    if (s.option_meta) {
+      const slMode = String(env.OPT_SL_MODE || "PREMIUM_PCT").toUpperCase();
+      if (slMode === "UNDERLYING_ATR") {
+        const fit = optionStopLossFromUnderlyingATR({
+          side,
+          entry: expectedEntryPrice,
+          tickSize: tick,
+          optionMeta: s.option_meta,
+          atr: Number(reg?.meta?.atr),
+          atrMult: Number(env.OPT_SL_UNDERLYING_ATR_MULT || 1.0),
+          minTicks: Number(env.OPT_SL_UNDERLYING_MIN_TICKS || 6),
+        });
+        if (fit?.ok) {
+          stopLoss = fit.stopLoss;
+          logger.info(
+            {
+              token,
+              side,
+              stopLoss,
+              entry: expectedEntryPrice,
+              meta: fit.meta,
+            },
+            "[risk] option SL set from underlying ATR",
+          );
+        }
+      }
+    }
+
+    // stop-loss quality gating (options allow wider % stops)
+    const gate = await this._qualityGateStopLoss({
+      entryGuess,
+      stopLoss,
+      side,
+      instrument,
+      maxPct: s.option_meta ? Number(env.OPT_MAX_SL_PCT || 35) : undefined,
+    });
+    if (!gate.ok) {
+      logger.info({ token, reason: gate.reason }, "[trade] blocked (SL gate)");
       return;
     }
 
@@ -6806,6 +6834,75 @@ function fallbackSL(entry, side) {
   const pct = Number(env.SL_PCT_FALLBACK || 0.3) / 100.0;
   if (side === "BUY") return entry * (1 - pct);
   return entry * (1 + pct);
+}
+
+function optionStopLossFromUnderlyingATR({
+  side,
+  entry,
+  tickSize,
+  optionMeta,
+  atr,
+  atrMult,
+  minTicks,
+}) {
+  const atrVal = Number(atr);
+  const mult = Number(atrMult);
+  if (!Number.isFinite(atrVal) || atrVal <= 0 || !Number.isFinite(mult)) {
+    return { ok: false, reason: "INVALID_ATR" };
+  }
+
+  const moveU = Math.max(0, atrVal * Math.max(0, mult));
+  if (!(moveU > 0)) return { ok: false, reason: "NO_MOVE" };
+
+  const moneyness = String(optionMeta?.moneyness || env.OPT_MONEYNESS || "ATM")
+    .toUpperCase()
+    .trim();
+
+  const fallbackDelta =
+    moneyness === "ITM"
+      ? Number(env.OPT_DELTA_ITM || 0.65)
+      : moneyness === "OTM"
+        ? Number(env.OPT_DELTA_OTM || 0.4)
+        : Number(env.OPT_DELTA_ATM || 0.5);
+
+  const deltaRaw = Math.abs(Number(optionMeta?.delta));
+  const delta = Number.isFinite(deltaRaw) && deltaRaw > 0 ? deltaRaw : fallbackDelta;
+
+  const gammaRaw = Math.abs(Number(optionMeta?.gamma));
+  const gamma = Number.isFinite(gammaRaw) ? gammaRaw : 0;
+
+  let premMove = moveU * delta + 0.5 * gamma * moveU * moveU;
+  if (!Number.isFinite(premMove) || premMove <= 0) {
+    return { ok: false, reason: "NO_PREM_MOVE" };
+  }
+
+  const tick = Number(tickSize || 0.05);
+  const minTicksNum = Math.max(0, Number(minTicks || 0));
+  const minStop = minTicksNum > 0 ? minTicksNum * tick : 0;
+  if (minStop > 0) premMove = Math.max(premMove, minStop);
+
+  const rawStop =
+    side === "BUY" ? Number(entry) - premMove : Number(entry) + premMove;
+
+  if (!Number.isFinite(rawStop) || rawStop <= 0) {
+    return { ok: false, reason: "INVALID_STOP" };
+  }
+
+  const stopLoss = roundToTick(rawStop, tick, side === "BUY" ? "down" : "up");
+
+  return {
+    ok: true,
+    stopLoss,
+    meta: {
+      moveU,
+      delta,
+      gamma,
+      premMove,
+      minStop,
+      atr: atrVal,
+      atrMult: mult,
+    },
+  };
 }
 
 function calcOpenPnl(trade, ltp) {

@@ -20,7 +20,56 @@ async function evaluateOnCandleClose({ instrument_token, intervalMin }) {
   if (!candles || candles.length < 50) return null;
 
   const last = candles[candles.length - 1];
+  return evaluateFromCandles({
+    candles,
+    last,
+    instrument_token,
+    intervalMin,
+    stage: "close",
+  });
+}
 
+async function evaluateOnCandleTick({
+  instrument_token,
+  intervalMin,
+  liveCandle,
+}) {
+  const allow = enabledIntervals();
+  if (!allow.includes(Number(intervalMin))) return null;
+
+  const candles = await getRecentCandles(instrument_token, intervalMin, 400);
+  if (!candles || candles.length < 50) return null;
+
+  const live = liveCandle || null;
+  if (!live || !live.ts) return null;
+
+  const last = candles[candles.length - 1];
+  const lastTs = last?.ts ? new Date(last.ts).getTime() : null;
+  const liveTs = new Date(live.ts).getTime();
+
+  let merged = candles.slice();
+  if (lastTs != null && liveTs === lastTs) {
+    merged[merged.length - 1] = live;
+  } else {
+    merged.push(live);
+  }
+
+  return evaluateFromCandles({
+    candles: merged,
+    last: live,
+    instrument_token,
+    intervalMin,
+    stage: "tick",
+  });
+}
+
+function evaluateFromCandles({
+  candles,
+  last,
+  instrument_token,
+  intervalMin,
+  stage,
+}) {
   let ids = enabledStrategyIds();
   if (!ids.length) return null;
 
@@ -45,6 +94,7 @@ async function evaluateOnCandleClose({ instrument_token, intervalMin }) {
         instrument_token: Number(instrument_token),
         intervalMin: Number(intervalMin),
         ts: last?.ts,
+        stage,
       });
     }
   }
@@ -70,7 +120,7 @@ async function evaluateOnCandleClose({ instrument_token, intervalMin }) {
     },
     token: Number(instrument_token),
     outcome: "SELECTED",
-    stage: "selector",
+    stage: stage === "tick" ? "selector_tick" : "selector",
     reason: best.reason,
     meta: {
       confidence: Number(best.confidence || 0),
@@ -101,7 +151,8 @@ async function evaluateOnCandleClose({ instrument_token, intervalMin }) {
       synthetic: last.synthetic,
     },
     ts: last.ts,
+    stage,
   };
 }
 
-module.exports = { evaluateOnCandleClose };
+module.exports = { evaluateOnCandleClose, evaluateOnCandleTick };
