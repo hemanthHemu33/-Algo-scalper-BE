@@ -163,6 +163,9 @@ class TradeManager {
     // SL fill watchdog state (SL-L can remain OPEN in fast moves)
     this._slWatch = new Map(); // tradeId -> state
     this._slWatchdogInFlight = false;
+
+    // ENTRY limit fallback timers (tradeId -> timeout)
+    this._entryFallbackTimers = new Map();
   }
 
   setRuntimeAddTokens(fn) {
@@ -2441,6 +2444,207 @@ class TradeManager {
     );
   }
 
+  _clearEntryLimitFallbackTimer(tradeId) {
+    const id = String(tradeId || "");
+    if (!id) return;
+    const timer = this._entryFallbackTimers.get(id);
+    if (timer) clearTimeout(timer);
+    this._entryFallbackTimers.delete(id);
+  }
+
+  _scheduleEntryLimitFallback({
+    tradeId,
+    entryOrderId,
+    entryParams,
+    timeoutMs,
+  }) {
+    const id = String(tradeId || "");
+    const oid = String(entryOrderId || "");
+    const ms = Number(timeoutMs || 0);
+    if (!id || !oid || ms <= 0) return;
+
+    this._clearEntryLimitFallbackTimer(id);
+
+    const timer = setTimeout(() => {
+      this._entryLimitFallbackFire({
+        tradeId: id,
+        entryOrderId: oid,
+        entryParams,
+      }).catch((e) => {
+        logger.warn(
+          { tradeId: id, entryOrderId: oid, e: e.message },
+          "[entry_fallback] failed",
+        );
+      });
+    }, ms);
+
+    this._entryFallbackTimers.set(id, timer);
+  }
+
+  async _entryLimitFallbackFire({ tradeId, entryOrderId, entryParams }) {
+    const t = await getTrade(tradeId);
+    if (!t) return;
+
+    const terminal = [
+      STATUS.LIVE,
+      STATUS.EXITED_TARGET,
+      STATUS.EXITED_SL,
+      STATUS.ENTRY_FAILED,
+      STATUS.CLOSED,
+      STATUS.GUARD_FAILED,
+    ];
+    if (terminal.includes(t.status)) {
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    const statusInfo = await this._getOrderStatus(entryOrderId);
+    const status = String(statusInfo?.status || "").toUpperCase();
+    const order = statusInfo?.order || {};
+    const filledNow = Number(order.filled_quantity || 0);
+    const avgNow = Number(
+      order.average_price || t.entryPrice || t.candle?.close || 0,
+    );
+
+    if (status === "COMPLETE") {
+      const qty = Number(order.filled_quantity || t.qty);
+      await updateTrade(tradeId, {
+        status: STATUS.ENTRY_FILLED,
+        entryPrice: avgNow > 0 ? avgNow : t.entryPrice,
+        qty,
+      });
+      await this._placeExitsIfMissing({
+        ...t,
+        entryPrice: avgNow > 0 ? avgNow : t.entryPrice,
+        qty,
+      });
+      await this._ensureExitQty(tradeId, qty);
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    if (isDead(status)) {
+      await updateTrade(tradeId, {
+        status: STATUS.ENTRY_FAILED,
+        closeReason: `ENTRY_${status}`,
+      });
+      await this._finalizeClosed(tradeId, t.instrument_token);
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    if (filledNow > 0) {
+      await updateTrade(tradeId, {
+        status: STATUS.ENTRY_OPEN,
+        entryPrice: avgNow > 0 ? avgNow : t.entryPrice,
+        qty: filledNow,
+      });
+      await this._placeExitsIfMissing({
+        ...t,
+        entryPrice: avgNow > 0 ? avgNow : t.entryPrice,
+        qty: filledNow,
+      });
+      await this._ensureExitQty(tradeId, filledNow);
+      logger.warn(
+        { tradeId, entryOrderId, filledQty: filledNow },
+        "[entry_fallback] partial fill detected; skipping MARKET fallback",
+      );
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    logger.warn(
+      { tradeId, entryOrderId },
+      "[entry_fallback] timeout -> cancel LIMIT and place MARKET",
+    );
+
+    try {
+      await this._safeCancelOrder(
+        env.DEFAULT_ORDER_VARIETY || "regular",
+        entryOrderId,
+        {
+          purpose: "ENTRY_LIMIT_FALLBACK_CANCEL",
+          tradeId,
+        },
+      );
+    } catch (e) {
+      logger.warn(
+        { tradeId, entryOrderId, e: e.message },
+        "[entry_fallback] cancel failed; will not place MARKET",
+      );
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    const refresh = await this._getOrderStatus(entryOrderId);
+    const refreshStatus = String(refresh?.status || "").toUpperCase();
+    if (refreshStatus === "COMPLETE") {
+      const qty = Number(refresh?.order?.filled_quantity || t.qty);
+      const avg = Number(
+        refresh?.order?.average_price || t.entryPrice || t.candle?.close || 0,
+      );
+      await updateTrade(tradeId, {
+        status: STATUS.ENTRY_FILLED,
+        entryPrice: avg > 0 ? avg : t.entryPrice,
+        qty,
+      });
+      await this._placeExitsIfMissing({
+        ...t,
+        entryPrice: avg > 0 ? avg : t.entryPrice,
+        qty,
+      });
+      await this._ensureExitQty(tradeId, qty);
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    if (!isDead(refreshStatus)) {
+      logger.warn(
+        { tradeId, entryOrderId, refreshStatus },
+        "[entry_fallback] cancel not confirmed; skipping MARKET",
+      );
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    const marketParams = {
+      ...entryParams,
+      order_type: "MARKET",
+    };
+    delete marketParams.price;
+
+    let fallbackOrderId = null;
+    try {
+      const out = await this._safePlaceOrder(
+        env.DEFAULT_ORDER_VARIETY,
+        marketParams,
+        { purpose: "ENTRY_LIMIT_FALLBACK", tradeId },
+      );
+      fallbackOrderId = out.orderId;
+    } catch (e) {
+      logger.error(
+        { tradeId, entryOrderId, e: e.message },
+        "[entry_fallback] MARKET place failed",
+      );
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    await updateTrade(tradeId, {
+      entryOrderId: fallbackOrderId,
+      entryFallbackFrom: entryOrderId,
+      entryFallbackPlacedAt: new Date(),
+      status: STATUS.ENTRY_OPEN,
+    });
+    await linkOrder({
+      order_id: String(fallbackOrderId),
+      tradeId,
+      role: "ENTRY",
+    });
+    await this._replayOrphanUpdates(fallbackOrderId);
+    this._clearEntryLimitFallbackTimer(tradeId);
+  }
+
   async _watchExitLeg(tradeId, orderId, role) {
     const oid = String(orderId || "");
     if (!oid) return;
@@ -4147,21 +4351,6 @@ class TradeManager {
         { purpose: "ENTRY", tradeId },
       );
       entryOrderId = out.orderId;
-
-      // Pro: if LIMIT entry is not filled quickly, fallback to MARKET (options only)
-      if (
-        isOptContract &&
-        entryOrderType === "LIMIT" &&
-        Boolean(env.ENTRY_LIMIT_FALLBACK_TO_MARKET) &&
-        Number(env.ENTRY_LIMIT_TIMEOUT_MS || 0) > 0
-      ) {
-        this._scheduleEntryLimitFallback({
-          tradeId,
-          entryOrderId,
-          entryParams,
-          timeoutMs: Number(env.ENTRY_LIMIT_TIMEOUT_MS),
-        });
-      }
     } catch (e) {
       logger.error({ tradeId, e: e.message }, "[trade] ENTRY place failed");
       alert("error", "❌ ENTRY rejected/failed", {
@@ -4175,6 +4364,28 @@ class TradeManager {
       });
       await this._finalizeClosed(tradeId, token);
       return;
+    }
+
+    // Pro: if LIMIT entry is not filled quickly, fallback to MARKET (options only)
+    if (
+      isOptContract &&
+      entryOrderType === "LIMIT" &&
+      Boolean(env.ENTRY_LIMIT_FALLBACK_TO_MARKET) &&
+      Number(env.ENTRY_LIMIT_TIMEOUT_MS || 0) > 0
+    ) {
+      try {
+        this._scheduleEntryLimitFallback({
+          tradeId,
+          entryOrderId,
+          entryParams,
+          timeoutMs: Number(env.ENTRY_LIMIT_TIMEOUT_MS),
+        });
+      } catch (e) {
+        logger.warn(
+          { tradeId, entryOrderId, e: e.message },
+          "[entry_fallback] schedule failed",
+        );
+      }
     }
 
     await updateTrade(tradeId, { entryOrderId, status: STATUS.ENTRY_OPEN });
@@ -4309,6 +4520,9 @@ class TradeManager {
       // Guard against out-of-order / duplicate entry updates (e.g., OPEN after COMPLETE, or duplicate COMPLETE)
       const freshEntryTrade0 = await getTrade(trade.tradeId);
       const progressedStatus0 = freshEntryTrade0?.status || trade.status;
+      const currentEntryOrderId = String(freshEntryTrade0?.entryOrderId || "");
+      const isCurrentEntry =
+        !currentEntryOrderId || currentEntryOrderId === orderId;
 
       const progressedSet0 = [
         STATUS.ENTRY_FILLED,
@@ -4355,6 +4569,7 @@ class TradeManager {
       }
 
       if (status === "COMPLETE") {
+        this._clearEntryLimitFallbackTimer(trade.tradeId);
         const avg = Number(
           order.average_price || trade.entryPrice || trade.candle?.close,
         );
@@ -4505,6 +4720,12 @@ class TradeManager {
         order.average_price || trade.entryPrice || trade.candle?.close || 0,
       );
       if ((status === "PARTIAL" || status === "OPEN") && filledNow > 0) {
+        if (!isCurrentEntry) {
+          logger.warn(
+            { tradeId: trade.tradeId, orderId, status },
+            "[order_update] partial fill on non-current entry order",
+          );
+        }
         // Place protective exits for the filled quantity (safety first)
         await updateTrade(trade.tradeId, {
           status: STATUS.ENTRY_OPEN,
@@ -4525,6 +4746,19 @@ class TradeManager {
       }
 
       if (isDead(status)) {
+        this._clearEntryLimitFallbackTimer(trade.tradeId);
+        if (!isCurrentEntry) {
+          logger.warn(
+            {
+              tradeId: trade.tradeId,
+              orderId,
+              status,
+              currentEntryOrderId,
+            },
+            "[order_update] dead update for non-current entry order ignored",
+          );
+          return;
+        }
         await updateTrade(trade.tradeId, {
           status: STATUS.ENTRY_FAILED,
           closeReason:
