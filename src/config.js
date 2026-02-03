@@ -261,6 +261,9 @@ const schema = z.object({
   // Option SL fitter (to make 1-lot risk fit RISK_PER_TRADE_INR caps when lot sizes are large)
   // If disabled, engine may block trades when 1-lot risk exceeds cap after lot-normalization.
   OPT_SL_FIT_ENABLED: z.coerce.boolean().default(false),
+  // When FORCE_ONE_LOT + LOT_RISK_CAP_ENFORCE would otherwise BLOCK, auto-tighten SL to fit 1 lot within cap.
+  // Safe default: it never increases INR risk; it either tightens SL or blocks if it cannot fit within MIN ticks.
+  OPT_SL_FIT_WHEN_CAP_BLOCKS: z.coerce.boolean().default(true),
   // Minimum SL distance enforced by fitter (in ticks). Helps avoid ultra-tight “0.05 SL” fitting.
   OPT_SL_FIT_MIN_TICKS: z.coerce.number().default(10),
 
@@ -333,6 +336,16 @@ const schema = z.object({
   // Production hardening
   RECONCILE_INTERVAL_SEC: z.coerce.number().default(60),
   TICK_QUEUE_MAX: z.coerce.number().default(50),
+  // Tick mode controls (reduce load in F&O scalping). Only used if pipeline/tickerManager honors it.
+  // Values: 'full' (depth+ohlc+ltp) or 'ltp' (ltp-only).
+  TICK_MODE_DEFAULT: z.string().default("full"),
+  TICK_MODE_TRADE: z.string().default("full"),
+  TICK_MODE_UNDERLYING: z.string().default("ltp"),
+
+  // Candle write buffer (avoid DB writes in the hot tick loop). Only used if market/candleWriteBuffer exists.
+  CANDLE_WRITE_BUFFER_ENABLED: z.coerce.boolean().default(true),
+  CANDLE_WRITE_BATCH_SIZE: z.coerce.number().default(200),
+  CANDLE_WRITE_FLUSH_MS: z.coerce.number().default(250),
   DAILY_LOSS_CHECK_MS: z.coerce.number().default(2000),
   FORCE_FLATTEN_CHECK_MS: z.coerce.number().default(1000),
   // Allow REST quote fetch for LTP in daily-loss checker when ticks are sparse
@@ -460,6 +473,19 @@ const schema = z.object({
   EXIT_WATCH_POLL_MS: z.coerce.number().default(1000),
   EXIT_WATCH_MS: z.coerce.number().default(20000),
   TARGET_REPLACE_MAX: z.coerce.number().default(2),
+
+  // SL fill watchdog: protects SL-L (stoploss-limit) from staying OPEN after trigger in fast moves.
+  SL_WATCHDOG_ENABLED: z.coerce.boolean().default(true),
+  // If SL is triggered (LTP crosses trigger) but the SL order stays OPEN beyond this window -> cancel & MARKET exit.
+  SL_WATCHDOG_OPEN_SEC: z.coerce.number().default(8),
+  // Poll cadence while waiting (ms). Uses ticks when available; may fall back to a throttled quote/LTP fetch.
+  SL_WATCHDOG_POLL_MS: z.coerce.number().default(900),
+  // Extra trigger buffer (in bps) to reduce false positives around the exact trigger price.
+  SL_WATCHDOG_TRIGGER_BPS_BUFFER: z.coerce.number().default(5),
+  // Require a price breach (via ticks/LTP) before considering the SL "triggered".
+  SL_WATCHDOG_REQUIRE_LTP_BREACH: z.coerce.boolean().default(true),
+  // If true, enable kill-switch when watchdog fires (safest). If false, only panic-exits the position.
+  SL_WATCHDOG_KILL_SWITCH_ON_FIRE: z.coerce.boolean().default(false),
 
   // Health / monitoring (used by /admin/health/critical)
   CRITICAL_HEALTH_REQUIRE_TICKER_CONNECTED: z.coerce.boolean().default(true),

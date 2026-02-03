@@ -27,6 +27,7 @@ let ocoReconcileTimer = null;
 
 // Track ALL subscribed tokens (base universe + runtime position tokens)
 let subscribedTokens = new Set();
+let tokenModeByToken = new Map();
 let _lastPosResubAt = 0;
 let _lastUniverseRebuildAt = 0;
 
@@ -66,6 +67,54 @@ function _isOptLikeInstrument(doc) {
   const seg = String(doc?.segment || "").toUpperCase();
   const it = String(doc?.instrument_type || "").toUpperCase();
   return seg.includes("-OPT") || it === "CE" || it === "PE" || it === "OPT";
+}
+
+function _modeStrSafe(v, def = "full") {
+  const m = String(v || def || "full").toLowerCase();
+  if (m === "ltp") return "ltp";
+  if (m === "quote") return "quote";
+  return "full";
+}
+
+function _modeConst(modeStr) {
+  const m = _modeStrSafe(modeStr, "full");
+  if (!ticker) return null;
+  if (m === "ltp") return ticker.modeLTP;
+  if (m === "quote") return ticker.modeQuote;
+  return ticker.modeFull;
+}
+
+function _applyMode(tokens, modeStr) {
+  if (!ticker) return;
+  const arr = (tokens || [])
+    .map((x) => Number(x))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (!arr.length) return;
+  const mode = _modeConst(modeStr);
+  if (!mode) return;
+  try {
+    ticker.setMode(mode, arr);
+  } catch {}
+  const m = _modeStrSafe(modeStr, "full");
+  for (const t of arr) tokenModeByToken.set(Number(t), m);
+}
+
+function _applyModesFromCache(tokens) {
+  const underlyingMode = _modeStrSafe(env.TICK_MODE_UNDERLYING, "quote");
+  const full = [];
+  const quote = [];
+  const ltp = [];
+  for (const x of tokens || []) {
+    const t = Number(x);
+    if (!Number.isFinite(t) || t <= 0) continue;
+    const m = tokenModeByToken.get(t) || underlyingMode;
+    if (m === "ltp") ltp.push(t);
+    else if (m === "quote") quote.push(t);
+    else full.push(t);
+  }
+  if (quote.length) _applyMode(quote, "quote");
+  if (ltp.length) _applyMode(ltp, "ltp");
+  if (full.length) _applyMode(full, "full");
 }
 
 async function _getActiveNetPositionsSafe() {
@@ -161,14 +210,43 @@ async function _positionSubscriptionTokens() {
   return Array.from(out);
 }
 
-async function _subscribeTokens(tokens) {
+async function _subscribeTokens(tokens, opts = {}) {
   const arr = (tokens || [])
     .map((x) => Number(x))
     .filter((n) => Number.isFinite(n) && n > 0);
 
   if (!arr.length) return { ok: true, added: [] };
+
   ticker.subscribe(arr);
-  ticker.setMode(ticker.modeFull, arr);
+
+  const underlyingMode = _modeStrSafe(env.TICK_MODE_UNDERLYING, "quote");
+  const tradeMode = _modeStrSafe(env.TICK_MODE_TRADE, "full");
+
+  const role = String(opts?.role || "").toLowerCase();
+  const reason = String(opts?.reason || "").toUpperCase();
+  const hintedTrade =
+    role === "trade" || opts?.isOption === true || reason.includes("OPT");
+
+  // Optional classification (small lists only): decide per-token by instrument type.
+  const classify = _bool(opts?.classifyByInstrument, false);
+  if (classify && typeof ensureInstrument === "function") {
+    const trade = [];
+    const under = [];
+    for (const tok of arr) {
+      try {
+        const doc = await ensureInstrument(kite, tok);
+        if (_isOptLikeInstrument(doc)) trade.push(tok);
+        else under.push(tok);
+      } catch {
+        // If unknown, keep it light
+        under.push(tok);
+      }
+    }
+    if (under.length) _applyMode(under, underlyingMode);
+    if (trade.length) _applyMode(trade, tradeMode);
+  } else {
+    _applyMode(arr, hintedTrade ? tradeMode : underlyingMode);
+  }
 
   for (const t of arr) subscribedTokens.add(t);
   return { ok: true, added: arr };
@@ -194,7 +272,11 @@ async function ensureActivePositionSubscriptions({
 
   if (!missing.length) return { ok: true, added: [] };
 
-  await _subscribeTokens(missing);
+  await _subscribeTokens(missing, {
+    role: "trade",
+    reason,
+    classifyByInstrument: true,
+  });
 
   // If pipeline supports addTokens, let it backfill candles for exits/indicators.
   if (pipeline && typeof pipeline.addTokens === "function") {
@@ -317,6 +399,7 @@ async function setSession(accessToken) {
   });
 
   subscribedTokens = new Set();
+  tokenModeByToken = new Map();
   _lastPosResubAt = 0;
   _lastUniverseRebuildAt = 0;
 
@@ -379,7 +462,9 @@ function wireEvents() {
 
       if (allTokens.length) {
         ticker.subscribe(allTokens);
-        ticker.setMode(ticker.modeFull, allTokens);
+        // Reduce WS load: underlying universe in quote (or LTP) mode, traded instruments in full.
+        _applyMode(allTokens, _modeStrSafe(env.TICK_MODE_UNDERLYING, "quote"));
+        _applyMode(posTokens || [], _modeStrSafe(env.TICK_MODE_TRADE, "full"));
         subscribedTokens = new Set(allTokens);
 
         logger.info(
@@ -477,7 +562,7 @@ function wireEvents() {
       const arr = Array.from(subscribedTokens || []);
       if (arr.length) {
         ticker.subscribe(arr);
-        ticker.setMode(ticker.modeFull, arr);
+        _applyModesFromCache(arr);
         logger.warn(
           { count: arr.length },
           "[kite] reconnect: re-subscribed tokens",

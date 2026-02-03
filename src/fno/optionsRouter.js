@@ -2,6 +2,10 @@ const { DateTime } = require("luxon");
 const { env } = require("../config");
 const { logger } = require("../logger");
 const {
+  isQuoteGuardBreakerOpen,
+  getQuoteGuardStats,
+} = require("../kite/quoteGuard");
+const {
   getInstrumentsDump,
   parseCsvList,
   uniq,
@@ -328,6 +332,30 @@ async function pickOptionContractForSignal({
     };
   }
 
+  // QuoteGuard safety: if breaker is open (rate limits / transient failures),
+  // block option selection so we don't pick contracts with partial / missing liquidity fields.
+  const blockOnQG =
+    String(env.OPT_BLOCK_ON_QUOTE_GUARD_OPEN || "true") !== "false";
+  if (
+    blockOnQG &&
+    typeof isQuoteGuardBreakerOpen === "function" &&
+    isQuoteGuardBreakerOpen()
+  ) {
+    const st =
+      typeof getQuoteGuardStats === "function" ? getQuoteGuardStats() : null;
+    return {
+      ok: false,
+      reason: "QUOTE_GUARD_BREAKER_OPEN",
+      message:
+        "[options] QuoteGuard breaker open; blocking option selection until quotes stabilize",
+      underlying,
+      optType: null,
+      meta: {
+        breakerOpenUntil: st?.breakerOpenUntil || null,
+        failStreak: st?.failStreak ?? null,
+      },
+    };
+  }
   const dir = String(side || "").toUpperCase();
   const optType = dir === "BUY" ? "CE" : "PE";
 
@@ -552,15 +580,15 @@ async function pickOptionContractForSignal({
       const premOk = Number.isFinite(ltp)
         ? ltp >= minPrem && ltp <= maxPrem
         : true;
-      const spreadOk = Number.isFinite(bps) ? bps <= maxBps : true;
+      const spreadOk = Number.isFinite(bps) ? bps <= maxBps : false; // fail-closed when spread is unknown
       const spreadTrendOk = Number.isFinite(bpsCh)
         ? bpsCh <= spreadRiseBlockBps
         : true;
 
+      const depthTopQty = Number(r.depth_qty_top || 0);
+      const hasAnyDepth = Number.isFinite(depthTopQty) && depthTopQty > 0;
       const depthOk =
-        Number(minDepth) > 0
-          ? Number(r.depth_qty_top || 0) >= Number(minDepth)
-          : true;
+        Number(minDepth) > 0 ? depthTopQty >= Number(minDepth) : hasAnyDepth; // require depth even if minDepth not configured
 
       const delta = Number(r.delta);
       const deltaAbs = Number.isFinite(delta) ? Math.abs(delta) : null;
@@ -602,10 +630,13 @@ async function pickOptionContractForSignal({
         weights,
       });
 
-      // "ok" is your hard gate pack when OPT_PICK_REQUIRE_OK=true.
-      // We keep missing greeks as non-blocking so you don't fail open if quotes don't include depth.
-      const ok =
-        premOk &&
+      // "hardOk" = all safety/liquidity/greek gates EXCLUDING the premium band.
+      // "ok"     = hardOk + premium band.
+      // Why split?
+      //  - When premium band is too tight (e.g., decaying 0DTE), you may end up with
+      //    NO_OK_CANDIDATE even though plenty of contracts are liquid + greeks-safe.
+      //  - We can optionally allow a *premium-band-only* fallback without relaxing other gates.
+      const hardOk =
         spreadOk &&
         spreadTrendOk &&
         depthOk &&
@@ -615,8 +646,11 @@ async function pickOptionContractForSignal({
         gammaOk &&
         oiWallOk;
 
+      const ok = premOk && hardOk;
+
       return {
         row: r,
+        hardOk,
         ok,
         premOk,
         spreadOk,
@@ -658,92 +692,157 @@ async function pickOptionContractForSignal({
     return true;
   });
 
-  if (eligible.length === 0) {
-    const why = requireOk
-      ? "no OK candidate (spread/depth/greeks/oi gates)"
-      : "no candidate in premium band";
+  // If nothing is eligible, optionally allow a *premium-band-only* fallback
+  // (i.e., keep all other gates intact).
+  let premiumBandFallbackUsed = false;
+  let best = eligible[0];
 
-    const msg = `[options] ${why} for ${underlying} ${optType} (minPrem=${minPrem}, maxPrem=${maxPrem}, maxBps=${maxBps}, minDepth=${minDepth})`;
+  if (!best) {
+    const allowPremiumFallback =
+      !!env.OPT_PREMIUM_BAND_FALLBACK && requireOk && enforcePremBand;
 
-    const debugTop =
-      debugTopN > 0
-        ? scored.slice(0, debugTopN).map((x) => ({
-            tradingsymbol: x.row.tradingsymbol,
-            strike: Number(x.row.strike),
-            ltp: Number(x.row.ltp),
-            spread_bps: Number(x.row.spread_bps),
-            depth_qty_top: Number(x.row.depth_qty_top || 0),
-            delta: Number(x.row.delta),
-            gamma: Number(x.row.gamma),
-            iv_pts: Number(x.row.iv_pts),
-            score: Number(x.score),
-            ok: !!x.ok,
-            premOk: !!x.premOk,
-            spreadOk: !!x.spreadOk,
-            spreadTrendOk: !!x.spreadTrendOk,
-            depthOk: !!x.depthOk,
-            deltaOk: !!x.deltaOk,
-            gammaOk: !!x.gammaOk,
-            ivOk: !!x.ivOk,
-            ivTrendOk: !!x.ivTrendOk,
-          }))
-        : undefined;
+    if (allowPremiumFallback) {
+      const slackDown = Number(env.OPT_PREMIUM_BAND_FALLBACK_SLACK_DOWN || 20);
+      const slackUp = Number(env.OPT_PREMIUM_BAND_FALLBACK_SLACK_UP || 150);
 
-    logger.warn(
-      {
+      // Find best contract that passes ALL gates except premium band.
+      // Choose by score then ATM distance.
+      let bestHard = null;
+      for (const x of scored) {
+        if (!x?.hardOk) continue;
+        const ltp = Number(x.row.ltp);
+        if (!Number.isFinite(ltp)) continue;
+        if (ltp < minPrem - slackDown) continue;
+        if (ltp > maxPrem + slackUp) continue;
+        if (!bestHard) {
+          bestHard = x;
+          continue;
+        }
+        if (x.score < bestHard.score) bestHard = x;
+        else if (x.score === bestHard.score && x.dist < bestHard.dist) {
+          bestHard = x;
+        }
+      }
+
+      if (bestHard) {
+        best = bestHard;
+        premiumBandFallbackUsed = true;
+
+        logger.warn(
+          {
+            underlying,
+            optType,
+            expiry: expiryISO,
+            atm,
+            desiredStrike,
+            step,
+            minPrem,
+            maxPrem,
+            slackDown,
+            slackUp,
+            picked: {
+              tradingsymbol: bestHard.row.tradingsymbol,
+              strike: Number(bestHard.row.strike),
+              ltp: Number(bestHard.row.ltp),
+              bps: Number(bestHard.row.spread_bps),
+              depth: Number(bestHard.row.depth_qty_top || 0),
+              delta: Number(bestHard.row.delta),
+              gamma: Number(bestHard.row.gamma),
+            },
+          },
+          "[options] premium band fallback used (all other gates OK)",
+        );
+      }
+    }
+
+    // Still nothing? Return original failure.
+    if (!best) {
+      const why = requireOk
+        ? "no OK candidate (spread/depth/greeks/oi gates)"
+        : "no candidate in premium band";
+
+      const msg = `[options] ${why} for ${underlying} ${optType} (minPrem=${minPrem}, maxPrem=${maxPrem}, maxBps=${maxBps}, minDepth=${minDepth})`;
+
+      const debugTop =
+        debugTopN > 0
+          ? scored.slice(0, debugTopN).map((x) => ({
+              tradingsymbol: x.row.tradingsymbol,
+              strike: Number(x.row.strike),
+              ltp: Number(x.row.ltp),
+              spread_bps: Number(x.row.spread_bps),
+              depth_qty_top: Number(x.row.depth_qty_top || 0),
+              delta: Number(x.row.delta),
+              gamma: Number(x.row.gamma),
+              iv_pts: Number(x.row.iv_pts),
+              score: Number(x.score),
+              ok: !!x.ok,
+              hardOk: !!x.hardOk,
+              premOk: !!x.premOk,
+              spreadOk: !!x.spreadOk,
+              spreadTrendOk: !!x.spreadTrendOk,
+              depthOk: !!x.depthOk,
+              deltaOk: !!x.deltaOk,
+              gammaOk: !!x.gammaOk,
+              ivOk: !!x.ivOk,
+              ivTrendOk: !!x.ivTrendOk,
+            }))
+          : undefined;
+
+      logger.warn(
+        {
+          underlying,
+          optType,
+          expiry: expiryISO,
+          atm,
+          desiredStrike,
+          step,
+          requireOk,
+          minPrem,
+          maxPrem,
+          maxBps,
+          minDepth,
+          topCandidates: debugTop,
+        },
+        "[options] no eligible candidate",
+      );
+
+      return {
+        ok: false,
+        reason: requireOk ? "NO_OK_CANDIDATE" : "NO_PREMIUM_BAND_CANDIDATE",
+        message: msg,
         underlying,
         optType,
         expiry: expiryISO,
-        atm,
+        atmStrike: atm,
         desiredStrike,
-        step,
-        requireOk,
-        minPrem,
-        maxPrem,
-        maxBps,
-        minDepth,
-        topCandidates: debugTop,
-      },
-      "[options] no eligible candidate",
-    );
-
-    return {
-      ok: false,
-      reason: requireOk ? "NO_OK_CANDIDATE" : "NO_PREMIUM_BAND_CANDIDATE",
-      message: msg,
-      underlying,
-      optType,
-      expiry: expiryISO,
-      atmStrike: atm,
-      desiredStrike,
-      strikeStep: step,
-      premiumBand: { minPrem, maxPrem, enforced: enforcePremBand },
-      meta: {
-        micro: { maxBps, spreadRiseBlockBps, minDepth },
-        deltaBand: enforceDeltaBand
-          ? { min: deltaMin, max: deltaMax, target: deltaTarget }
-          : null,
-        iv: {
-          maxPts: ivMaxPts,
-          dropBlockPts: ivDropBlockPts,
-          neutralPts: ivNeutralPts,
+        strikeStep: step,
+        premiumBand: { minPrem, maxPrem, enforced: enforcePremBand },
+        meta: {
+          micro: { maxBps, spreadRiseBlockBps, minDepth },
+          deltaBand: enforceDeltaBand
+            ? { min: deltaMin, max: deltaMax, target: deltaTarget }
+            : null,
+          iv: {
+            maxPts: ivMaxPts,
+            dropBlockPts: ivDropBlockPts,
+            neutralPts: ivNeutralPts,
+          },
+          gamma: {
+            max: gammaMax,
+            gateActive: gammaGateActive,
+            gateDteDays: gammaGateDteDays,
+          },
+          oiContext,
+          topCandidates: debugTop,
         },
-        gamma: {
-          max: gammaMax,
-          gateActive: gammaGateActive,
-          gateDteDays: gammaGateDteDays,
-        },
-        oiContext,
-        topCandidates: debugTop,
-      },
-    };
+      };
+    }
   }
 
-  const best = eligible[0];
-
+  const poolForDebug = eligible.length > 0 ? eligible : scored;
   const topCandidates =
     debugTopN > 0
-      ? eligible.slice(0, debugTopN).map((x) => ({
+      ? poolForDebug.slice(0, debugTopN).map((x) => ({
           tradingsymbol: x.row.tradingsymbol,
           strike: Number(x.row.strike),
           ltp: Number(x.row.ltp),
@@ -762,6 +861,7 @@ async function pickOptionContractForSignal({
           distSteps: Number(x.distSteps),
           score: Number(x.score),
           ok: !!x.ok,
+          hardOk: !!x.hardOk,
           premOk: !!x.premOk,
           spreadOk: !!x.spreadOk,
           spreadTrendOk: !!x.spreadTrendOk,
@@ -812,6 +912,13 @@ async function pickOptionContractForSignal({
     meta: {
       policy: picked?.policy || null,
       dteDays: Number.isFinite(dteDays) ? dteDays : null,
+      premiumBandFallbackUsed,
+      premiumBandFallback: premiumBandFallbackUsed
+        ? {
+            slackDown: Number(env.OPT_PREMIUM_BAND_FALLBACK_SLACK_DOWN || 20),
+            slackUp: Number(env.OPT_PREMIUM_BAND_FALLBACK_SLACK_UP || 150),
+          }
+        : null,
       gammaGateActive,
       deltaBand: enforceDeltaBand
         ? { min: deltaMin, max: deltaMax, target: deltaTarget }
@@ -852,7 +959,8 @@ async function pickOptionContractForSignal({
         gamma: best.row.gamma,
         ivPts: best.row.iv_pts,
         score: best.score,
-        ok: best.ok,
+        ok: premiumBandFallbackUsed ? true : best.ok,
+        premiumBandFallbackUsed,
         oiWall: selection?.meta?.oiContext?.wall || null,
       },
     },

@@ -63,14 +63,22 @@ function readCfg() {
     chunkSize: clampNum(env.QUOTE_GUARD_CHUNK_SIZE || 75, 10, 200),
     maxInFlight: clampNum(env.QUOTE_GUARD_MAX_INFLIGHT || 1, 1, 4),
     minIntervalMs: clampNum(env.QUOTE_GUARD_MIN_INTERVAL_MS || 150, 0, 5000),
-    budgetWindowMs: clampNum(env.QUOTE_GUARD_BUDGET_WINDOW_MS || 10000, 1000, 60000),
+    budgetWindowMs: clampNum(
+      env.QUOTE_GUARD_BUDGET_WINDOW_MS || 10000,
+      1000,
+      60000,
+    ),
     budgetMax: clampNum(env.QUOTE_GUARD_BUDGET_MAX || 20, 0, 500),
     maxRetries: clampNum(env.QUOTE_GUARD_MAX_RETRIES || 3, 0, 8),
     backoffBaseMs: clampNum(env.QUOTE_GUARD_BACKOFF_BASE_MS || 250, 50, 5000),
     backoffMaxMs: clampNum(env.QUOTE_GUARD_BACKOFF_MAX_MS || 5000, 100, 30000),
     jitterPct: clampNum(env.QUOTE_GUARD_JITTER_PCT || 0.25, 0, 1),
     breakerFails: clampNum(env.QUOTE_GUARD_BREAKER_FAILS || 4, 1, 20),
-    breakerCooldownMs: clampNum(env.QUOTE_GUARD_BREAKER_COOLDOWN_MS || 20000, 1000, 300000),
+    breakerCooldownMs: clampNum(
+      env.QUOTE_GUARD_BREAKER_COOLDOWN_MS || 20000,
+      1000,
+      300000,
+    ),
   };
 }
 
@@ -276,7 +284,10 @@ async function getQuoteGuarded(kite, keys, meta = {}) {
   const t = nowMs();
   if (state.breakerOpenUntil && t < state.breakerOpenUntil) {
     logger.warn(
-      { label: meta?.label, until: new Date(state.breakerOpenUntil).toISOString() },
+      {
+        label: meta?.label,
+        until: new Date(state.breakerOpenUntil).toISOString(),
+      },
       "[quote-guard] breaker open; returning empty quotes",
     );
     return {};
@@ -288,10 +299,13 @@ async function getQuoteGuarded(kite, keys, meta = {}) {
   const results = {};
   for (const part of chunks) {
     try {
-      const q = await enqueue(() => guardedGetQuoteWithRetry(kite, part, meta), {
-        label: meta?.label,
-        size: part.length,
-      });
+      const q = await enqueue(
+        () => guardedGetQuoteWithRetry(kite, part, meta),
+        {
+          label: meta?.label,
+          size: part.length,
+        },
+      );
       if (q && typeof q === "object") {
         for (const k of Object.keys(q)) results[k] = q[k];
       }
@@ -319,7 +333,13 @@ function getQuoteGuardStats() {
   };
 }
 
+function isQuoteGuardBreakerOpen() {
+  const t = nowMs();
+  return Boolean(state.breakerOpenUntil && t < state.breakerOpenUntil);
+}
+
 module.exports = {
   getQuoteGuarded,
   getQuoteGuardStats,
+  isQuoteGuardBreakerOpen,
 };

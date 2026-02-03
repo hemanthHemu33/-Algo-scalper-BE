@@ -20,6 +20,10 @@ const {
   computeTargetFromRR,
 } = require("./optionSlFitter");
 const { getRecentCandles } = require("../market/candleStore");
+const {
+  isQuoteGuardBreakerOpen,
+  getQuoteGuardStats,
+} = require("../kite/quoteGuard");
 const { OrderRateLimiter } = require("./orderRateLimiter");
 const { computeDynamicExitPlan } = require("./dynamicExitManager");
 const { planRunnerTarget } = require("./targetPlanner");
@@ -155,6 +159,10 @@ class TradeManager {
 
     // Injected by pipeline: runtime token subscription (needed for OPT mode correctness)
     this.runtimeAddTokens = null;
+
+    // SL fill watchdog state (SL-L can remain OPEN in fast moves)
+    this._slWatch = new Map(); // tradeId -> state
+    this._slWatchdogInFlight = false;
   }
 
   setRuntimeAddTokens(fn) {
@@ -399,8 +407,334 @@ class TradeManager {
       this._lastFlattenCheckAt = now;
       this._forceFlattenIfNeeded().catch(() => {});
     }
+
+    // SL watchdog: track trigger crossings in fast moves (especially for SL-L fallback)
+    try {
+      this._maybeTriggerSlWatchFromTick(token, ltp, now);
+    } catch {}
   }
 
+  // =========================
+  // SL fill watchdog (for SL-L fallback)
+  // =========================
+  _isSlWatchdogEnabled() {
+    return String(env.SL_WATCHDOG_ENABLED || "true") !== "false";
+  }
+
+  _clearSlWatch(tradeId) {
+    try {
+      const id = String(tradeId || "");
+      const st = this._slWatch.get(id);
+      if (st?.timer) {
+        clearTimeout(st.timer);
+      }
+      this._slWatch.delete(id);
+    } catch {}
+  }
+
+  _registerSlWatchFromTrade(trade) {
+    try {
+      if (!this._isSlWatchdogEnabled()) return;
+      const tradeId = String(trade?.tradeId || "");
+      if (!tradeId) return;
+
+      const slOrderId = trade?.slOrderId ? String(trade.slOrderId) : null;
+      if (!slOrderId) return;
+
+      // Watch only stoploss-limit (SL) — SL-M becomes MARKET on trigger and should not remain OPEN.
+      const ot = String(trade?.slOrderType || "").toUpperCase();
+      if (ot && ot !== "SL") return;
+
+      const token = Number(trade?.instrument_token);
+      const triggerPrice = Number(trade?.stopLoss);
+      if (
+        !Number.isFinite(token) ||
+        !Number.isFinite(triggerPrice) ||
+        triggerPrice <= 0
+      )
+        return;
+
+      const side = String(trade?.side || "BUY").toUpperCase();
+      const exitSide = side === "BUY" ? "SELL" : "BUY";
+
+      const existing = this._slWatch.get(tradeId) || {};
+      this._slWatch.set(tradeId, {
+        ...existing,
+        tradeId,
+        token,
+        side,
+        exitSide,
+        triggerPrice,
+        slOrderId,
+        slOrderType: ot || "SL",
+        triggeredAtMs: existing.triggeredAtMs || 0,
+        firedAtMs: existing.firedAtMs || 0,
+        lastLtp: existing.lastLtp || null,
+        timer: existing.timer || null,
+      });
+    } catch {}
+  }
+
+  _updateSlWatchTrigger(tradeId, triggerPrice) {
+    try {
+      const id = String(tradeId || "");
+      const st = this._slWatch.get(id);
+      const tp = Number(triggerPrice);
+      if (!st || !Number.isFinite(tp) || tp <= 0) return;
+      this._slWatch.set(id, { ...st, triggerPrice: tp });
+    } catch {}
+  }
+
+  _slWatchIsBreached(ltp, triggerPrice, exitSide) {
+    const l = Number(ltp);
+    const t = Number(triggerPrice);
+    if (!Number.isFinite(l) || !Number.isFinite(t) || t <= 0) return false;
+
+    const bufBps = Number(env.SL_WATCHDOG_TRIGGER_BPS_BUFFER || 5);
+    const b = Number.isFinite(bufBps) ? bufBps : 0;
+    const factor = b > 0 ? b / 10000 : 0;
+
+    if (String(exitSide).toUpperCase() === "SELL") {
+      // Long position stop: trigger when LTP <= trigger. Add buffer by requiring LTP slightly below trigger.
+      return l <= t * (1 - factor);
+    }
+    // Short position stop: trigger when LTP >= trigger. Add buffer by requiring LTP slightly above trigger.
+    return l >= t * (1 + factor);
+  }
+
+  _maybeTriggerSlWatchFromTick(token, ltp, nowMs) {
+    if (!this._isSlWatchdogEnabled()) return;
+    if (!this.activeTradeId) return;
+
+    const tradeId = String(this.activeTradeId);
+    const st = this._slWatch.get(tradeId);
+    if (!st) return;
+
+    if (Number(st.token) !== Number(token)) return;
+    if (!Number.isFinite(Number(ltp))) return;
+
+    // Update last seen LTP for diagnostics
+    st.lastLtp = Number(ltp);
+    this._slWatch.set(tradeId, st);
+
+    const requireBreach =
+      String(env.SL_WATCHDOG_REQUIRE_LTP_BREACH || "true") !== "false";
+    const breached = this._slWatchIsBreached(ltp, st.triggerPrice, st.exitSide);
+
+    if (requireBreach && !breached) return;
+
+    // Mark triggered and arm timer once
+    if (!st.triggeredAtMs) {
+      st.triggeredAtMs = Number(nowMs || Date.now());
+      this._slWatch.set(tradeId, st);
+      try {
+        updateTrade(tradeId, {
+          slTriggeredAt: new Date(st.triggeredAtMs),
+        }).catch(() => {});
+      } catch {}
+
+      const openSec = Number(env.SL_WATCHDOG_OPEN_SEC || 8);
+      const ms = Math.max(1000, openSec * 1000);
+
+      if (st.timer) clearTimeout(st.timer);
+      st.timer = setTimeout(() => {
+        this._slWatchdogFire(tradeId, "timeout").catch(() => {});
+      }, ms);
+      this._slWatch.set(tradeId, st);
+    }
+  }
+
+  _slWatchdogHeartbeat(trade, netQty, source = "reconcile") {
+    try {
+      if (!this._isSlWatchdogEnabled()) return;
+      const tradeId = String(trade?.tradeId || "");
+      if (!tradeId) return;
+
+      // Only for active positions
+      if (!Number.isFinite(Number(netQty)) || Number(netQty) === 0) {
+        this._clearSlWatch(tradeId);
+        return;
+      }
+
+      this._registerSlWatchFromTrade(trade);
+      const st = this._slWatch.get(tradeId);
+      if (!st) return;
+
+      const openSec = Number(env.SL_WATCHDOG_OPEN_SEC || 8);
+      const nowMs = Date.now();
+
+      // If already triggered and overdue, fire immediately (handles restarts / missed timers)
+      if (st.triggeredAtMs && !st.firedAtMs) {
+        const overdue = nowMs - Number(st.triggeredAtMs) >= openSec * 1000;
+        if (overdue) {
+          this._slWatchdogFire(tradeId, `heartbeat_${source}`).catch(() => {});
+          return;
+        }
+      }
+
+      // If not triggered, try using latest tick LTP we have
+      const ltp = this.lastPriceByToken.get(Number(st.token));
+      if (!Number.isFinite(Number(ltp))) return;
+
+      this._maybeTriggerSlWatchFromTick(st.token, ltp, nowMs);
+    } catch {}
+  }
+
+  async _getOrderStatus(orderId) {
+    const oid = String(orderId || "");
+    if (!oid) return null;
+
+    // 1) Try getOrderHistory(orderId) — best for a single order
+    try {
+      const hist = await this.kite.getOrderHistory(oid);
+      const last = Array.isArray(hist) ? hist[hist.length - 1] : null;
+      const st = String(last?.status || "").toUpperCase();
+      return { status: st, order: last };
+    } catch {}
+
+    // 2) Fallback to getOrders() and find by order_id
+    try {
+      const orders = await this.kite.getOrders();
+      const o = Array.isArray(orders)
+        ? orders.find((x) => String(x?.order_id) === oid)
+        : null;
+      const st = String(o?.status || "").toUpperCase();
+      return { status: st, order: o };
+    } catch {}
+
+    return null;
+  }
+
+  async _slWatchdogFire(tradeId, cause = "timeout") {
+    if (this._slWatchdogInFlight) return;
+    this._slWatchdogInFlight = true;
+
+    try {
+      if (!this._isSlWatchdogEnabled()) return;
+
+      const id = String(tradeId || "");
+      const st = this._slWatch.get(id);
+      if (!st) return;
+
+      // Mark fired (avoid re-entrant timers)
+      if (st.firedAtMs) return;
+      st.firedAtMs = Date.now();
+      this._slWatch.set(id, st);
+
+      const fresh = await getTrade(id);
+      if (!fresh) return;
+
+      // If already closed/terminal, stop watching
+      const terminal = [
+        STATUS.EXITED_TARGET,
+        STATUS.EXITED_SL,
+        STATUS.ENTRY_FAILED,
+        STATUS.CLOSED,
+      ];
+      if (terminal.includes(fresh.status)) {
+        this._clearSlWatch(id);
+        return;
+      }
+
+      // If SL order is already complete/dead, stop watching
+      const slId = fresh?.slOrderId ? String(fresh.slOrderId) : null;
+      if (!slId) {
+        this._clearSlWatch(id);
+        return;
+      }
+
+      const s = await this._getOrderStatus(slId);
+      const stt = String(s?.status || "").toUpperCase();
+
+      if (stt === "COMPLETE" || isDead(stt)) {
+        this._clearSlWatch(id);
+        return;
+      }
+
+      // Only act if we have evidence SL should have triggered (or requireBreach is disabled)
+      const requireBreach =
+        String(env.SL_WATCHDOG_REQUIRE_LTP_BREACH || "true") !== "false";
+      const breached =
+        !requireBreach ||
+        this._slWatchIsBreached(st.lastLtp, st.triggerPrice, st.exitSide);
+
+      if (!breached) {
+        // False trigger; reset to avoid nuisance exits
+        logger.warn(
+          { tradeId: id, cause, lastLtp: st.lastLtp, trigger: st.triggerPrice },
+          "[sl_watchdog] fired but breach not confirmed -> reset",
+        );
+        st.triggeredAtMs = 0;
+        st.firedAtMs = 0;
+        if (st.timer) clearTimeout(st.timer);
+        st.timer = null;
+        this._slWatch.set(id, st);
+        return;
+      }
+
+      // Persist watchdog event
+      try {
+        await updateTrade(id, {
+          slWatchdogFiredAt: new Date(),
+          slWatchdogCause: String(cause || "timeout"),
+          slWatchdogSlOrderStatus: stt || null,
+          slWatchdogLastLtp: Number.isFinite(Number(st.lastLtp))
+            ? Number(st.lastLtp)
+            : null,
+        });
+      } catch {}
+
+      logger.error(
+        {
+          tradeId: id,
+          token: st.token,
+          slOrderId: slId,
+          slStatus: stt,
+          lastLtp: st.lastLtp,
+          trigger: st.triggerPrice,
+          cause,
+        },
+        "[sl_watchdog] SL triggered but not filled -> cancel & MARKET exit",
+      );
+
+      alert("error", "🛑 SL watchdog: cancel SL-L & MARKET exit", {
+        tradeId: id,
+        slOrderId: slId,
+        slStatus: stt,
+        ltp: st.lastLtp,
+        trigger: st.triggerPrice,
+        cause,
+      }).catch(() => {});
+
+      // Optional kill-switch on watchdog fire (safest)
+      const killOnFire =
+        String(env.SL_WATCHDOG_KILL_SWITCH_ON_FIRE || "false") === "true";
+      if (killOnFire) {
+        await this.setKillSwitch(true, "SL_WATCHDOG");
+      }
+
+      // Cancel any remaining exits (best effort), then panic exit to guarantee flat
+      try {
+        await this._cancelRemainingExitsOnce(fresh, "SL_WATCHDOG");
+      } catch {}
+      await this._panicExit(
+        fresh,
+        "SL_WATCHDOG_" + String(cause || "timeout"),
+        {
+          allowWhenHalted: true,
+        },
+      );
+
+      this._clearSlWatch(id);
+    } catch (e) {
+      logger.error(
+        { tradeId: String(tradeId || ""), e: e?.message || String(e) },
+        "[sl_watchdog] error",
+      );
+    } finally {
+      this._slWatchdogInFlight = false;
+    }
+  }
   async _getLtp(token, instrument) {
     const tok = Number(token);
     const cached = this.lastPriceByToken.get(tok);
@@ -788,6 +1122,9 @@ class TradeManager {
 
         for (const oid of toCancel) {
           try {
+            try {
+              this.expectedCancelOrderIds.add(String(oid));
+            } catch {}
             await this._safeCancelOrder(variety, oid, {
               purpose: "PANIC_CANCEL",
               tradeId,
@@ -1311,6 +1648,11 @@ class TradeManager {
           STATUS.CLOSED,
         ].includes(trade.status);
 
+        // SL watchdog heartbeat (handles restarts / tick gaps): if SL-L triggered but not filled -> flatten.
+        try {
+          this._slWatchdogHeartbeat(trade, netQty, source);
+        } catch {}
+
         if (netQty === 0) {
           // cancel any remaining exits ASAP (reduces accidental re-entry via dangling SL/TGT)
           if (
@@ -1802,6 +2144,9 @@ class TradeManager {
             { purpose: "DYN_TRAIL_SL", tradeId },
           );
           await updateTrade(tradeId, { stopLoss: plan.sl.stopLoss });
+          try {
+            this._updateSlWatchTrigger(tradeId, plan.sl.stopLoss);
+          } catch {}
           did = true;
           logger.info(
             { tradeId, stopLoss: plan.sl.stopLoss, meta: plan.meta },
@@ -2170,8 +2515,14 @@ class TradeManager {
     const enabled = String(env.ENABLE_SPREAD_FILTER) === "true";
     if (!enabled && !(sampleOnly && allowWhenDisabled)) return { ok: true };
 
+    // OPT mode is extremely sensitive to liquidity.
+    // Fail-closed if we can't verify bid/ask depth (prevents illiquid / spoofed strikes).
+    const strictOptDepth = this._isOptMode();
+
     if (typeof this.kite.getQuote !== "function") {
-      return { ok: true, note: "no_getQuote" };
+      return strictOptDepth
+        ? { ok: false, reason: "NO_GETQUOTE_FN" }
+        : { ok: true, note: "no_getQuote" };
     }
 
     const ex = instrument.exchange || env.DEFAULT_EXCHANGE || "NSE";
@@ -2184,19 +2535,38 @@ class TradeManager {
       const bid = Number(q?.depth?.buy?.[0]?.price);
       const ask = Number(q?.depth?.sell?.[0]?.price);
       const ltp = Number(q?.last_price);
-      if (
-        !Number.isFinite(bid) ||
-        !Number.isFinite(ask) ||
-        bid <= 0 ||
-        ask <= 0
-      ) {
+
+      const hasDepth =
+        Number.isFinite(bid) &&
+        Number.isFinite(ask) &&
+        bid > 0 &&
+        ask > 0 &&
+        ask >= bid;
+
+      if (!hasDepth) {
+        if (strictOptDepth) {
+          return { ok: false, reason: "NO_DEPTH", meta: { bid, ask, ltp } };
+        }
         return { ok: true, note: "no_depth" };
       }
+
       const mid = (bid + ask) / 2;
       const bps = ((ask - bid) / mid) * 10000;
+
       const maxBps = Number.isFinite(Number(opts.maxBps))
         ? Number(opts.maxBps)
         : this._getMaxSpreadBps(instrument);
+
+      if (!Number.isFinite(bps)) {
+        if (strictOptDepth) {
+          return {
+            ok: false,
+            reason: "SPREAD_BPS_NAN",
+            meta: { bid, ask, ltp, bps },
+          };
+        }
+        return { ok: true, note: "spread_nan", meta: { bid, ask, ltp, bps } };
+      }
 
       if (!sampleOnly && enabled && bps > maxBps) {
         return {
@@ -2214,9 +2584,18 @@ class TradeManager {
     } catch (e) {
       logger.warn(
         { e: e.message },
-        "[filters] spread check failed; allowing trade",
+        strictOptDepth
+          ? "[filters] spread check failed; blocking trade (OPT strict)"
+          : "[filters] spread check failed; allowing trade",
       );
-      return { ok: true, note: "quote_error" };
+      return strictOptDepth
+        ? {
+            ok: false,
+            reason: "QUOTE_ERROR",
+            note: "quote_error",
+            meta: { message: e.message },
+          }
+        : { ok: true, note: "quote_error" };
     }
   }
 
@@ -2746,6 +3125,29 @@ class TradeManager {
     let s = signal;
     const isOptMode = this._isOptMode();
     if (isOptMode) {
+      // QuoteGuard safety: if quotes are unstable (breaker open), pause new OPT entries.
+      const blockOnQG =
+        String(env.OPT_BLOCK_ON_QUOTE_GUARD_OPEN || "true") !== "false";
+      if (
+        blockOnQG &&
+        typeof isQuoteGuardBreakerOpen === "function" &&
+        isQuoteGuardBreakerOpen()
+      ) {
+        const st =
+          typeof getQuoteGuardStats === "function"
+            ? getQuoteGuardStats()
+            : null;
+        logger.warn(
+          {
+            breakerOpenUntil: st?.breakerOpenUntil || null,
+            failStreak: st?.failStreak ?? null,
+            token: s.instrument_token,
+            side: s.side,
+          },
+          "[trade] blocked (quote guard breaker open)",
+        );
+        return;
+      }
       const underlyingToken = Number(s.instrument_token);
       const underlyingSide = String(s.side || "").toUpperCase();
 
@@ -3491,24 +3893,118 @@ class TradeManager {
           newQty = this._normalizeQtyToLot(newQty, instrument);
 
           if (newQty < 1) {
-            logger.info(
-              {
-                token,
-                side: side,
-                reason: "LOT_RISK_CAP_BLOCK",
-                meta: {
-                  qty,
-                  trueRiskInr,
-                  capInr,
-                  perUnitRisk,
-                  lot,
-                  qtyMode,
-                  intendedRiskInr,
+            // FORCE_ONE_LOT + small cap can hard-block trades because you cannot take < 1 lot.
+            // In OPT mode, a safe "rescue" is to tighten SL toward entry so 1-lot risk fits the cap.
+            const forceOneLot =
+              String(env.FNO_MIN_LOT_POLICY || "STRICT").toUpperCase() ===
+              "FORCE_ONE_LOT";
+            const slFitWhenCapBlocks =
+              String(env.OPT_SL_FIT_WHEN_CAP_BLOCKS || "true") !== "false";
+
+            const canRescueBySlFit =
+              forceOneLot && lot > 1 && !!s.option_meta && slFitWhenCapBlocks;
+
+            if (canRescueBySlFit) {
+              const tickSize = Number(instrument.tick_size || tick || 0.05);
+              const minTicks = Number(
+                env.OPT_SL_FIT_MIN_TICKS || env.MIN_SL_TICKS || 2,
+              );
+
+              const fit = fitStopLossToLotRiskCap({
+                side,
+                entry: entryForRisk,
+                stopLoss,
+                lot,
+                tickSize,
+                capInr,
+                minTicks,
+              });
+
+              if (fit.ok) {
+                const oldSL = stopLoss;
+                const qtyOld = qty;
+                // In FORCE_ONE_LOT scenarios, prefer taking the minimum 1 lot (not multiple lots),
+                // otherwise even a fitted SL may still exceed cap for larger qty.
+                qty = this._normalizeQtyToLot(lot, instrument) || lot;
+
+                stopLoss = fit.stopLoss;
+
+                // Keep planned target consistent with rrTarget if we already have a planned target.
+                if (plannedTargetPrice != null) {
+                  const newT = computeTargetFromRR({
+                    side,
+                    entry: entryGuess,
+                    stopLoss,
+                    rr: Number(rrTarget || env.RR_TARGET || 2.2),
+                    tickSize,
+                  });
+                  if (newT != null) plannedTargetPrice = newT;
+                }
+
+                logger.warn(
+                  {
+                    token,
+                    side,
+                    qtyOld,
+                    qty,
+                    lot,
+                    entryForRisk,
+                    oldSL,
+                    newSL: stopLoss,
+                    capInr,
+                    perUnitRiskOld: perUnitRisk,
+                    perUnitRiskNew: fit.perUnitRisk,
+                    allowedPerUnitRisk: fit.allowedPerUnitRisk,
+                    minStopDistance: fit.minStop,
+                  },
+                  "[risk] lot risk cap rescue: SL tightened to allow 1 lot",
+                );
+
+                // Continue without blocking; SL is now fitted so (1 lot) risk should be <= cap.
+              } else {
+                logger.info(
+                  {
+                    token,
+                    side: side,
+                    reason: "LOT_RISK_CAP_BLOCK",
+                    meta: {
+                      qty,
+                      trueRiskInr,
+                      capInr,
+                      perUnitRisk,
+                      lot,
+                      qtyMode,
+                      intendedRiskInr,
+                      forceOneLot,
+                      slFitWhenCapBlocks,
+                      fitReason: fit.reason,
+                      fitMeta: fit.meta || null,
+                    },
+                  },
+                  "[trade] blocked (lot risk cap; cannot fit SL for 1 lot)",
+                );
+                return;
+              }
+            } else {
+              logger.info(
+                {
+                  token,
+                  side: side,
+                  reason: "LOT_RISK_CAP_BLOCK",
+                  meta: {
+                    qty,
+                    trueRiskInr,
+                    capInr,
+                    perUnitRisk,
+                    lot,
+                    qtyMode,
+                    intendedRiskInr,
+                  },
                 },
-              },
-              "[trade] blocked (lot risk cap after lot-normalization)",
-            );
-            return;
+                "[trade] blocked (lot risk cap after lot-normalization)",
+              );
+              return;
+            }
           }
 
           logger.warn(
@@ -5179,6 +5675,9 @@ class TradeManager {
           { purpose: "TP1_TO_BE_AND_RESIZE_SL", tradeId },
         );
         await updateTrade(tradeId, { stopLoss: newSL });
+        try {
+          this._updateSlWatchTrigger(tradeId, newSL);
+        } catch {}
         logger.info(
           { tradeId, stopLoss: newSL, remaining },
           "[tp1] SL moved to BE+buffer and resized",
@@ -5257,6 +5756,9 @@ class TradeManager {
               })
             : null;
 
+        let slOrderTypeUsed = slOrderType;
+        let slLimitPriceUsed = slLimitPrice;
+
         const slParams = {
           exchange: trade.instrument.exchange,
           tradingsymbol: trade.instrument.tradingsymbol,
@@ -5303,11 +5805,16 @@ class TradeManager {
                 ...slParams,
                 order_type: "SL",
                 price: this._buildStopLossLimitPrice({
+                  // NOTE: if SL-M is blocked, SL-L is used and should be watchdogged.
+
                   triggerPrice: trade.stopLoss,
                   exitSide: slSide,
                   instrument: trade.instrument,
                 }),
               };
+
+              slOrderTypeUsed = "SL";
+              slLimitPriceUsed = fallbackParams.price;
 
               logger.warn(
                 { tradeId, msg, fallbackParams },
@@ -5347,7 +5854,21 @@ class TradeManager {
             return;
           }
         }
-        await updateTrade(tradeId, { slOrderId });
+        await updateTrade(tradeId, {
+          slOrderId,
+          slOrderType: slOrderTypeUsed,
+          slLimitPrice: slLimitPriceUsed,
+        });
+
+        // Register SL watchdog state (for SL-L)
+        try {
+          this._registerSlWatchFromTrade({
+            ...fresh,
+            slOrderId,
+            slOrderType: slOrderTypeUsed,
+            slLimitPrice: slLimitPriceUsed,
+          });
+        } catch {}
         await linkOrder({ order_id: String(slOrderId), tradeId, role: "SL" });
         await this._replayOrphanUpdates(slOrderId);
         alert("info", "✅ SL placed", {

@@ -1,7 +1,11 @@
 const crypto = require("crypto");
 const { DateTime } = require("luxon");
 const { logger } = require("../logger");
-const { getQuoteGuarded } = require("../kite/quoteGuard");
+const {
+  getQuoteGuarded,
+  isQuoteGuardBreakerOpen,
+  getQuoteGuardStats,
+} = require("../kite/quoteGuard");
 const { computeGreeksFromMarket } = require("./greeks");
 
 // Very small in-memory cache (TTL ms). Designed for intraday routing:
@@ -152,18 +156,31 @@ async function getOptionChainSnapshot({
 
     // trend deltas
     const prev = _lastRowBySymbol.get(qk) || null;
-    const oiChange = Number.isFinite(oi) && Number.isFinite(prev?.oi)
-      ? oi - prev.oi
-      : null;
-    const spreadBpsChange = Number.isFinite(bps) && Number.isFinite(prev?.spread_bps)
-      ? bps - prev.spread_bps
-      : null;
+    const oiChange =
+      Number.isFinite(oi) && Number.isFinite(prev?.oi) ? oi - prev.oi : null;
+    const spreadBpsChange =
+      Number.isFinite(bps) && Number.isFinite(prev?.spread_bps)
+        ? bps - prev.spread_bps
+        : null;
 
     // greeks/IV (approx) from mid/ltp
     let greeks = null;
     const K = Number(r0.strike);
-    const px = Number.isFinite(mid) && mid > 0 ? mid : Number.isFinite(ltp) && ltp > 0 ? ltp : null;
-    if (useGreeks && Number.isFinite(K) && K > 0 && Number.isFinite(T) && T > 0 && Number.isFinite(px) && px > 0) {
+    const px =
+      Number.isFinite(mid) && mid > 0
+        ? mid
+        : Number.isFinite(ltp) && ltp > 0
+          ? ltp
+          : null;
+    if (
+      useGreeks &&
+      Number.isFinite(K) &&
+      K > 0 &&
+      Number.isFinite(T) &&
+      T > 0 &&
+      Number.isFinite(px) &&
+      px > 0
+    ) {
       greeks = computeGreeksFromMarket({
         S,
         K,
@@ -176,9 +193,10 @@ async function getOptionChainSnapshot({
 
     const iv = Number.isFinite(greeks?.iv) ? greeks.iv : null; // decimal (0.18)
     const ivPts = Number.isFinite(iv) ? iv * 100 : null; // points (18)
-    const ivChangePts = Number.isFinite(iv) && Number.isFinite(prev?.iv)
-      ? (iv - prev.iv) * 100
-      : null;
+    const ivChangePts =
+      Number.isFinite(iv) && Number.isFinite(prev?.iv)
+        ? (iv - prev.iv) * 100
+        : null;
 
     const row = {
       instrument_token: Number.isFinite(rTok) ? rTok : null,
@@ -194,7 +212,9 @@ async function getOptionChainSnapshot({
       ask: Number.isFinite(sellP) ? sellP : null,
       mid: Number.isFinite(mid) ? mid : null,
       spread_bps: Number.isFinite(bps) ? bps : null,
-      spread_bps_change: Number.isFinite(spreadBpsChange) ? spreadBpsChange : null,
+      spread_bps_change: Number.isFinite(spreadBpsChange)
+        ? spreadBpsChange
+        : null,
       depth_qty_top: depthQty,
       volume: Number.isFinite(volume) ? volume : 0,
       oi: Number.isFinite(oi) ? oi : 0,
@@ -206,8 +226,12 @@ async function getOptionChainSnapshot({
       iv_change_pts: Number.isFinite(ivChangePts) ? ivChangePts : null,
       delta: Number.isFinite(greeks?.delta) ? greeks.delta : null,
       gamma: Number.isFinite(greeks?.gamma) ? greeks.gamma : null,
-      vega_1pct: Number.isFinite(greeks?.vegaPer1Pct) ? greeks.vegaPer1Pct : null,
-      theta_per_day: Number.isFinite(greeks?.thetaPerDay) ? greeks.thetaPerDay : null,
+      vega_1pct: Number.isFinite(greeks?.vegaPer1Pct)
+        ? greeks.vegaPer1Pct
+        : null,
+      theta_per_day: Number.isFinite(greeks?.thetaPerDay)
+        ? greeks.thetaPerDay
+        : null,
     };
 
     // Update trend cache (even if greeks missing, keep spread/oi)
@@ -232,6 +256,16 @@ async function getOptionChainSnapshot({
       underlyingLtp: Number.isFinite(S) ? S : null,
       r: Number.isFinite(r) ? r : null,
       T,
+      quoteGuard: {
+        breakerOpen:
+          typeof isQuoteGuardBreakerOpen === "function"
+            ? Boolean(isQuoteGuardBreakerOpen())
+            : false,
+        breakerOpenUntil:
+          (typeof getQuoteGuardStats === "function"
+            ? getQuoteGuardStats()?.breakerOpenUntil
+            : null) || null,
+      },
     },
     count: rows.length,
     rows,
@@ -242,11 +276,16 @@ async function getOptionChainSnapshot({
 
   const keyShort = `${snapshot.underlying}|${snapshot.optType}|${snapshot.expiryISO}`;
   _lastChainByKey.set(keyShort, snapshot);
-  _lastChainByUnderlying.set(`${snapshot.underlying}|${snapshot.optType}`, snapshot);
+  _lastChainByUnderlying.set(
+    `${snapshot.underlying}|${snapshot.optType}`,
+    snapshot,
+  );
 
   // Trim cache
   if (_cache.size > 50) {
-    const entries = Array.from(_cache.entries()).sort((a, b) => a[1].ts - b[1].ts);
+    const entries = Array.from(_cache.entries()).sort(
+      (a, b) => a[1].ts - b[1].ts,
+    );
     for (let i = 0; i < Math.max(10, entries.length - 40); i++) {
       _cache.delete(entries[i][0]);
     }

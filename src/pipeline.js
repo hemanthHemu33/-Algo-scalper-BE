@@ -6,7 +6,8 @@ const {
 } = require("./market/marketCalendar");
 const { logger } = require("./logger");
 const { CandleBuilder } = require("./market/candleBuilder");
-const { ensureIndexes, upsertCandle } = require("./market/candleStore");
+const { CandleWriteBuffer } = require("./market/candleWriteBuffer");
+const { ensureIndexes } = require("./market/candleStore");
 const { backfillCandles } = require("./market/backfill");
 const { evaluateOnCandleClose } = require("./strategy/strategyEngine");
 const { RiskEngine } = require("./risk/riskEngine");
@@ -23,6 +24,9 @@ function buildPipeline({ kite, tickerCtrl }) {
     intervalsMinutes: intervals,
     timezone: env.CANDLE_TZ,
   });
+
+  const candleWriter = new CandleWriteBuffer();
+  candleWriter.start();
 
   const risk = new RiskEngine();
   const trader = new TradeManager({ kite, riskEngine: risk });
@@ -120,23 +124,43 @@ function buildPipeline({ kite, tickerCtrl }) {
       return { ok: false, error: "tickerCtrl_not_available" };
     }
 
+    // Treat option contracts (selected at runtime) differently:
+    // backfilling option candles on every ATM shift can hit 429s and blow up Mongo.
+    const isOptRuntime =
+      opts?.isOption === true ||
+      String(opts?.reason || "") === "OPT_SELECTED_CONTRACT";
+
     // Serialize subscribe operations (separate queue from tick processing)
     const res = await enqueueSubs(async () => {
-      const sub = await tickerCtrl.subscribe(toAdd);
+      const sub = await tickerCtrl.subscribe(toAdd, {
+        reason: opts?.reason || null,
+        isOption: isOptRuntime,
+        role: isOptRuntime ? "trade" : "underlying",
+      });
       if (!sub?.ok) return sub;
 
       for (const t of toAdd) tokensSet.add(t);
       tokensRef = Array.from(tokensSet);
 
       // Kick off backfill in background (do not block entry)
-      const doBackfill =
-        String(env.RUNTIME_SUBSCRIBE_BACKFILL || "true") === "true" &&
-        opts.backfill !== false;
+      // NOTE:
+      // - For option runtime tokens: controlled by OPT_RUNTIME_SUBSCRIBE_BACKFILL (default: false)
+      // - For other runtime tokens: controlled by RUNTIME_SUBSCRIBE_BACKFILL
+      const backfillFlag = isOptRuntime
+        ? String(env.OPT_RUNTIME_SUBSCRIBE_BACKFILL || "false")
+        : String(env.RUNTIME_SUBSCRIBE_BACKFILL || "true");
+
+      const doBackfill = backfillFlag === "true" && opts.backfill !== false;
 
       if (doBackfill) {
         const daysOverride = Number(
-          opts.daysOverride || env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS || 1,
+          opts.daysOverride ||
+            (isOptRuntime
+              ? env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS_OPT
+              : env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS) ||
+            1,
         );
+
         void enqueueSubs(async () => {
           for (const token of toAdd) {
             for (const intervalMin of intervals) {
@@ -148,16 +172,30 @@ function buildPipeline({ kite, tickerCtrl }) {
                   timezone: env.CANDLE_TZ,
                   daysOverride,
                 });
-                logger.info({ token, intervalMin }, "[runtime-backfill] ok");
+                logger.info(
+                  { token, intervalMin, daysOverride, isOptRuntime },
+                  "[runtime-backfill] ok",
+                );
               } catch (e) {
                 logger.warn(
-                  { token, intervalMin, e: e?.message || String(e) },
+                  {
+                    token,
+                    intervalMin,
+                    daysOverride,
+                    isOptRuntime,
+                    e: e?.message || String(e),
+                  },
                   "[runtime-backfill] failed",
                 );
               }
             }
           }
         }, "runtimeBackfill");
+      } else if (isOptRuntime) {
+        logger.info(
+          { added: toAdd.length, reason: opts?.reason || null },
+          "[runtime-backfill] skipped for option token",
+        );
       }
 
       return { ok: true, added: toAdd, tokens: Array.from(tokensSet) };
@@ -196,18 +234,23 @@ function buildPipeline({ kite, tickerCtrl }) {
         continue;
       }
 
-      await upsertCandle(c);
+      const tok = Number(c.instrument_token);
+      const isSignalTok =
+        Number.isFinite(tok) &&
+        signalTokensSet.size &&
+        signalTokensSet.has(tok);
+
+      // Persist candles asynchronously (avoid DB writes in the hot tick loop)
+      // Default: persist only signal tokens (underlying universe).
+      // Enable CANDLE_PERSIST_NON_SIGNAL_TOKENS=true if you want option candles persisted too.
+      const persistNonSignal =
+        String(env.CANDLE_PERSIST_NON_SIGNAL_TOKENS || "false") === "true";
+      if (isSignalTok || persistNonSignal) candleWriter.enqueue(c);
 
       // IMPORTANT (OPT mode correctness):
       // We may subscribe option tokens at runtime for execution/exits,
       // but we must NOT generate strategy signals on option tokens.
-      // Only evaluate strategies on the original underlying universe.
-      const tok = Number(c.instrument_token);
-      if (
-        Number.isFinite(tok) &&
-        signalTokensSet.size &&
-        !signalTokensSet.has(tok)
-      ) {
+      if (Number.isFinite(tok) && signalTokensSet.size && !isSignalTok) {
         continue;
       }
 
@@ -285,7 +328,7 @@ function buildPipeline({ kite, tickerCtrl }) {
     // tick->trader (LTP updates + throttled risk checks)
     for (const t of ticks || []) {
       try {
-        await Promise.resolve(trader.onTick(t));
+        trader.onTick(t);
       } catch (e) {
         logger.warn({ e: e?.message || String(e) }, "[trader] onTick failed");
       }
