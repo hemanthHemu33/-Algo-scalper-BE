@@ -64,10 +64,25 @@ async function getInstrumentByToken(instrument_token) {
     .findOne({ instrument_token: Number(instrument_token) });
 }
 
+function isInstrumentCacheStale(doc) {
+  const maxAgeHours = Number(env.INSTRUMENT_CACHE_MAX_AGE_HOURS || 0);
+  if (!Number.isFinite(maxAgeHours) || maxAgeHours <= 0) return false;
+  const updatedAt = doc?.updatedAt ? new Date(doc.updatedAt).getTime() : 0;
+  if (!updatedAt || Number.isNaN(updatedAt)) return true;
+  const ageMs = Date.now() - updatedAt;
+  return ageMs > maxAgeHours * 60 * 60 * 1000;
+}
+
 async function ensureInstrument(kite, instrument_token) {
   const tok = Number(instrument_token);
   let doc = await getInstrumentByToken(tok);
-  if (doc) return doc;
+  if (doc && !isInstrumentCacheStale(doc)) return doc;
+  if (doc) {
+    logger.info(
+      { tok },
+      "[instruments] cache stale; refreshing instrument metadata",
+    );
+  }
 
   // Search token across a small ordered exchange list.
   const exchanges = uniq([
@@ -100,6 +115,13 @@ async function ensureInstrument(kite, instrument_token) {
   }
 
   if (!row) {
+    if (doc) {
+      logger.warn(
+        { tok },
+        "[instruments] refresh failed; returning cached instrument metadata",
+      );
+      return doc;
+    }
     throw new Error(
       `[instruments] token not found in instruments dumps: ${tok} (checked ${exchanges.join(
         ",",
@@ -156,7 +178,13 @@ async function ensureInstrumentBySymbol(kite, symbol) {
   const parsed = parseSymbol(symbol);
   if (!parsed) throw new Error("[instruments] empty symbol");
   let doc = await getInstrumentBySymbol(parsed);
-  if (doc) return doc;
+  if (doc && !isInstrumentCacheStale(doc)) return doc;
+  if (doc) {
+    logger.info(
+      { symbol: parsed.tradingsymbol, exchange: parsed.exchange },
+      "[instruments] cache stale; refreshing instrument metadata",
+    );
+  }
 
   const ex = parsed.exchange || env.DEFAULT_EXCHANGE || "NSE";
   logger.warn(
@@ -172,6 +200,13 @@ async function ensureInstrumentBySymbol(kite, symbol) {
   );
 
   if (!row) {
+    if (doc) {
+      logger.warn(
+        { symbol: parsed.tradingsymbol, exchange: ex },
+        "[instruments] refresh failed; returning cached instrument metadata",
+      );
+      return doc;
+    }
     throw new Error(
       `[instruments] tradingsymbol not found in ${ex} instruments dump: ${parsed.tradingsymbol} (check your SUBSCRIBE_SYMBOLS; for Mazagon Dock, Zerodha symbol is MAZDOCK)`,
     );
