@@ -186,6 +186,10 @@ class TradeManager {
     // ENTRY limit fallback timers (tradeId -> timeout)
     this._entryFallbackTimers = new Map();
 
+    // PANIC exit watchdog (tradeId -> timeout)
+    this._panicExitTimers = new Map();
+    this._panicExitRetryCount = new Map();
+
     // Reconcile debouncer (order-update driven)
     this._reconcileTimer = null;
     this._reconcileScheduledAt = 0;
@@ -824,6 +828,163 @@ class TradeManager {
     }
 
     return latest;
+  }
+
+  _clearPanicExitWatch(tradeId) {
+    const id = String(tradeId || "");
+    if (!id) return;
+    const timer = this._panicExitTimers.get(id);
+    if (timer) clearTimeout(timer);
+    this._panicExitTimers.delete(id);
+  }
+
+  _schedulePanicExitWatch({ tradeId, orderId, instrument, exitSide, qty, reason }) {
+    const id = String(tradeId || "");
+    if (!id) return;
+
+    const timeoutMs = Math.max(0, Number(env.PANIC_EXIT_FILL_TIMEOUT_MS || 2500));
+    if (timeoutMs <= 0) return;
+
+    this._clearPanicExitWatch(id);
+
+    const timer = setTimeout(() => {
+      this._panicExitTimeoutCheck({
+        tradeId: id,
+        orderId,
+        instrument,
+        exitSide,
+        qty,
+        reason,
+      }).catch((e) => {
+        logger.error(
+          { tradeId: id, orderId, err: e?.message || String(e) },
+          "[panic] timeout check failed",
+        );
+      });
+    }, timeoutMs);
+    timer.unref?.();
+    this._panicExitTimers.set(id, timer);
+  }
+
+  async _panicExitTimeoutCheck({
+    tradeId,
+    orderId,
+    instrument,
+    exitSide,
+    qty,
+    reason,
+  }) {
+    const id = String(tradeId || "");
+    const oid = String(orderId || "");
+    if (!id || !oid) return;
+
+    const latest = await this._getOrderStatus(oid);
+    const status = String(latest?.status || "").toUpperCase();
+
+    if (!status) {
+      logger.warn({ tradeId: id, orderId: oid }, "[panic] timeout check: no status");
+      return;
+    }
+
+    if (status === "COMPLETE" || isDead(status)) {
+      this._clearPanicExitWatch(id);
+      this._panicExitRetryCount.delete(id);
+      return;
+    }
+
+    const retryCount = Number(this._panicExitRetryCount.get(id) || 0);
+    const maxRetries = Math.max(0, Number(env.PANIC_EXIT_MAX_RETRIES || 1));
+
+    if (retryCount >= maxRetries) {
+      logger.warn(
+        { tradeId: id, orderId: oid, status, retryCount, maxRetries },
+        "[panic] timeout check: max retries reached",
+      );
+      return;
+    }
+
+    if (status === "OPEN" || status === "PARTIAL" || status === "TRIGGER PENDING") {
+      logger.warn(
+        { tradeId: id, orderId: oid, status, reason },
+        "[panic] timeout reached; cancel + replace",
+      );
+
+      try {
+        this.expectedCancelOrderIds.add(oid);
+        await this._safeCancelOrder(env.DEFAULT_ORDER_VARIETY, oid, {
+          purpose: "PANIC_EXIT_TIMEOUT_CANCEL",
+          tradeId: id,
+        });
+      } catch {}
+
+      const after = await this._getOrderStatus(oid);
+      const afterStatus = String(after?.status || "").toUpperCase();
+
+      if (afterStatus === "COMPLETE") {
+        this._clearPanicExitWatch(id);
+        this._panicExitRetryCount.delete(id);
+        return;
+      }
+
+      if (!isDead(afterStatus) && afterStatus !== "CANCELLED" && afterStatus !== "CANCELED") {
+        logger.warn(
+          { tradeId: id, orderId: oid, status: afterStatus },
+          "[panic] timeout check: cancel not confirmed; skipping replace",
+        );
+        return;
+      }
+
+      const order = after?.order || latest?.order || {};
+      const filledQty = Number(order?.filled_quantity || 0);
+      const totalQty = Number(order?.quantity || qty || 0);
+      const remainingQty = Math.max(0, totalQty - filledQty);
+
+      if (remainingQty < 1) {
+        this._clearPanicExitWatch(id);
+        this._panicExitRetryCount.delete(id);
+        return;
+      }
+
+      const fresh = (await getTrade(id)) || {};
+      const inst = instrument || fresh.instrument;
+      const side =
+        exitSide ||
+        (Number(fresh.qty || 0) >= 0 ? "SELL" : "BUY");
+
+      const fb = await this._panicExitFallbackLimit({
+        tradeId: id,
+        instrument: inst,
+        exitSide: side,
+        qty: remainingQty,
+        reason: `${reason || "PANIC_EXIT"}_TIMEOUT_REPLACE`,
+        marketError: "PANIC_EXIT_TIMEOUT",
+      });
+
+      const newOrderId = fb?.orderId || null;
+      if (newOrderId) {
+        this._panicExitRetryCount.set(id, retryCount + 1);
+        await updateTrade(id, {
+          status: STATUS.GUARD_FAILED,
+          panicExitOrderId: newOrderId,
+          panicExitPlacedAt: new Date(),
+          closeReason: `${fresh.closeReason || "PANIC_EXIT"} | REPLACED`,
+        });
+        await linkOrder({
+          order_id: newOrderId,
+          tradeId: id,
+          role: "PANIC_EXIT",
+        });
+        await this._replayOrphanUpdates(newOrderId);
+        this._schedulePanicExitWatch({
+          tradeId: id,
+          orderId: newOrderId,
+          instrument: inst,
+          exitSide: side,
+          qty: remainingQty,
+          reason,
+        });
+      }
+    }
   }
 
   async _slWatchdogFire(tradeId, cause = "timeout") {
@@ -1937,6 +2098,14 @@ class TradeManager {
           role: "PANIC_EXIT",
         });
         await this._replayOrphanUpdates(exitOrderId);
+        this._schedulePanicExitWatch({
+          tradeId,
+          orderId: exitOrderId,
+          instrument,
+          exitSide,
+          qty,
+          reason,
+        });
       }
     } catch (e) {
       logger.error({ tradeId, e: e.message }, "[panic] exit failed");
@@ -2539,6 +2708,8 @@ class TradeManager {
       if (panic) {
         const ps = String(panic.status || "").toUpperCase();
         if (ps === "COMPLETE") {
+          this._clearPanicExitWatch(tradeId);
+          this._panicExitRetryCount.delete(String(tradeId));
           const exitPrice = Number(panic.average_price || panic.price || 0);
           await updateTrade(tradeId, {
             status: STATUS.CLOSED,
@@ -2553,6 +2724,8 @@ class TradeManager {
         }
 
         if (isDead(ps)) {
+          this._clearPanicExitWatch(tradeId);
+          this._panicExitRetryCount.delete(String(tradeId));
           logger.error(
             { tradeId, token, status: ps },
             "[reconcile] PANIC_EXIT order is dead while in GUARD_FAILED",
@@ -5261,6 +5434,8 @@ class TradeManager {
     if (link.role === "PANIC_EXIT") {
       if (status === "COMPLETE") {
         const exitPrice = Number(order.average_price || order.price || 0);
+        this._clearPanicExitWatch(trade.tradeId);
+        this._panicExitRetryCount.delete(String(trade.tradeId));
 
         await updateTrade(trade.tradeId, {
           status: STATUS.CLOSED,
@@ -5304,6 +5479,8 @@ class TradeManager {
           order.message ||
           "";
 
+        this._clearPanicExitWatch(trade.tradeId);
+        this._panicExitRetryCount.delete(String(trade.tradeId));
         this._handleOrderRejection({ trade, order, role: link.role });
         logger.error(
           { tradeId: trade.tradeId, orderId, status, msg },

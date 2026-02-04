@@ -88,19 +88,26 @@ async function checkTopOfBookStability({
   for (let i = 0; i < n; i++) {
     const startedAt = Date.now();
 
-    const resp = await getQuoteGuarded(kite, [key], {
+    const quotes = await getQuoteGuarded(kite, [key], {
       purpose: String(purpose || "ENTRY_STABILITY").toUpperCase(),
     });
 
-    if (!resp?.ok) {
+    if (!quotes || typeof quotes !== "object") {
       return {
         ok: false,
-        reason: `QUOTE_FETCH_FAILED (${resp?.error || "unknown"})`,
-        meta: { key, i, error: resp?.error || null },
+        reason: "QUOTE_FETCH_FAILED (no_quotes)",
+        meta: { key, i },
       };
     }
 
-    const q = resp?.data?.[key];
+    const q = quotes?.[key];
+    if (!q) {
+      return {
+        ok: false,
+        reason: "QUOTE_FETCH_FAILED (missing_key)",
+        meta: { key, i },
+      };
+    }
     const t = extractTop(q);
 
     if (!(t.bid > 0) || !(t.ask > 0)) {
