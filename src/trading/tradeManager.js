@@ -387,6 +387,22 @@ class TradeManager {
     );
   }
 
+  _isOrderConflictError(msg) {
+    const s = String(msg || "").toLowerCase();
+    return (
+      s.includes("order exceeds holdings") ||
+      s.includes("insufficient holdings") ||
+      s.includes("position insufficient") ||
+      s.includes("order conflict")
+    );
+  }
+
+  _shouldFallbackToVirtualTarget(msg) {
+    return (
+      this._isInsufficientMarginError(msg) || this._isOrderConflictError(msg)
+    );
+  }
+
   async init() {
     await ensureTradeIndexes();
     // Patch-6: load persisted cost calibration multipliers (if enabled)
@@ -6757,7 +6773,7 @@ class TradeManager {
       targetOrder?.status_message ||
       targetOrder?.message ||
       "";
-    if (this._isInsufficientMarginError(rejectMsg)) {
+    if (this._shouldFallbackToVirtualTarget(rejectMsg)) {
       await this._enableVirtualTarget(fresh, {
         reason: rejectMsg,
         source: source || "dead_target",
@@ -7899,7 +7915,7 @@ class TradeManager {
                 });
               } catch (e2) {
                 const msg = String(e2?.message || e2);
-                if (this._isInsufficientMarginError(msg)) {
+                if (this._shouldFallbackToVirtualTarget(msg)) {
                   await this._enableVirtualTarget(
                     { ...trade, ...fresh2, initialQty: initQty },
                     { reason: msg, source: "tp1_fallback_target" },
@@ -7934,7 +7950,7 @@ class TradeManager {
               });
             } catch (e) {
               const msg = String(e?.message || e);
-              if (this._isInsufficientMarginError(msg)) {
+              if (this._shouldFallbackToVirtualTarget(msg)) {
                 await this._enableVirtualTarget(
                   { ...trade, ...fresh2, initialQty: initQty },
                   { reason: msg, source: "runner_target" },
@@ -7969,7 +7985,7 @@ class TradeManager {
             });
           } catch (e) {
             const msg = String(e?.message || e);
-            if (this._isInsufficientMarginError(msg)) {
+            if (this._shouldFallbackToVirtualTarget(msg)) {
               await this._enableVirtualTarget(
                 { ...trade, ...fresh2, initialQty: initQty },
                 { reason: msg, source: "target" },
