@@ -202,6 +202,8 @@ class TradeManager {
     this._reconcileTimer = null;
     this._reconcileScheduledAt = 0;
 
+    this._virtualTargetFetchInFlight = new Set(); // tradeId -> in-flight
+
     // Portfolio risk checks
     this._lastPortfolioRiskCheckAt = 0;
 
@@ -392,14 +394,22 @@ class TradeManager {
     return (
       s.includes("order exceeds holdings") ||
       s.includes("insufficient holdings") ||
+      s.includes("insufficient position") ||
       s.includes("position insufficient") ||
-      s.includes("order conflict")
+      s.includes("order conflict") ||
+      s.includes("rms:order") ||
+      s.includes("rms order")
     );
   }
 
   _shouldFallbackToVirtualTarget(msg) {
+    const s = String(msg || "").toLowerCase();
     return (
-      this._isInsufficientMarginError(msg) || this._isOrderConflictError(msg)
+      this._isInsufficientMarginError(msg) ||
+      this._isOrderConflictError(msg) ||
+      s.includes("rms") ||
+      s.includes("margin required") ||
+      s.includes("available margin")
     );
   }
 
@@ -601,16 +611,19 @@ class TradeManager {
   }
 
   async _hydrateOpenPositionFromActiveTrade() {
-    if (!this.activeTradeId) return;
-    const t = await getTrade(this.activeTradeId);
-    if (!t) return;
-    this.risk.setOpenPosition(Number(t.instrument_token), {
-      tradeId: t.tradeId,
-      side: t.side,
-      qty: Number(t.qty || 0),
-    });
-    if (t?.targetVirtual && !t?.targetOrderId) {
-      this._registerVirtualTargetFromTrade(t);
+    const actives = await getActiveTrades();
+    if (!actives.length) return;
+
+    for (const t of actives) {
+      if (!t?.instrument_token) continue;
+      this.risk.setOpenPosition(Number(t.instrument_token), {
+        tradeId: t.tradeId,
+        side: t.side,
+        qty: Number(t.qty || 0),
+      });
+      if (t?.targetVirtual && !t?.targetOrderId) {
+        this._registerVirtualTargetFromTrade(t);
+      }
     }
   }
 
@@ -1244,21 +1257,74 @@ class TradeManager {
   }
 
   _maybeTriggerVirtualTargetFromTick(token, ltp, nowMs) {
-    if (!this.activeTradeId) return;
-    const tradeId = String(this.activeTradeId);
-    const st = this._virtualTargetWatch.get(tradeId);
-    if (!st || st.firedAtMs) return;
-    if (Number(st.token) !== Number(token)) return;
-    if (!this._virtualTargetIsHit(ltp, st.targetPrice, st.exitSide)) return;
+    if (!this._virtualTargetWatch.size) return;
+    const tok = Number(token);
+    if (!Number.isFinite(tok)) return;
 
-    st.firedAtMs = Number(nowMs || Date.now());
-    this._virtualTargetWatch.set(tradeId, st);
-    this._fireVirtualTarget(tradeId, st, ltp).catch((e) => {
-      logger.error(
-        { tradeId, e: e.message },
-        "[virtual_target] fire failed",
+    for (const [tradeId, st] of this._virtualTargetWatch.entries()) {
+      if (!st || st.firedAtMs) continue;
+      if (Number(st.token) !== tok) continue;
+      if (!this._virtualTargetIsHit(ltp, st.targetPrice, st.exitSide)) continue;
+
+      st.firedAtMs = Number(nowMs || Date.now());
+      this._virtualTargetWatch.set(tradeId, st);
+      this._fireVirtualTarget(tradeId, st, ltp).catch((e) => {
+        logger.error(
+          { tradeId, e: e.message },
+          "[virtual_target] fire failed",
+        );
+      });
+    }
+  }
+
+  async _virtualTargetHeartbeat(trade, netQty, source = "reconcile") {
+    try {
+      const tradeId = String(trade?.tradeId || "");
+      if (!tradeId) return;
+      if (!trade?.targetVirtual || trade?.targetOrderId) return;
+
+      if (!Number.isFinite(Number(netQty)) || Number(netQty) === 0) {
+        this._clearVirtualTarget(tradeId);
+        return;
+      }
+
+      const token = Number(trade?.instrument_token);
+      if (!Number.isFinite(token)) return;
+
+      this._registerVirtualTargetFromTrade(trade);
+
+      const allowFetch =
+        String(env.VIRTUAL_TARGET_LTP_FETCH_ENABLED || "true") === "true";
+      if (!allowFetch) return;
+
+      if (this._virtualTargetFetchInFlight.has(tradeId)) return;
+      this._virtualTargetFetchInFlight.add(tradeId);
+
+      try {
+        const now = Date.now();
+        const throttleMs = Math.max(
+          500,
+          Number(env.VIRTUAL_TARGET_LTP_FETCH_THROTTLE_MS || 1500),
+        );
+        const last = Number(this._lastLtpFetchAtByToken.get(token) || 0);
+        if (now - last < throttleMs) return;
+        this._lastLtpFetchAtByToken.set(token, now);
+
+        const instrument =
+          trade?.instrument || (await ensureInstrument(this.kite, token));
+        const ltp = await this._getLtp(token, instrument);
+        if (!Number.isFinite(ltp)) return;
+
+        this._maybeTriggerVirtualTargetFromTick(token, ltp, now);
+      } finally {
+        this._virtualTargetFetchInFlight.delete(tradeId);
+      }
+    } catch (e) {
+      logger.warn(
+        { tradeId: trade?.tradeId, e: e.message, source },
+        "[virtual_target] heartbeat failed",
       );
-    });
+    }
   }
 
   async _fireVirtualTarget(tradeId, st, ltp) {
@@ -1341,6 +1407,7 @@ class TradeManager {
       });
       await this._replayOrphanUpdates(targetOrderId);
       this._watchExitLeg(tradeId, targetOrderId, "TARGET").catch(() => {});
+      this._clearVirtualTarget(tradeId);
     } catch (e) {
       const msg = String(e?.message || e);
       logger.error(
@@ -3284,6 +3351,8 @@ class TradeManager {
       ? byId.get(String(trade.targetOrderId))
       : null;
     const tp1 = trade.tp1OrderId ? byId.get(String(trade.tp1OrderId)) : null;
+
+    await this._virtualTargetHeartbeat(trade, netQty, "reconcile");
 
     // If broker shows NO position but trade thinks it's live/filled, someone manually exited
     // (or RMS square-off happened). Treat as a critical safety event: kill-switch + close trade.

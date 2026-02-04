@@ -325,6 +325,10 @@ const schema = z.object({
   OPT_RUNTIME_SUBSCRIBE_BACKFILL: z.string().default("true"),
   OPT_DYN_EXIT_ALLOW_UNDERLYING_LTP_FETCH: z.string().default("false"),
 
+  // Virtual target (margin-blocked target fallback)
+  VIRTUAL_TARGET_LTP_FETCH_ENABLED: z.string().default("true"),
+  VIRTUAL_TARGET_LTP_FETCH_THROTTLE_MS: z.coerce.number().default(1500),
+
   CANDLE_INTERVALS: z.string().default("1,3"),
   CANDLE_COLLECTION_PREFIX: z.string().default("candles_"),
   CANDLE_TZ: z.string().default("Asia/Kolkata"),
