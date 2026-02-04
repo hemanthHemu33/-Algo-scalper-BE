@@ -460,6 +460,8 @@ const schema = z.object({
   AUTO_EXIT_ON_DAILY_LOSS: z.string().default("true"),
   RISK_MAX_DRAWDOWN_INR: z.coerce.number().default(2700),
   RISK_MAX_EXPOSURE_PER_SYMBOL_INR: z.coerce.number().default(150000),
+  RISK_MAX_PORTFOLIO_EXPOSURE_INR: z.coerce.number().default(0),
+  RISK_MAX_LEVERAGE: z.coerce.number().default(0),
 
   // Trading window (MIS safe)
   AUTO_FIX_TIME_WINDOWS: z.string().default("false"),
