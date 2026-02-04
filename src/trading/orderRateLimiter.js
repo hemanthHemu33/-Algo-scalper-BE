@@ -12,12 +12,19 @@ const { env } = require("../config");
  * using daily_risk.ordersPlaced (persisted).
  */
 class OrderRateLimiter {
-  constructor() {
+  constructor({ maxPerSec, maxPerMin } = {}) {
     this.secBucketStart = 0;
     this.secCount = 0;
 
     this.minBucketStart = 0;
     this.minCount = 0;
+
+    this.maxPerSec = Number.isFinite(Number(maxPerSec))
+      ? Number(maxPerSec)
+      : Number(env.MAX_ORDERS_PER_SEC || 10);
+    this.maxPerMin = Number.isFinite(Number(maxPerMin))
+      ? Number(maxPerMin)
+      : Number(env.MAX_ORDERS_PER_MIN || 200);
   }
 
   _bucketStartMs(now, sizeMs) {
@@ -25,8 +32,8 @@ class OrderRateLimiter {
   }
 
   check({ now = Date.now(), count = 1 } = {}) {
-    const perSec = Number(env.MAX_ORDERS_PER_SEC || 10);
-    const perMin = Number(env.MAX_ORDERS_PER_MIN || 200);
+    const perSec = this.maxPerSec;
+    const perMin = this.maxPerMin;
 
     const secStart = this._bucketStartMs(now, 1000);
     if (secStart !== this.secBucketStart) {
