@@ -876,6 +876,25 @@ class TradeManager {
     return l <= t * (1 - factor);
   }
 
+  _refreshTargetWatchAfterAdjust(trade, targetPrice) {
+    try {
+      if (!this._isTargetWatchdogEnabled()) return;
+      const tradeId = String(trade?.tradeId || "");
+      const price = Number(targetPrice);
+      if (!tradeId || !Number.isFinite(price) || price <= 0) return;
+
+      this._registerTargetWatchFromTrade({ ...trade, targetPrice: price });
+      const st = this._targetWatch.get(tradeId);
+      if (!st) return;
+      this._targetWatch.set(tradeId, { ...st, targetPrice: price });
+
+      const ltp = this.lastPriceByToken.get(Number(st.token));
+      if (Number.isFinite(Number(ltp))) {
+        this._maybeTriggerTargetWatchFromTick(st.token, ltp, Date.now());
+      }
+    } catch {}
+  }
+
   _armTargetWatchTimer(tradeId, st, openSec) {
     if (!st) return;
     if (st.timer) clearTimeout(st.timer);
@@ -3669,6 +3688,12 @@ class TradeManager {
             { purpose: "DYN_ADJUST_TARGET", tradeId },
           );
           await updateTrade(tradeId, { targetPrice: plan.target.targetPrice });
+          try {
+            this._refreshTargetWatchAfterAdjust(
+              { ...trade, targetPrice: plan.target.targetPrice },
+              plan.target.targetPrice,
+            );
+          } catch {}
           did = true;
           logger.info(
             { tradeId, targetPrice: plan.target.targetPrice, meta: plan.meta },
