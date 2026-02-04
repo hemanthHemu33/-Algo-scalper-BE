@@ -6303,6 +6303,11 @@ class TradeManager {
         });
         if (pf && pf.exited) return;
 
+        await this._recalcTargetFromActualFill({
+          tradeId: trade.tradeId,
+          entryPrice: avg,
+        });
+
         const freshForExits = (await getTrade(trade.tradeId)) || trade;
         await this._placeExitsIfMissing({
           ...trade,
@@ -7005,6 +7010,72 @@ class TradeManager {
       logger.warn(
         { tradeId, e: e.message },
         "[postFillRisk] recheck failed (continuing)",
+      );
+      return { ok: true, skipped: true, error: e.message };
+    }
+  }
+
+  async _recalcTargetFromActualFill({ tradeId, entryPrice }) {
+    try {
+      const t = await getTrade(tradeId);
+      if (!t) return { ok: true, skipped: true };
+
+      const entry = Number(entryPrice || t.entryPrice || 0);
+      const sl = Number(t.stopLoss || t.initialStopLoss || 0);
+      if (!(entry > 0) || !(sl > 0)) return { ok: true, skipped: true };
+
+      const rr = Number(t.rr || env.RR_TARGET || 1.0);
+      const tickSize = Number(t.instrument?.tick_size || 0.05);
+      const newTarget = computeTargetFromRR({
+        side: t.side,
+        entry,
+        stopLoss: sl,
+        rr,
+        tickSize,
+      });
+
+      if (!Number.isFinite(newTarget) || newTarget <= 0) {
+        return { ok: true, skipped: true };
+      }
+
+      await updateTrade(tradeId, {
+        plannedTargetPrice: newTarget,
+        ...(t.targetOrderId ? { targetPrice: newTarget } : {}),
+      });
+
+      if (
+        t.targetOrderId &&
+        String(t.targetOrderType || "").toUpperCase() === "LIMIT" &&
+        typeof this.kite.modifyOrder === "function"
+      ) {
+        try {
+          await this._safeModifyOrder(
+            env.DEFAULT_ORDER_VARIETY,
+            t.targetOrderId,
+            { price: newTarget },
+            { purpose: "TARGET_PRICE_MODIFY_POST_FILL", tradeId },
+          );
+          logger.info(
+            { tradeId, targetOrderId: t.targetOrderId, targetPrice: newTarget },
+            "[trade] TARGET price adjusted post-fill",
+          );
+        } catch (e) {
+          logger.warn(
+            { tradeId, e: e.message },
+            "[trade] TARGET price modify failed post-fill (continuing)",
+          );
+          alert("warn", "⚠️ TARGET price modify failed post-fill", {
+            tradeId,
+            message: e.message,
+          }).catch(() => {});
+        }
+      }
+
+      return { ok: true, targetPrice: newTarget };
+    } catch (e) {
+      logger.warn(
+        { tradeId, e: e.message },
+        "[trade] post-fill target recalc failed (continuing)",
       );
       return { ok: true, skipped: true, error: e.message };
     }
