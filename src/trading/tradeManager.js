@@ -976,8 +976,7 @@ class TradeManager {
     const total = realized + openPnl;
 
     const lossCap = Number(
-      this.risk?.getLimits?.().dailyLossCapInr ??
-        env.DAILY_MAX_LOSS_INR ||
+      (this.risk?.getLimits?.().dailyLossCapInr ?? env.DAILY_MAX_LOSS_INR) ||
         1000,
     );
     if (Number.isFinite(lossCap) && total <= -lossCap) {
