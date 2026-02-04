@@ -92,15 +92,22 @@ async function checkTopOfBookStability({
       purpose: String(purpose || "ENTRY_STABILITY").toUpperCase(),
     });
 
-    if (!resp?.ok) {
+    if (!resp || typeof resp !== "object") {
       return {
         ok: false,
-        reason: `QUOTE_FETCH_FAILED (${resp?.error || "unknown"})`,
-        meta: { key, i, error: resp?.error || null },
+        reason: "QUOTE_FETCH_FAILED (no_response)",
+        meta: { key, i, error: "no_response" },
       };
     }
 
-    const q = resp?.data?.[key];
+    const q = resp?.[key];
+    if (!q) {
+      return {
+        ok: false,
+        reason: "QUOTE_FETCH_FAILED (missing_quote)",
+        meta: { key, i, error: "missing_quote" },
+      };
+    }
     const t = extractTop(q);
 
     if (!(t.bid > 0) || !(t.ask > 0)) {

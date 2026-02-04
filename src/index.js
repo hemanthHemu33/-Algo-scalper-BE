@@ -78,6 +78,17 @@ async function persistKill(reason, meta) {
   } catch {}
 }
 
+function scheduleFatalExit(reason) {
+  const enabled = String(env.FATAL_EXIT_ENABLED || "true") === "true";
+  if (!enabled) return;
+  const delayMs = Math.max(0, Number(env.FATAL_EXIT_DELAY_MS || 2000));
+  logger.error({ reason, delayMs }, "[fatal] scheduling process exit");
+  setTimeout(() => {
+    // Ensure a clean restart from a supervisor (PM2/Docker/K8s).
+    process.exit(1);
+  }, delayMs).unref();
+}
+
 async function main() {
   // Apply SRV DNS workaround early (before Mongo connects)
   applyWindowsSrvDnsWorkaround();
@@ -176,6 +187,7 @@ process.on("unhandledRejection", async (reason) => {
   }).catch(() => {});
   await halt("UNHANDLED_REJECTION", { message: msg });
   await persistKill("UNHANDLED_REJECTION", { message: msg });
+  scheduleFatalExit("UNHANDLED_REJECTION");
 });
 
 process.on("uncaughtException", async (err) => {
@@ -186,7 +198,7 @@ process.on("uncaughtException", async (err) => {
   }).catch(() => {});
   await halt("UNCAUGHT_EXCEPTION", { message: msg, stack: err?.stack });
   await persistKill("UNCAUGHT_EXCEPTION", { message: msg });
-  // Note: we do NOT exit immediately to avoid restarting into an unsafe state.
+  scheduleFatalExit("UNCAUGHT_EXCEPTION");
 });
 
 main().catch((e) => {

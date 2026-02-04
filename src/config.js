@@ -220,6 +220,10 @@ const schema = z.object({
   OPT_MIN_PREMIUM_NIFTY: z.coerce.number().default(80),
   OPT_MAX_PREMIUM_NIFTY: z.coerce.number().default(350),
   OPT_PREMIUM_BAND_ENFORCE_NIFTY: z.coerce.boolean().default(true),
+  // If enforce fails, allow a relaxed fallback (still requires requireOk)
+  OPT_PREMIUM_BAND_FALLBACK: z.coerce.boolean().default(false),
+  OPT_PREMIUM_BAND_FALLBACK_SLACK_DOWN: z.coerce.number().default(20),
+  OPT_PREMIUM_BAND_FALLBACK_SLACK_UP: z.coerce.number().default(150),
   OPT_MAX_SPREAD_BPS: z.coerce.number().default(35),
   // Minimum depth (top of book qty) requirement; 0 disables
   OPT_MIN_DEPTH_QTY: z.coerce.number().default(0),
@@ -230,6 +234,7 @@ const schema = z.object({
   OPT_RISK_FREE_RATE: z.coerce.number().default(0.06),
 
   // Delta band to avoid far OTM / low-reacting contracts (0..1)
+  OPT_DELTA_BAND_ENFORCE: z.coerce.boolean().default(true),
   OPT_DELTA_BAND_MIN: z.coerce.number().default(0.35),
   OPT_DELTA_BAND_MAX: z.coerce.number().default(0.65),
   OPT_DELTA_TARGET: z.coerce.number().default(0.5),
@@ -323,6 +328,8 @@ const schema = z.object({
   CANDLE_INTERVALS: z.string().default("1,3"),
   CANDLE_COLLECTION_PREFIX: z.string().default("candles_"),
   CANDLE_TZ: z.string().default("Asia/Kolkata"),
+  // Persist candles for non-signal tokens (e.g., options) if enabled
+  CANDLE_PERSIST_NON_SIGNAL_TOKENS: z.string().default("false"),
   // Optional tick-based signal confirmation (intra-candle)
   SIGNAL_TICK_CONFIRM_ENABLED: z.string().default("false"),
   SIGNAL_TICK_CONFIRM_THROTTLE_MS: z.coerce.number().default(1500),
@@ -352,6 +359,9 @@ const schema = z.object({
 
   // Production hardening
   RECONCILE_INTERVAL_SEC: z.coerce.number().default(60),
+  OCO_RECONCILE_INTERVAL_SEC: z.coerce.number().default(5),
+  OCO_POSITION_RECONCILER_ENABLED: z.string().default("true"),
+  OCO_RECENT_CLOSED_WINDOW_SEC: z.coerce.number().default(120),
   TICK_QUEUE_MAX: z.coerce.number().default(50),
   // Tick mode controls (reduce load in F&O scalping). Only used if pipeline/tickerManager honors it.
   // Values: 'full' (depth+ohlc+ltp) or 'ltp' (ltp-only).
@@ -363,6 +373,8 @@ const schema = z.object({
   CANDLE_WRITE_BUFFER_ENABLED: z.coerce.boolean().default(true),
   CANDLE_WRITE_BATCH_SIZE: z.coerce.number().default(200),
   CANDLE_WRITE_FLUSH_MS: z.coerce.number().default(250),
+  CANDLE_WRITE_MAX_BATCH: z.coerce.number().default(500),
+  CANDLE_WRITE_MAX_BUFFER: z.coerce.number().default(15000),
   DAILY_LOSS_CHECK_MS: z.coerce.number().default(2000),
   FORCE_FLATTEN_CHECK_MS: z.coerce.number().default(1000),
   // Allow REST quote fetch for LTP in daily-loss checker when ticks are sparse
@@ -422,6 +434,10 @@ const schema = z.object({
   PANIC_EXIT_LIMIT_FALLBACK_ENABLED: z.string().default("true"),
   PANIC_EXIT_LIMIT_BUFFER_TICKS: z.coerce.number().default(2),
   PANIC_EXIT_LIMIT_MAX_BPS: z.coerce.number().default(250),
+  // Panic-exit fill SLA (if MARKET hangs open, cancel+replace)
+  PANIC_EXIT_FILL_TIMEOUT_MS: z.coerce.number().default(3000),
+  PANIC_EXIT_FILL_POLL_MS: z.coerce.number().default(500),
+  PANIC_EXIT_REPLACE_ON_TIMEOUT: z.string().default("true"),
 
   MAX_ENTRY_SLIPPAGE_BPS: z.coerce.number().default(25),
   MAX_ENTRY_SLIPPAGE_KILL_BPS: z.coerce.number().default(60),
@@ -475,6 +491,10 @@ const schema = z.object({
   // Reliability guards
   MAX_CONSECUTIVE_FAILURES: z.coerce.number().default(3),
 
+  // Crash-only safety (exit to allow supervisor restart)
+  FATAL_EXIT_ENABLED: z.string().default("true"),
+  FATAL_EXIT_DELAY_MS: z.coerce.number().default(2000),
+
   // Order rate limits (soft guard; tune per account)
   MAX_ORDERS_PER_SEC: z.coerce.number().default(10),
   MAX_ORDERS_PER_MIN: z.coerce.number().default(200),
@@ -484,11 +504,15 @@ const schema = z.object({
   ORDER_PLACE_RETRY_MAX: z.coerce.number().default(1),
   ORDER_PLACE_RETRY_BACKOFF_MS: z.coerce.number().default(250),
   ORDER_DEDUP_LOOKBACK_SEC: z.coerce.number().default(120),
+  ORPHAN_REPLAY_DELAY_MS: z.coerce.number().default(250),
+  ORPHAN_REPLAY_MAX_ATTEMPTS: z.coerce.number().default(4),
 
   // Entry verification (limit entry fill watchdog)
   ENTRY_WATCH_POLL_MS: z.coerce.number().default(1000),
   ENTRY_WATCH_MS: z.coerce.number().default(30000),
   CANCEL_ENTRY_ON_TIMEOUT: z.string().default("true"),
+  ENTRY_TIMEOUT_LATE_FILL_ATTEMPTS: z.coerce.number().default(2),
+  ENTRY_TIMEOUT_LATE_FILL_DELAY_MS: z.coerce.number().default(400),
 
   // Exit leg verification
   EXIT_WATCH_POLL_MS: z.coerce.number().default(1000),

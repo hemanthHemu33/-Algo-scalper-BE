@@ -265,7 +265,7 @@ function _median(nums) {
 function computeOiWallContext({ rows, optType, desiredStrike, step }) {
   const mult = Number(env.OPT_OI_WALL_MULT ?? 2.5);
   const strikes = Math.max(1, Number(env.OPT_OI_WALL_STRIKES ?? 2));
-  const requireChange = Boolean(env.OPT_OI_WALL_REQUIRE_CHANGE ?? true);
+  const requireChange = Boolean(env.OPT_OI_WALL_REQUIRE_OI_CHANGE ?? true);
 
   const ois = (rows || [])
     .map((r) => Number(r.oi))
