@@ -3,6 +3,7 @@ const { getDb } = require("../db");
 const TRADES = "trades";
 const ORDER_LINKS = "order_links";
 const DAILY_RISK = "daily_risk";
+const RISK_STATE = "risk_state";
 const ORPHAN_ORDER_UPDATES = "orphan_order_updates";
 const ORDER_LOGS = "order_logs";
 // Patch-6: cost calibration & reconciliations (post-trade cost model tuning)
@@ -20,6 +21,7 @@ async function ensureTradeIndexes() {
   await db.collection(DAILY_RISK).createIndex({ date: 1 }, { unique: true });
   await db.collection(ORDER_LOGS).createIndex({ order_id: 1, createdAt: -1 });
   await db.collection(ORDER_LOGS).createIndex({ tradeId: 1, createdAt: -1 });
+  await db.collection(RISK_STATE).createIndex({ date: 1 }, { unique: true });
 
   // Cost calibration (one doc per segmentKey)
   await db
@@ -164,10 +166,28 @@ async function getDailyRisk(date) {
   return db.collection(DAILY_RISK).findOne({ date });
 }
 
+async function upsertRiskState(date, patch) {
+  const db = getDb();
+  await db.collection(RISK_STATE).updateOne(
+    { date },
+    {
+      $set: { ...patch, updatedAt: new Date() },
+      $setOnInsert: { createdAt: new Date(), date },
+    },
+    { upsert: true },
+  );
+}
+
+async function getRiskState(date) {
+  const db = getDb();
+  return db.collection(RISK_STATE).findOne({ date });
+}
+
 module.exports = {
   TRADES,
   ORDER_LINKS,
   DAILY_RISK,
+  RISK_STATE,
   ORPHAN_ORDER_UPDATES,
   ORDER_LOGS,
   COST_CALIBRATION,
@@ -185,4 +205,6 @@ module.exports = {
   getOrderLogs,
   upsertDailyRisk,
   getDailyRisk,
+  upsertRiskState,
+  getRiskState,
 };

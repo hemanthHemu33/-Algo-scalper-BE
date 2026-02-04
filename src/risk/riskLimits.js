@@ -7,13 +7,21 @@ const DOC_ID = "active";
 function defaultLimits() {
   const dailyLossCap = Number(env.DAILY_MAX_LOSS_INR || 0);
   const maxOpenTrades = Number(env.MAX_OPEN_POSITIONS || 1);
+  const maxTradesPerDay = Number(env.MAX_TRADES_PER_DAY || 0);
   return {
     dailyLossCapInr: Number.isFinite(dailyLossCap) ? dailyLossCap : null,
     maxDrawdownInr: Number(env.RISK_MAX_DRAWDOWN_INR || dailyLossCap * 2 || 0),
     maxOpenTrades: Number.isFinite(maxOpenTrades) ? maxOpenTrades : null,
+    maxTradesPerDay: Number.isFinite(maxTradesPerDay)
+      ? maxTradesPerDay
+      : null,
     maxPerSymbolExposureInr: Number(
       env.RISK_MAX_EXPOSURE_PER_SYMBOL_INR || 0,
     ),
+    maxPortfolioExposureInr: Number(
+      env.RISK_MAX_PORTFOLIO_EXPOSURE_INR || 0,
+    ),
+    maxLeverage: Number(env.RISK_MAX_LEVERAGE || 0),
   };
 }
 

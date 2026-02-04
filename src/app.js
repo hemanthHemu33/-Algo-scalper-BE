@@ -653,6 +653,8 @@ function buildApp() {
   app.post("/admin/risk/limits", requirePerm("admin"), async (req, res) => {
     try {
       const limits = await setRiskLimits(req.body || {});
+      const pipeline = getPipeline();
+      await pipeline?.trader?.refreshRiskLimits?.();
       await recordAudit({
         actor: actorFromReq(req),
         action: "risk_limits_update",

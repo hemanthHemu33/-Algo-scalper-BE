@@ -31,6 +31,9 @@ const { detectRegime } = require("../strategy/selector");
 const { costGate, estimateRoundTripCostInr } = require("./costModel");
 const { costCalibrator } = require("./costCalibrator");
 const { optimizer } = require("../optimizer/adaptiveOptimizer");
+const { equityService } = require("../account/equityService");
+const { buildPositionsSnapshot } = require("./positionService");
+const { getRiskLimits } = require("../risk/riskLimits");
 const {
   ensureTradeIndexes,
   insertTrade,
@@ -44,6 +47,8 @@ const {
   appendOrderLog,
   upsertDailyRisk,
   getDailyRisk,
+  upsertRiskState,
+  getRiskState,
 } = require("./tradeStore");
 
 const STATUS = {
@@ -120,6 +125,11 @@ class TradeManager {
   constructor({ kite, riskEngine }) {
     this.kite = kite;
     this.risk = riskEngine;
+    if (this.risk?.setStateChangeHandler) {
+      this.risk.setStateChangeHandler((state) => {
+        this._persistRiskState(state).catch(() => {});
+      });
+    }
 
     this.lastPriceByToken = new Map(); // token -> ltp
     this.activeTradeId = null; // single-stock mode
@@ -309,6 +319,8 @@ class TradeManager {
       await costCalibrator.start();
     } catch {}
     await this._ensureDailyRisk();
+    await this._hydrateRiskStateFromDb();
+    await this.refreshRiskLimits();
     await this._hydrateRiskFromDb();
     await this._loadActiveTradeId();
     await this._hydrateOpenPositionFromActiveTrade();
@@ -350,6 +362,130 @@ class TradeManager {
       this.risk.setKillSwitch(true);
     }
     this.ordersPlacedToday = Number(dr?.ordersPlaced || 0);
+  }
+
+  async _hydrateRiskStateFromDb() {
+    const rs = await getRiskState(todayKey());
+    if (!rs) return;
+    if (this.risk?.applyState) {
+      this.risk.applyState({
+        kill: rs.kill,
+        consecutiveFailures: rs.consecutiveFailures,
+        tradesToday: rs.tradesToday,
+        openPositions: rs.openPositions,
+        cooldownUntil: rs.cooldownUntil,
+      });
+    }
+  }
+
+  async _persistRiskState(state) {
+    if (!state) return;
+    await upsertRiskState(todayKey(), {
+      kill: !!state.kill,
+      consecutiveFailures: Number(state.consecutiveFailures || 0),
+      tradesToday: Number(state.tradesToday || 0),
+      openPositions: Array.isArray(state.openPositions)
+        ? state.openPositions
+        : [],
+      cooldownUntil: state.cooldownUntil || {},
+    });
+  }
+
+  async refreshRiskLimits() {
+    const res = await getRiskLimits();
+    const limits = res?.limits || res || {};
+    if (this.risk?.setLimits) this.risk.setLimits(limits);
+    return limits;
+  }
+
+  async _checkExposureLimits({ instrument, qty, entryPrice }) {
+    const limits = this.risk?.getLimits ? this.risk.getLimits() : {};
+    const maxPerSymbolExposureInr = Number(
+      limits?.maxPerSymbolExposureInr || 0,
+    );
+    const maxPortfolioExposureInr = Number(
+      limits?.maxPortfolioExposureInr || 0,
+    );
+    const maxLeverage = Number(limits?.maxLeverage || 0);
+
+    if (
+      maxPerSymbolExposureInr <= 0 &&
+      maxPortfolioExposureInr <= 0 &&
+      maxLeverage <= 0
+    ) {
+      return { ok: true };
+    }
+
+    const positions = await buildPositionsSnapshot({ kite: this.kite });
+    const exposureBySymbol = {};
+    let totalExposure = 0;
+    for (const p of positions) {
+      const key = p.tradingsymbol || String(p.instrument_token || "");
+      const exp = Number(p.exposureInr || 0);
+      if (Number.isFinite(exp) && exp > 0) {
+        exposureBySymbol[key] = (exposureBySymbol[key] || 0) + exp;
+        totalExposure += exp;
+      }
+    }
+
+    const newExposure = Math.abs(Number(entryPrice || 0) * Number(qty || 0));
+    const symbolKey =
+      instrument?.tradingsymbol || String(instrument?.instrument_token || "");
+    const nextSymbolExposure = (exposureBySymbol[symbolKey] || 0) + newExposure;
+    const nextTotalExposure = totalExposure + newExposure;
+
+    if (
+      maxPerSymbolExposureInr > 0 &&
+      nextSymbolExposure > maxPerSymbolExposureInr
+    ) {
+      return {
+        ok: false,
+        reason: "MAX_SYMBOL_EXPOSURE",
+        meta: {
+          symbol: symbolKey,
+          nextSymbolExposure,
+          maxPerSymbolExposureInr,
+          newExposure,
+        },
+      };
+    }
+
+    if (
+      maxPortfolioExposureInr > 0 &&
+      nextTotalExposure > maxPortfolioExposureInr
+    ) {
+      return {
+        ok: false,
+        reason: "MAX_PORTFOLIO_EXPOSURE",
+        meta: {
+          nextTotalExposure,
+          maxPortfolioExposureInr,
+          newExposure,
+        },
+      };
+    }
+
+    if (maxLeverage > 0) {
+      const equitySnap = await equityService.snapshot({ kite: this.kite });
+      const equity = Number(equitySnap?.snapshot?.equity || 0);
+      if (Number.isFinite(equity) && equity > 0) {
+        const leverage = nextTotalExposure / equity;
+        if (leverage > maxLeverage) {
+          return {
+            ok: false,
+            reason: "MAX_LEVERAGE",
+            meta: {
+              leverage,
+              maxLeverage,
+              equity,
+              nextTotalExposure,
+            },
+          };
+        }
+      }
+    }
+
+    return { ok: true };
   }
 
   async _recordOrdersPlaced(n = 1) {
@@ -839,7 +975,12 @@ class TradeManager {
     const realized = Number(day?.realizedPnl || 0);
     const total = realized + openPnl;
 
-    if (total <= -Number(env.DAILY_MAX_LOSS_INR || 1000)) {
+    const lossCap = Number(
+      this.risk?.getLimits?.().dailyLossCapInr ??
+        env.DAILY_MAX_LOSS_INR ||
+        1000,
+    );
+    if (Number.isFinite(lossCap) && total <= -lossCap) {
       logger.error(
         { total, realized, openPnl },
         "[risk] DAILY_MAX_LOSS hit -> kill switch",
@@ -4354,6 +4495,19 @@ class TradeManager {
           qty = newQty;
         }
       }
+    }
+
+    const exposureCheck = await this._checkExposureLimits({
+      instrument,
+      qty,
+      entryPrice: expectedEntryPrice || entryGuess,
+    });
+    if (!exposureCheck.ok) {
+      logger.info(
+        { token, reason: exposureCheck.reason, meta: exposureCheck.meta },
+        "[trade] blocked (exposure limits)",
+      );
+      return;
     }
 
     // --- Cost/edge gate (solves "profit smaller than charges" for high-frequency scalping)

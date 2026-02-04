@@ -7,16 +7,80 @@ const {
 const { isHalted } = require("../runtime/halt");
 
 class RiskEngine {
-  constructor() {
+  constructor({ limits, onStateChange } = {}) {
     this.kill = false;
     this.consecutiveFailures = 0;
     this.tradesToday = 0;
     this.openPositions = new Map(); // token -> {tradeId, side, qty}
     this.cooldownUntil = new Map(); // token -> timestamp
+    this.limits = limits || {};
+    this.onStateChange = typeof onStateChange === "function" ? onStateChange : null;
+  }
+
+  setStateChangeHandler(fn) {
+    this.onStateChange = typeof fn === "function" ? fn : null;
+  }
+
+  setLimits(limits = {}) {
+    this.limits = { ...(this.limits || {}), ...(limits || {}) };
+  }
+
+  getLimits() {
+    return this.limits || {};
+  }
+
+  getState() {
+    return {
+      kill: this.kill,
+      consecutiveFailures: this.consecutiveFailures,
+      tradesToday: this.tradesToday,
+      openPositions: Array.from(this.openPositions.entries()).map(
+        ([token, pos]) => ({
+          token: Number(token),
+          ...pos,
+        }),
+      ),
+      cooldownUntil: Array.from(this.cooldownUntil.entries()).reduce(
+        (acc, [token, ts]) => {
+          acc[String(token)] = ts;
+          return acc;
+        },
+        {},
+      ),
+    };
+  }
+
+  applyState(state) {
+    if (!state) return;
+    if (typeof state.kill === "boolean") this.kill = state.kill;
+    if (Number.isFinite(Number(state.consecutiveFailures))) {
+      this.consecutiveFailures = Number(state.consecutiveFailures);
+    }
+    if (Number.isFinite(Number(state.tradesToday))) {
+      this.tradesToday = Number(state.tradesToday);
+    }
+    if (Array.isArray(state.openPositions)) {
+      this.openPositions = new Map(
+        state.openPositions.map((p) => [Number(p.token), { ...p }]),
+      );
+    }
+    if (state.cooldownUntil && typeof state.cooldownUntil === "object") {
+      this.cooldownUntil = new Map(
+        Object.entries(state.cooldownUntil).map(([token, ts]) => [
+          Number(token),
+          Number(ts),
+        ]),
+      );
+    }
+  }
+
+  _emitStateChange() {
+    if (this.onStateChange) this.onStateChange(this.getState());
   }
 
   setKillSwitch(enabled) {
     this.kill = !!enabled;
+    this._emitStateChange();
   }
   getKillSwitch() {
     return this.kill;
@@ -24,12 +88,15 @@ class RiskEngine {
 
   setTradesToday(n) {
     this.tradesToday = Math.max(0, Number(n || 0));
+    this._emitStateChange();
   }
   setOpenPosition(token, pos) {
     this.openPositions.set(Number(token), pos);
+    this._emitStateChange();
   }
   clearOpenPosition(token) {
     this.openPositions.delete(Number(token));
+    this._emitStateChange();
   }
 
   canTrade(token) {
@@ -82,9 +149,18 @@ class RiskEngine {
     }
 
     if (this.kill) return { ok: false, reason: "kill_switch" };
-    if (this.tradesToday >= Number(env.MAX_TRADES_PER_DAY || 8))
+    const maxTradesPerDay = Number(
+      this.limits?.maxTradesPerDay ?? env.MAX_TRADES_PER_DAY || 8,
+    );
+    if (Number.isFinite(maxTradesPerDay) && this.tradesToday >= maxTradesPerDay)
       return { ok: false, reason: "max_trades_day" };
-    if (this.openPositions.size >= Number(env.MAX_OPEN_POSITIONS || 1))
+    const maxOpenTrades = Number(
+      this.limits?.maxOpenTrades ?? env.MAX_OPEN_POSITIONS || 1,
+    );
+    if (
+      Number.isFinite(maxOpenTrades) &&
+      this.openPositions.size >= maxOpenTrades
+    )
       return { ok: false, reason: "max_open_positions" };
     if (this.openPositions.has(token))
       return { ok: false, reason: "already_in_position" };
@@ -96,25 +172,30 @@ class RiskEngine {
   markTradeOpened(token, pos) {
     this.tradesToday += 1;
     this.openPositions.set(Number(token), pos);
+    this._emitStateChange();
   }
 
   markTradeClosed(token) {
     this.openPositions.delete(Number(token));
     const cooldown = Number(env.SYMBOL_COOLDOWN_SECONDS || 180);
     this.cooldownUntil.set(Number(token), Date.now() + cooldown * 1000);
+    this._emitStateChange();
   }
 
   markFailure(reason) {
     this.consecutiveFailures += 1;
     if (this.consecutiveFailures >= Number(env.MAX_CONSECUTIVE_FAILURES || 3)) {
       this.kill = true;
+      this._emitStateChange();
       return { killed: true, reason: reason || "failure_limit" };
     }
+    this._emitStateChange();
     return { killed: false };
   }
 
   resetFailures() {
     this.consecutiveFailures = 0;
+    this._emitStateChange();
   }
 
   calcQty({ entryPrice, stopLoss, riskInr: riskInrOverride }) {
