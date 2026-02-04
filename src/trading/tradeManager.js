@@ -1937,9 +1937,152 @@ class TradeManager {
           role: "PANIC_EXIT",
         });
         await this._replayOrphanUpdates(exitOrderId);
+        this._watchPanicExitFill({
+          tradeId,
+          orderId: exitOrderId,
+          reason,
+          instrument,
+          exitSide,
+          qty,
+        }).catch((e) => {
+          logger.error({ tradeId, e: e.message }, "[panic] watch failed");
+        });
       }
     } catch (e) {
       logger.error({ tradeId, e: e.message }, "[panic] exit failed");
+    }
+  }
+
+  async _watchPanicExitFill({
+    tradeId,
+    orderId,
+    reason,
+    instrument,
+    exitSide,
+    qty,
+  }) {
+    const timeoutMs = Number(env.PANIC_EXIT_FILL_TIMEOUT_MS || 0);
+    const pollMs = Math.max(200, Number(env.PANIC_EXIT_FILL_POLL_MS || 500));
+    const allowReplace =
+      String(env.PANIC_EXIT_REPLACE_ON_TIMEOUT || "true") === "true";
+    if (!allowReplace || timeoutMs <= 0) return;
+
+    const deadline = Date.now() + timeoutMs;
+    const oid = String(orderId || "");
+    if (!tradeId || !oid) return;
+
+    while (Date.now() < deadline) {
+      const t = await getTrade(tradeId);
+      if (!t) return;
+      if (
+        [STATUS.CLOSED, STATUS.EXITED_TARGET, STATUS.EXITED_SL].includes(t.status)
+      ) {
+        return;
+      }
+      if (String(t.panicExitOrderId || "") !== oid) return;
+
+      const statusInfo = await this._getOrderStatus(oid);
+      const status = String(statusInfo?.status || "").toUpperCase();
+      if (status === "COMPLETE" || isDead(status)) return;
+
+      await sleep(pollMs);
+    }
+
+    const tFinal = await getTrade(tradeId);
+    if (!tFinal) return;
+    if (String(tFinal.panicExitOrderId || "") !== oid) return;
+
+    const statusInfo = await this._getOrderStatus(oid);
+    const status = String(statusInfo?.status || "").toUpperCase();
+    const order = statusInfo?.order || {};
+    if (status === "COMPLETE" || isDead(status)) return;
+
+    let remaining = Math.max(
+      0,
+      Number(qty || 0) - Number(order.filled_quantity || 0),
+    );
+    let side = exitSide;
+
+    try {
+      const positions = await this.kite.getPositions();
+      const net = positions?.net || positions?.day || [];
+      const token = Number(tFinal.instrument_token);
+      const p = Array.isArray(net)
+        ? net.find((x) => Number(x.instrument_token) === token)
+        : null;
+      const netQty = Number(p?.quantity ?? p?.net_quantity ?? 0);
+      if (Number.isFinite(netQty) && netQty !== 0) {
+        remaining = Math.abs(netQty);
+        side = netQty > 0 ? "SELL" : "BUY";
+      } else if (Number.isFinite(netQty) && netQty === 0) {
+        return;
+      }
+    } catch {}
+
+    if (!Number.isFinite(remaining) || remaining <= 0) return;
+
+    logger.warn(
+      { tradeId, orderId: oid, status, remaining, side },
+      "[panic] fill timeout; cancel+replace",
+    );
+
+    try {
+      try {
+        this.expectedCancelOrderIds.add(oid);
+      } catch {}
+      await this._safeCancelOrder(env.DEFAULT_ORDER_VARIETY, oid, {
+        purpose: "PANIC_TIMEOUT_CANCEL",
+        tradeId,
+      });
+    } catch (e) {
+      logger.warn(
+        { tradeId, orderId: oid, e: e.message },
+        "[panic] timeout cancel failed; skipping replace",
+      );
+      return;
+    }
+
+    const late = await this._checkLateFillAfterCancel(oid);
+    const lateStatus = String(late?.status || "").toUpperCase();
+    if (lateStatus === "COMPLETE" || isDead(lateStatus)) return;
+
+    try {
+      const fb = await this._panicExitFallbackLimit({
+        tradeId,
+        instrument: instrument || tFinal.instrument,
+        exitSide: side,
+        qty: remaining,
+        reason: `${reason}_TIMEOUT`,
+        marketError: "PANIC_EXIT_TIMEOUT",
+      });
+      const newOrderId = fb?.orderId;
+      if (newOrderId) {
+        await updateTrade(tradeId, {
+          panicExitOrderId: newOrderId,
+          panicExitReplacedFrom: oid,
+          panicExitReplacedAt: new Date(),
+          closeReason: `PANIC_EXIT_REPLACED | ${reason}`,
+        });
+        await linkOrder({
+          order_id: newOrderId,
+          tradeId,
+          role: "PANIC_EXIT",
+        });
+        await this._replayOrphanUpdates(newOrderId);
+        this._watchPanicExitFill({
+          tradeId,
+          orderId: newOrderId,
+          reason,
+          instrument,
+          exitSide: side,
+          qty: remaining,
+        }).catch(() => {});
+      }
+    } catch (e) {
+      logger.error(
+        { tradeId, e: e.message },
+        "[panic] timeout fallback failed",
+      );
     }
   }
 
