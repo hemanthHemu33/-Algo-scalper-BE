@@ -183,6 +183,9 @@ class TradeManager {
     this._slWatch = new Map(); // tradeId -> state
     this._slWatchdogInFlight = false;
 
+    // Virtual target watcher (used when broker rejects target due to margin)
+    this._virtualTargetWatch = new Map(); // tradeId -> state
+
     // ENTRY limit fallback timers (tradeId -> timeout)
     this._entryFallbackTimers = new Map();
 
@@ -365,6 +368,17 @@ class TradeManager {
         s.includes("discontinued") ||
         s.includes("not allowed") ||
         s.includes("rejected"))
+    );
+  }
+
+  _isInsufficientMarginError(msg) {
+    const s = String(msg || "").toLowerCase();
+    return (
+      s.includes("insufficient funds") ||
+      s.includes("insufficient margin") ||
+      s.includes("margin exceeds") ||
+      s.includes("rms:margin") ||
+      (s.includes("required") && s.includes("margin") && s.includes("available"))
     );
   }
 
@@ -574,6 +588,9 @@ class TradeManager {
       side: t.side,
       qty: Number(t.qty || 0),
     });
+    if (t?.targetVirtual && !t?.targetOrderId) {
+      this._registerVirtualTargetFromTrade(t);
+    }
   }
 
   onTick(tick) {
@@ -609,6 +626,11 @@ class TradeManager {
     // SL watchdog: track trigger crossings in fast moves (especially for SL-L fallback)
     try {
       this._maybeTriggerSlWatchFromTick(token, ltp, now);
+    } catch {}
+
+    // Virtual target watcher: exit when target price is hit without resting order
+    try {
+      this._maybeTriggerVirtualTargetFromTick(token, ltp, now);
     } catch {}
   }
 
@@ -740,6 +762,184 @@ class TradeManager {
       }, ms);
       this._slWatch.set(tradeId, st);
     }
+  }
+
+  _virtualTargetIsHit(ltp, targetPrice, exitSide) {
+    const l = Number(ltp);
+    const t = Number(targetPrice);
+    if (!Number.isFinite(l) || !Number.isFinite(t) || t <= 0) return false;
+    if (String(exitSide).toUpperCase() === "SELL") return l >= t;
+    return l <= t;
+  }
+
+  _registerVirtualTargetFromTrade(trade) {
+    try {
+      const tradeId = String(trade?.tradeId || "");
+      if (!tradeId) return;
+
+      const token = Number(trade?.instrument_token);
+      const targetPrice =
+        Number(trade?.targetPrice) || this._computeTargetPrice(trade);
+      if (!Number.isFinite(token) || !Number.isFinite(targetPrice)) return;
+
+      const side = String(trade?.side || "BUY").toUpperCase();
+      const exitSide = side === "BUY" ? "SELL" : "BUY";
+
+      const existing = this._virtualTargetWatch.get(tradeId) || {};
+      this._virtualTargetWatch.set(tradeId, {
+        ...existing,
+        tradeId,
+        token,
+        side,
+        exitSide,
+        targetPrice,
+        armedAtMs: existing.armedAtMs || Date.now(),
+        firedAtMs: existing.firedAtMs || 0,
+      });
+    } catch {}
+  }
+
+  _clearVirtualTarget(tradeId) {
+    try {
+      this._virtualTargetWatch.delete(String(tradeId || ""));
+    } catch {}
+  }
+
+  _maybeTriggerVirtualTargetFromTick(token, ltp, nowMs) {
+    if (!this.activeTradeId) return;
+    const tradeId = String(this.activeTradeId);
+    const st = this._virtualTargetWatch.get(tradeId);
+    if (!st || st.firedAtMs) return;
+    if (Number(st.token) !== Number(token)) return;
+    if (!this._virtualTargetIsHit(ltp, st.targetPrice, st.exitSide)) return;
+
+    st.firedAtMs = Number(nowMs || Date.now());
+    this._virtualTargetWatch.set(tradeId, st);
+    this._fireVirtualTarget(tradeId, st, ltp).catch((e) => {
+      logger.error(
+        { tradeId, e: e.message },
+        "[virtual_target] fire failed",
+      );
+    });
+  }
+
+  async _fireVirtualTarget(tradeId, st, ltp) {
+    const fresh = (await getTrade(tradeId)) || null;
+    if (!fresh) return;
+
+    if (
+      [
+        STATUS.EXITED_TARGET,
+        STATUS.EXITED_SL,
+        STATUS.ENTRY_FAILED,
+        STATUS.GUARD_FAILED,
+        STATUS.CLOSED,
+      ].includes(fresh.status)
+    ) {
+      return;
+    }
+
+    if (fresh?.targetOrderId) return;
+
+    const qty = Number(fresh.qty || 0);
+    if (!Number.isFinite(qty) || qty <= 0) return;
+
+    logger.warn(
+      { tradeId, targetPrice: st.targetPrice, ltp },
+      "[virtual_target] target hit -> placing MARKET exit",
+    );
+    alert("info", "🎯 Virtual target hit -> MARKET exit", {
+      tradeId,
+      targetPrice: st.targetPrice,
+      ltp,
+    }).catch(() => {});
+
+    try {
+      // Cancel SL to avoid margin blocks from overlapping exit orders
+      if (fresh.slOrderId) {
+        try {
+          this.expectedCancelOrderIds.add(String(fresh.slOrderId));
+        } catch {}
+        await this._safeCancelOrder(
+          env.DEFAULT_ORDER_VARIETY,
+          fresh.slOrderId,
+          { purpose: "VIRTUAL_TARGET_CANCEL_SL", tradeId },
+        );
+      }
+    } catch (e) {
+      logger.warn(
+        { tradeId, e: e.message },
+        "[virtual_target] cancel SL failed",
+      );
+    }
+
+    try {
+      const out = await this._safePlaceOrder(
+        env.DEFAULT_ORDER_VARIETY,
+        {
+          exchange: fresh.instrument.exchange,
+          tradingsymbol: fresh.instrument.tradingsymbol,
+          transaction_type: st.exitSide,
+          quantity: qty,
+          product: env.DEFAULT_PRODUCT,
+          order_type: "MARKET",
+          validity: "DAY",
+          tag: makeTag(tradeId, "TARGET"),
+        },
+        { purpose: "VIRTUAL_TARGET", tradeId },
+      );
+      const targetOrderId = out.orderId;
+      await updateTrade(tradeId, {
+        targetOrderId,
+        targetPrice: st.targetPrice,
+        targetVirtual: true,
+        targetVirtualFiredAt: new Date(),
+        status: STATUS.LIVE,
+      });
+      await linkOrder({
+        order_id: String(targetOrderId),
+        tradeId,
+        role: "TARGET",
+      });
+      await this._replayOrphanUpdates(targetOrderId);
+      this._watchExitLeg(tradeId, targetOrderId, "TARGET").catch(() => {});
+    } catch (e) {
+      const msg = String(e?.message || e);
+      logger.error(
+        { tradeId, e: msg },
+        "[virtual_target] MARKET exit failed; panic exit fallback",
+      );
+      await updateTrade(tradeId, {
+        targetVirtualError: msg,
+        targetVirtualFailedAt: new Date(),
+      });
+      await this._panicExit(fresh, "VIRTUAL_TARGET_EXIT_FAILED", {
+        allowWhenHalted: true,
+      });
+    }
+  }
+
+  async _enableVirtualTarget(trade, { reason, source } = {}) {
+    const tradeId = String(trade?.tradeId || "");
+    if (!tradeId) return;
+
+    const targetPrice =
+      Number(trade?.targetPrice) || this._computeTargetPrice(trade);
+    if (!Number.isFinite(targetPrice) || targetPrice <= 0) return;
+
+    await updateTrade(tradeId, {
+      targetVirtual: true,
+      targetPrice,
+      targetVirtualReason: reason || null,
+      targetVirtualSource: source || null,
+      targetVirtualAt: new Date(),
+    });
+    this._registerVirtualTargetFromTrade({ ...trade, targetPrice });
+    alert("warn", "⚠️ Target order blocked by margin; using virtual target", {
+      tradeId,
+      targetPrice,
+      reason,
+    }).catch(() => {});
   }
 
   _slWatchdogHeartbeat(trade, netQty, source = "reconcile") {
@@ -6099,6 +6299,19 @@ class TradeManager {
       return;
     const fresh = (await getTrade(tradeId)) || trade;
 
+    const rejectMsg =
+      targetOrder?.status_message_raw ||
+      targetOrder?.status_message ||
+      targetOrder?.message ||
+      "";
+    if (this._isInsufficientMarginError(rejectMsg)) {
+      await this._enableVirtualTarget(fresh, {
+        reason: rejectMsg,
+        source: source || "dead_target",
+      });
+      return;
+    }
+
     // Don't replace if already closed/failed
     if (
       [
@@ -6461,8 +6674,10 @@ class TradeManager {
     await updateTrade(tradeId, {
       targetOrderId,
       targetPrice,
+      targetVirtual: false,
       status: STATUS.LIVE,
     });
+    this._clearVirtualTarget(tradeId);
     await linkOrder({
       order_id: String(targetOrderId),
       tradeId,
@@ -6653,8 +6868,10 @@ class TradeManager {
       targetPrice,
       runnerTargetMode: plan.mode,
       runnerTargetMeta: plan.meta,
+      targetVirtual: false,
       status: STATUS.LIVE,
     });
+    this._clearVirtualTarget(tradeId);
     await linkOrder({
       order_id: String(targetOrderId),
       tradeId,
@@ -7148,17 +7365,26 @@ class TradeManager {
                   initialQty: initQty,
                 });
               } catch (e2) {
+                const msg = String(e2?.message || e2);
+                if (this._isInsufficientMarginError(msg)) {
+                  await this._enableVirtualTarget(
+                    { ...trade, ...fresh2, initialQty: initQty },
+                    { reason: msg, source: "tp1_fallback_target" },
+                  );
+                  await updateTrade(tradeId, { status: STATUS.LIVE });
+                  return;
+                }
                 logger.warn(
-                  { tradeId, e: e2.message },
+                  { tradeId, e: msg },
                   "[trade] TARGET place failed (keeping SL only)",
                 );
                 alert("warn", "⚠️ TARGET place failed (SL still active)", {
                   tradeId,
-                  message: e2.message,
+                  message: msg,
                 }).catch(() => {});
                 await updateTrade(tradeId, {
                   status: STATUS.LIVE,
-                  closeReason: "TARGET_PLACE_FAILED | " + e2.message,
+                  closeReason: "TARGET_PLACE_FAILED | " + msg,
                 });
                 return;
               }
@@ -7174,17 +7400,26 @@ class TradeManager {
                 initialQty: initQty,
               });
             } catch (e) {
+              const msg = String(e?.message || e);
+              if (this._isInsufficientMarginError(msg)) {
+                await this._enableVirtualTarget(
+                  { ...trade, ...fresh2, initialQty: initQty },
+                  { reason: msg, source: "runner_target" },
+                );
+                await updateTrade(tradeId, { status: STATUS.LIVE });
+                return;
+              }
               logger.warn(
-                { tradeId, e: e.message },
+                { tradeId, e: msg },
                 "[trade] RUNNER TARGET place failed (keeping SL only)",
               );
               alert("warn", "⚠️ RUNNER TARGET place failed (SL still active)", {
                 tradeId,
-                message: e.message,
+                message: msg,
               }).catch(() => {});
               await updateTrade(tradeId, {
                 status: STATUS.LIVE,
-                closeReason: "RUNNER_TARGET_PLACE_FAILED | " + e.message,
+                closeReason: "RUNNER_TARGET_PLACE_FAILED | " + msg,
               });
               return;
             }
@@ -7200,18 +7435,27 @@ class TradeManager {
               initialQty: initQty,
             });
           } catch (e) {
+            const msg = String(e?.message || e);
+            if (this._isInsufficientMarginError(msg)) {
+              await this._enableVirtualTarget(
+                { ...trade, ...fresh2, initialQty: initQty },
+                { reason: msg, source: "target" },
+              );
+              await updateTrade(tradeId, { status: STATUS.LIVE });
+              return;
+            }
             logger.warn(
-              { tradeId, e: e.message },
+              { tradeId, e: msg },
               "[trade] TARGET place failed (keeping SL only)",
             );
             alert("warn", "⚠️ TARGET place failed (SL still active)", {
               tradeId,
-              message: e.message,
+              message: msg,
             }).catch(() => {});
             // Do not kill-switch; SL is safety critical and is already placed.
             await updateTrade(tradeId, {
               status: STATUS.LIVE,
-              closeReason: "TARGET_PLACE_FAILED | " + e.message,
+              closeReason: "TARGET_PLACE_FAILED | " + msg,
             });
             return;
           }
@@ -7676,6 +7920,7 @@ class TradeManager {
 
     this.activeTradeId = null;
     this.recoveredPosition = null;
+    this._clearVirtualTarget(tradeId);
     this.risk.markTradeClosed(Number(instrument_token));
   }
 
