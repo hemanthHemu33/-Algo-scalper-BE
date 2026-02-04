@@ -425,6 +425,44 @@ You should move these route definitions **outside** `/admin/status`.
 
 ---
 
+## DB purge endpoint
+
+**Danger:** Deletes documents from all collections except a keep list. Requires `DB_PURGE_ENABLED=true` and `confirm: "PURGE"`.
+
+### `POST /admin/db/purge`
+
+**Body**
+
+```json
+{
+  "confirm": "PURGE",
+  "keepCollections": ["audit_logs", "broker_tokens"],
+  "dryRun": true
+}
+```
+
+**200**
+
+```json
+{
+  "ok": true,
+  "dryRun": true,
+  "keepCollections": ["audit_logs", "broker_tokens"],
+  "results": [
+    { "collection": "candles_1m", "deletedCount": 0, "count": 12345 },
+    { "collection": "trades", "deletedCount": 0, "count": 78 }
+  ]
+}
+```
+
+**400/403/500**
+
+```json
+{ "ok": false, "error": "confirm_required | purge_disabled | some error message" }
+```
+
+---
+
 ## F&O universe snapshot
 
 ### `GET /admin/fno`

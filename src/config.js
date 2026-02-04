@@ -355,6 +355,11 @@ const schema = z.object({
   // Ensure TTL indexes at startup (recommended)
   RETENTION_ENSURE_ON_START: z.string().default("true"),
 
+  // Admin DB purge (dangerous; deletes all docs except keep list)
+  DB_PURGE_ENABLED: z.string().default("false"),
+  // Comma-separated collections to keep when purging (e.g., "audit_logs,broker_tokens")
+  DB_PURGE_KEEP_COLLECTIONS: z.string().default("audit_logs"),
+
   // Production hardening
   RECONCILE_INTERVAL_SEC: z.coerce.number().default(60),
   TICK_QUEUE_MAX: z.coerce.number().default(50),
