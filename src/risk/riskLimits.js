@@ -22,6 +22,7 @@ function defaultLimits() {
       env.RISK_MAX_PORTFOLIO_EXPOSURE_INR || 0,
     ),
     maxLeverage: Number(env.RISK_MAX_LEVERAGE || 0),
+    maxMarginUtilization: Number(env.RISK_MAX_MARGIN_UTILIZATION || 0),
   };
 }
 

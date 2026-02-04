@@ -98,6 +98,13 @@ class RiskEngine {
     this.openPositions.delete(Number(token));
     this._emitStateChange();
   }
+  setCooldown(token, seconds, reason) {
+    const sec = Math.max(0, Number(seconds || 0));
+    if (!Number.isFinite(sec) || sec <= 0) return;
+    this.cooldownUntil.set(Number(token), Date.now() + sec * 1000);
+    this._emitStateChange();
+    return { token: Number(token), seconds: sec, reason: reason || null };
+  }
 
   canTrade(token) {
     token = Number(token);

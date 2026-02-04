@@ -1,4 +1,6 @@
 const { getDb } = require("../db");
+const { logger } = require("../logger");
+const { canTransition, normalizeTradeStatus } = require("./tradeStateMachine");
 
 const TRADES = "trades";
 const ORDER_LINKS = "order_links";
@@ -48,9 +50,41 @@ async function insertTrade(trade) {
 
 async function updateTrade(tradeId, patch) {
   const db = getDb();
+  const update = { ...(patch || {}) };
+
+  if (Object.prototype.hasOwnProperty.call(update, "status")) {
+    try {
+      const current = await db.collection(TRADES).findOne({ tradeId });
+      const fromStatus = current?.status || null;
+      const toStatus = normalizeTradeStatus(update.status);
+      const validation = canTransition(fromStatus, toStatus);
+
+      if (!validation.ok) {
+        logger.error(
+          { tradeId, fromStatus, toStatus, reason: validation.reason },
+          "[trade] invalid status transition blocked",
+        );
+        delete update.status;
+        update.statusTransitionError = {
+          from: fromStatus,
+          to: toStatus,
+          reason: validation.reason,
+          ts: new Date(),
+        };
+      } else {
+        update.status = toStatus;
+      }
+    } catch (e) {
+      logger.warn(
+        { tradeId, e: e?.message || String(e) },
+        "[trade] status transition validation skipped",
+      );
+    }
+  }
+
   await db
     .collection(TRADES)
-    .updateOne({ tradeId }, { $set: { ...patch, updatedAt: new Date() } });
+    .updateOne({ tradeId }, { $set: { ...update, updatedAt: new Date() } });
 }
 
 async function getTrade(tradeId) {
