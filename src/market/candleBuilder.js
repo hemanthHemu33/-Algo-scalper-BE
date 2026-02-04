@@ -1,4 +1,5 @@
 const { DateTime } = require("luxon");
+const { logger } = require("../logger");
 
 class CandleBuilder {
   constructor({ intervalsMinutes, timezone }) {
@@ -7,6 +8,7 @@ class CandleBuilder {
     this.current = new Map();
     this.prevDayVolume = new Map();
     this.lastTickTs = new Map(); // key: token:interval -> last tick ts
+    this._noVolWarned = new Set(); // token set
   }
 
   _bucketStart(ts, intervalMin) {
@@ -28,15 +30,36 @@ class CandleBuilder {
       const ts = tick.exchange_timestamp
         ? new Date(tick.exchange_timestamp)
         : tick.last_trade_time
-        ? new Date(tick.last_trade_time)
-        : new Date();
+          ? new Date(tick.last_trade_time)
+          : tick.timestamp
+            ? new Date(tick.timestamp)
+            : new Date();
 
       // Volume handling:
       // - Prefer LTQ when available
       // - Otherwise use day volume delta
       // - If day volume resets (new trading day), treat baseline as reset and use current dayVol as delta
-      const ltq = Number(tick.last_traded_quantity || 0);
-      const dayVol = Number(tick.volume_traded || 0);
+      const ltq = Number(
+        tick.last_traded_quantity ??
+          tick.last_quantity ??
+          tick.last_traded_qty ??
+          0,
+      );
+      const dayVol = Number(
+        tick.volume_traded ?? tick.volume ?? tick.volume_traded_today ?? 0,
+      );
+
+      // Pro-safety: if ticks have no volume fields (common in LTP mode), warn once per token.
+      if (ltq <= 0 && dayVol <= 0 && !this._noVolWarned.has(token)) {
+        this._noVolWarned.add(token);
+        logger.warn(
+          {
+            token,
+            hint: "Set TICK_MODE_UNDERLYING=quote/full to enable volume-based confidence",
+          },
+          "[candle] tick has no volume fields; candle volume will stay 0",
+        );
+      }
 
       const prev = this.prevDayVolume.get(token);
       let deltaVol = 0;
@@ -61,7 +84,7 @@ class CandleBuilder {
         if (!c) {
           this.current.set(
             key,
-            newCandle(token, intervalMin, bucketStart, price, volAdd)
+            newCandle(token, intervalMin, bucketStart, price, volAdd),
           );
           continue;
         }
@@ -71,7 +94,7 @@ class CandleBuilder {
           closed.push({ ...c, closedAt: new Date() });
           this.current.set(
             key,
-            newCandle(token, intervalMin, bucketStart, price, volAdd)
+            newCandle(token, intervalMin, bucketStart, price, volAdd),
           );
           continue;
         }
@@ -151,7 +174,7 @@ class CandleBuilder {
           intervalMin,
           candleEnd,
           lastClose,
-          0
+          0,
         );
 
         // mark synthetic so strategy engine can choose to block if configured

@@ -353,11 +353,14 @@ const schema = z.object({
   // Production hardening
   RECONCILE_INTERVAL_SEC: z.coerce.number().default(60),
   TICK_QUEUE_MAX: z.coerce.number().default(50),
-  // Tick mode controls (reduce load in F&O scalping). Only used if pipeline/tickerManager honors it.
-  // Values: 'full' (depth+ohlc+ltp) or 'ltp' (ltp-only).
+  // Tick mode controls (reduce load). Used by kite/tickerManager.
+  // Values:
+  // - 'ltp'   : last_price only (no volume / ohlc / depth) — NOT recommended for volume-based confidence.
+  // - 'quote' : ltp + day volume + ohlc (recommended for underlying)
+  // - 'full'  : quote + depth (recommended for traded/exit tokens)
   TICK_MODE_DEFAULT: z.string().default("full"),
   TICK_MODE_TRADE: z.string().default("full"),
-  TICK_MODE_UNDERLYING: z.string().default("ltp"),
+  TICK_MODE_UNDERLYING: z.string().default("quote"),
 
   // Candle write buffer (avoid DB writes in the hot tick loop). Only used if market/candleWriteBuffer exists.
   CANDLE_WRITE_BUFFER_ENABLED: z.coerce.boolean().default(true),
