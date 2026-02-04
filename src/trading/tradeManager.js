@@ -183,6 +183,10 @@ class TradeManager {
     this._slWatch = new Map(); // tradeId -> state
     this._slWatchdogInFlight = false;
 
+    // TARGET fill watchdog state (LIMIT target can remain OPEN after touch)
+    this._targetWatch = new Map(); // tradeId -> state
+    this._targetWatchdogInFlight = new Set(); // tradeId -> in-flight
+
     // Virtual target watcher (used when broker rejects target due to margin)
     this._virtualTargetWatch = new Map(); // tradeId -> state
 
@@ -632,6 +636,11 @@ class TradeManager {
     try {
       this._maybeTriggerVirtualTargetFromTick(token, ltp, now);
     } catch {}
+
+    // TARGET watchdog: if target touched but still OPEN -> chase fill
+    try {
+      this._maybeTriggerTargetWatchFromTick(token, ltp, now);
+    } catch {}
   }
 
   // =========================
@@ -770,6 +779,399 @@ class TradeManager {
     if (!Number.isFinite(l) || !Number.isFinite(t) || t <= 0) return false;
     if (String(exitSide).toUpperCase() === "SELL") return l >= t;
     return l <= t;
+  }
+
+  // =========================
+  // TARGET fill watchdog (LIMIT target chase)
+  // =========================
+  _isTargetWatchdogEnabled() {
+    return String(env.TARGET_WATCHDOG_ENABLED || "true") !== "false";
+  }
+
+  _clearTargetWatch(tradeId) {
+    try {
+      const id = String(tradeId || "");
+      const st = this._targetWatch.get(id);
+      if (st?.timer) clearTimeout(st.timer);
+      this._targetWatch.delete(id);
+    } catch {}
+  }
+
+  _registerTargetWatchFromTrade(trade) {
+    try {
+      if (!this._isTargetWatchdogEnabled()) return;
+      const tradeId = String(trade?.tradeId || "");
+      if (!tradeId) return;
+      if (trade?.targetVirtual) return;
+
+      const targetOrderId = trade?.targetOrderId
+        ? String(trade.targetOrderId)
+        : null;
+      if (!targetOrderId) return;
+
+      const orderType = String(trade?.targetOrderType || "").toUpperCase();
+      if (orderType && orderType === "MARKET") return;
+
+      const token = Number(trade?.instrument_token);
+      const targetPrice =
+        Number(trade?.targetPrice) || this._computeTargetPrice(trade);
+      if (
+        !Number.isFinite(token) ||
+        !Number.isFinite(targetPrice) ||
+        targetPrice <= 0
+      )
+        return;
+
+      const side = String(trade?.side || "BUY").toUpperCase();
+      const exitSide = side === "BUY" ? "SELL" : "BUY";
+
+      const existing = this._targetWatch.get(tradeId) || {};
+      this._targetWatch.set(tradeId, {
+        ...existing,
+        tradeId,
+        token,
+        side,
+        exitSide,
+        targetPrice,
+        targetOrderId,
+        orderType: orderType || "LIMIT",
+        triggeredAtMs: existing.triggeredAtMs || 0,
+        lastActionAtMs: existing.lastActionAtMs || 0,
+        retryCount: Number(existing.retryCount || 0),
+        lastLtp: existing.lastLtp || null,
+        timer: existing.timer || null,
+      });
+    } catch {}
+  }
+
+  _targetWatchIsHit(ltp, targetPrice, exitSide) {
+    const l = Number(ltp);
+    const t = Number(targetPrice);
+    if (!Number.isFinite(l) || !Number.isFinite(t) || t <= 0) return false;
+
+    const bufBps = Number(env.TARGET_WATCHDOG_TRIGGER_BPS_BUFFER || 2);
+    const b = Number.isFinite(bufBps) ? bufBps : 0;
+    const factor = b > 0 ? b / 10000 : 0;
+
+    if (String(exitSide).toUpperCase() === "SELL") {
+      return l >= t * (1 + factor);
+    }
+    return l <= t * (1 - factor);
+  }
+
+  _armTargetWatchTimer(tradeId, st, openSec) {
+    if (!st) return;
+    if (st.timer) clearTimeout(st.timer);
+    const ms = Math.max(500, Number(openSec || 2) * 1000);
+    st.timer = setTimeout(() => {
+      this._targetWatchdogFire(tradeId, "timeout").catch(() => {});
+    }, ms);
+    this._targetWatch.set(tradeId, st);
+  }
+
+  _maybeTriggerTargetWatchFromTick(token, ltp, nowMs) {
+    if (!this._isTargetWatchdogEnabled()) return;
+    if (!this.activeTradeId) return;
+
+    const tradeId = String(this.activeTradeId);
+    const st = this._targetWatch.get(tradeId);
+    if (!st) return;
+    if (Number(st.token) !== Number(token)) return;
+    if (!Number.isFinite(Number(ltp))) return;
+
+    st.lastLtp = Number(ltp);
+    this._targetWatch.set(tradeId, st);
+
+    const requireTouch =
+      String(env.TARGET_WATCHDOG_REQUIRE_LTP_TOUCH || "true") !== "false";
+    const hit = this._targetWatchIsHit(ltp, st.targetPrice, st.exitSide);
+
+    if (requireTouch && !hit) return;
+
+    if (!st.triggeredAtMs) {
+      st.triggeredAtMs = Number(nowMs || Date.now());
+      this._targetWatch.set(tradeId, st);
+      try {
+        updateTrade(tradeId, {
+          targetTouchedAt: new Date(st.triggeredAtMs),
+        }).catch(() => {});
+      } catch {}
+
+      const openSec = Number(env.TARGET_WATCHDOG_OPEN_SEC || 2);
+      this._armTargetWatchTimer(tradeId, st, openSec);
+    }
+  }
+
+  _targetWatchdogHeartbeat(trade, netQty, source = "reconcile") {
+    try {
+      if (!this._isTargetWatchdogEnabled()) return;
+      const tradeId = String(trade?.tradeId || "");
+      if (!tradeId) return;
+
+      if (!Number.isFinite(Number(netQty)) || Number(netQty) === 0) {
+        this._clearTargetWatch(tradeId);
+        return;
+      }
+
+      this._registerTargetWatchFromTrade(trade);
+      const st = this._targetWatch.get(tradeId);
+      if (!st) return;
+
+      const openSec = Number(env.TARGET_WATCHDOG_OPEN_SEC || 2);
+      const nowMs = Date.now();
+
+      if (st.triggeredAtMs) {
+        const overdue = nowMs - Number(st.triggeredAtMs) >= openSec * 1000;
+        if (overdue) {
+          this._targetWatchdogFire(tradeId, `heartbeat_${source}`).catch(
+            () => {},
+          );
+          return;
+        }
+      }
+
+      const ltp = this.lastPriceByToken.get(Number(st.token));
+      if (!Number.isFinite(Number(ltp))) return;
+      this._maybeTriggerTargetWatchFromTick(st.token, ltp, nowMs);
+    } catch {}
+  }
+
+  async _getBestBidAsk(instrument) {
+    const ex = instrument?.exchange || env.DEFAULT_EXCHANGE || "NSE";
+    const sym = instrument?.tradingsymbol;
+    if (!sym || typeof this.kite.getQuote !== "function") return null;
+    const key = `${String(ex).toUpperCase()}:${String(sym).toUpperCase()}`;
+    try {
+      const resp = await this.kite.getQuote([key]);
+      const q = resp?.[key];
+      const bid = Number(q?.depth?.buy?.[0]?.price);
+      const ask = Number(q?.depth?.sell?.[0]?.price);
+      const ltp = Number(q?.last_price);
+      return { bid, ask, ltp };
+    } catch {
+      return null;
+    }
+  }
+
+  async _targetWatchdogFire(tradeId, cause = "timeout") {
+    const id = String(tradeId || "");
+    if (!id) return;
+    if (this._targetWatchdogInFlight.has(id)) return;
+    this._targetWatchdogInFlight.add(id);
+
+    try {
+      if (!this._isTargetWatchdogEnabled()) return;
+      const st = this._targetWatch.get(id);
+      if (!st) return;
+
+      const fresh = await getTrade(id);
+      if (!fresh) return;
+
+      const terminal = [
+        STATUS.EXITED_TARGET,
+        STATUS.EXITED_SL,
+        STATUS.ENTRY_FAILED,
+        STATUS.CLOSED,
+      ];
+      if (terminal.includes(fresh.status)) {
+        this._clearTargetWatch(id);
+        return;
+      }
+
+      const targetOrderId = fresh?.targetOrderId
+        ? String(fresh.targetOrderId)
+        : null;
+      if (!targetOrderId) {
+        this._clearTargetWatch(id);
+        return;
+      }
+
+      const statusInfo = await this._getOrderStatus(targetOrderId);
+      const order = statusInfo?.order || {};
+      const stt = String(statusInfo?.status || "").toUpperCase();
+
+      if (stt === "COMPLETE" || isDead(stt)) {
+        this._clearTargetWatch(id);
+        return;
+      }
+
+      const requireTouch =
+        String(env.TARGET_WATCHDOG_REQUIRE_LTP_TOUCH || "true") !== "false";
+      const breached =
+        !requireTouch ||
+        this._targetWatchIsHit(st.lastLtp, st.targetPrice, st.exitSide);
+
+      if (!breached) {
+        logger.warn(
+          { tradeId: id, cause, lastLtp: st.lastLtp, target: st.targetPrice },
+          "[target_watchdog] fired but touch not confirmed -> reset",
+        );
+        st.triggeredAtMs = 0;
+        if (st.timer) clearTimeout(st.timer);
+        st.timer = null;
+        this._targetWatch.set(id, st);
+        return;
+      }
+
+      const retryCount = Number(st.retryCount || 0);
+      const maxRetries = Math.max(
+        0,
+        Number(env.TARGET_WATCHDOG_MODIFY_RETRIES || 2),
+      );
+      const tick = Number(fresh.instrument?.tick_size || 0.05);
+
+      if (retryCount >= maxRetries) {
+        logger.warn(
+          { tradeId: id, targetOrderId, stt, retryCount, cause },
+          "[target_watchdog] retries exhausted -> cancel & MARKET exit",
+        );
+
+        alert("warn", "⚠️ Target watchdog: MARKET exit (retries exhausted)", {
+          tradeId: id,
+          targetOrderId,
+          retryCount,
+          cause,
+        }).catch(() => {});
+
+        const filledQty = Number(order?.filled_quantity || 0);
+        const totalQty = Number(order?.quantity || fresh.qty || 0);
+        const remainingQty = Math.max(0, totalQty - filledQty);
+
+        if (remainingQty < 1) {
+          this._clearTargetWatch(id);
+          return;
+        }
+
+        try {
+          this.expectedCancelOrderIds.add(String(targetOrderId));
+          await this._safeCancelOrder(env.DEFAULT_ORDER_VARIETY, targetOrderId, {
+            purpose: "TARGET_WATCHDOG_CANCEL",
+            tradeId: id,
+          });
+        } catch {}
+
+        const after = await this._getOrderStatus(targetOrderId);
+        const afterStatus = String(after?.status || "").toUpperCase();
+        if (afterStatus === "COMPLETE") {
+          this._clearTargetWatch(id);
+          return;
+        }
+
+        try {
+          if (fresh.slOrderId) {
+            this.expectedCancelOrderIds.add(String(fresh.slOrderId));
+            await this._safeCancelOrder(
+              env.DEFAULT_ORDER_VARIETY,
+              fresh.slOrderId,
+              {
+                purpose: "TARGET_WATCHDOG_CANCEL_SL",
+                tradeId: id,
+              },
+            );
+          }
+        } catch {}
+
+        const out = await this._safePlaceOrder(
+          env.DEFAULT_ORDER_VARIETY,
+          {
+            exchange: fresh.instrument.exchange,
+            tradingsymbol: fresh.instrument.tradingsymbol,
+            transaction_type: st.exitSide,
+            quantity: remainingQty,
+            product: env.DEFAULT_PRODUCT,
+            order_type: "MARKET",
+            validity: "DAY",
+            tag: makeTag(id, "TARGET"),
+          },
+          { purpose: "TARGET_WATCHDOG_MARKET", tradeId: id },
+        );
+
+        const newOrderId = out.orderId;
+        await updateTrade(id, {
+          targetOrderId: newOrderId,
+          targetOrderType: "MARKET",
+          targetWatchdogConvertedAt: new Date(),
+          targetWatchdogRetryCount: retryCount,
+          targetWatchdogCause: String(cause || "timeout"),
+        });
+        await linkOrder({
+          order_id: String(newOrderId),
+          tradeId: id,
+          role: "TARGET",
+        });
+        await this._replayOrphanUpdates(newOrderId);
+        this._watchExitLeg(id, newOrderId, "TARGET").catch(() => {});
+        this._clearTargetWatch(id);
+        return;
+      }
+
+      const quote = await this._getBestBidAsk(fresh.instrument);
+      const bid = Number(quote?.bid);
+      const ask = Number(quote?.ask);
+      const ltp = Number(quote?.ltp || st.lastLtp || 0);
+
+      let price = null;
+      if (st.exitSide === "SELL") {
+        const base = Number.isFinite(bid) ? bid : ltp;
+        if (Number.isFinite(base)) price = base - tick;
+        if (Number.isFinite(price)) {
+          price = roundToTick(price, tick, "down");
+        }
+      } else {
+        const base = Number.isFinite(ask) ? ask : ltp;
+        if (Number.isFinite(base)) price = base + tick;
+        if (Number.isFinite(price)) {
+          price = roundToTick(price, tick, "up");
+        }
+      }
+
+      if (!Number.isFinite(price) || price <= 0) {
+        st.retryCount = retryCount + 1;
+        this._targetWatch.set(id, st);
+        logger.warn(
+          { tradeId: id, targetOrderId, retryCount, cause },
+          "[target_watchdog] unable to compute marketable price -> retry later",
+        );
+        const openSec = Number(env.TARGET_WATCHDOG_RETRY_SEC || 1);
+        st.triggeredAtMs = Date.now();
+        this._armTargetWatchTimer(id, st, openSec);
+        return;
+      }
+
+      await this._safeModifyOrder(
+        env.DEFAULT_ORDER_VARIETY,
+        targetOrderId,
+        { price },
+        { purpose: "TARGET_WATCHDOG_CHASE", tradeId: id },
+      );
+
+      st.retryCount = retryCount + 1;
+      st.lastActionAtMs = Date.now();
+      this._targetWatch.set(id, st);
+
+      await updateTrade(id, {
+        targetWatchdogLastPrice: price,
+        targetWatchdogRetryCount: st.retryCount,
+        targetWatchdogLastAt: new Date(st.lastActionAtMs),
+        targetWatchdogCause: String(cause || "timeout"),
+      });
+
+      logger.warn(
+        { tradeId: id, targetOrderId, price, retryCount: st.retryCount, cause },
+        "[target_watchdog] target touched -> aggressive modify",
+      );
+
+      const retrySec = Number(env.TARGET_WATCHDOG_RETRY_SEC || 1);
+      st.triggeredAtMs = Date.now();
+      this._armTargetWatchTimer(id, st, retrySec);
+    } catch (e) {
+      logger.error(
+        { tradeId: String(tradeId || ""), e: e?.message || String(e) },
+        "[target_watchdog] error",
+      );
+    } finally {
+      this._targetWatchdogInFlight.delete(id);
+    }
   }
 
   _registerVirtualTargetFromTrade(trade) {
@@ -2715,10 +3117,13 @@ class TradeManager {
           STATUS.CLOSED,
         ].includes(trade.status);
 
-        // SL watchdog heartbeat (handles restarts / tick gaps): if SL-L triggered but not filled -> flatten.
-        try {
-          this._slWatchdogHeartbeat(trade, netQty, source);
-        } catch {}
+    // SL watchdog heartbeat (handles restarts / tick gaps): if SL-L triggered but not filled -> flatten.
+    try {
+      this._slWatchdogHeartbeat(trade, netQty, source);
+    } catch {}
+    try {
+      this._targetWatchdogHeartbeat(trade, netQty, source);
+    } catch {}
 
         if (netQty === 0) {
           // cancel any remaining exits ASAP (reduces accidental re-entry via dangling SL/TGT)
@@ -6286,6 +6691,7 @@ class TradeManager {
 
   async _handleDeadTarget(trade, targetOrder, source) {
     const tradeId = trade.tradeId;
+    this._clearTargetWatch(tradeId);
     const scaleOutEnabled = this._scaleOutEligible(trade);
     const keepTp2Resting =
       scaleOutEnabled &&
@@ -6674,10 +7080,17 @@ class TradeManager {
     await updateTrade(tradeId, {
       targetOrderId,
       targetPrice,
+      targetOrderType: targetParams.order_type,
       targetVirtual: false,
       status: STATUS.LIVE,
     });
     this._clearVirtualTarget(tradeId);
+    this._registerTargetWatchFromTrade({
+      ...trade,
+      targetOrderId,
+      targetPrice,
+      targetOrderType: targetParams.order_type,
+    });
     await linkOrder({
       order_id: String(targetOrderId),
       tradeId,
@@ -6866,12 +7279,19 @@ class TradeManager {
     await updateTrade(tradeId, {
       targetOrderId,
       targetPrice,
+      targetOrderType: params.order_type,
       runnerTargetMode: plan.mode,
       runnerTargetMeta: plan.meta,
       targetVirtual: false,
       status: STATUS.LIVE,
     });
     this._clearVirtualTarget(tradeId);
+    this._registerTargetWatchFromTrade({
+      ...trade,
+      targetOrderId,
+      targetPrice,
+      targetOrderType: params.order_type,
+    });
     await linkOrder({
       order_id: String(targetOrderId),
       tradeId,
@@ -7468,6 +7888,7 @@ class TradeManager {
   }
 
   async _onTargetFilled(tradeId, trade, targetOrder) {
+    this._clearTargetWatch(tradeId);
     // Cancel TP1 if still pending (avoid accidental over-exit)
     if (trade.tp1OrderId && !trade.tp1Done) {
       this.expectedCancelOrderIds.add(String(trade.tp1OrderId));
@@ -7555,6 +7976,7 @@ class TradeManager {
   }
 
   async _onSlFilled(tradeId, trade, slOrder) {
+    this._clearTargetWatch(tradeId);
     // Cancel TP1 if still pending (avoid accidental over-exit)
     if (trade.tp1OrderId && !trade.tp1Done) {
       this.expectedCancelOrderIds.add(String(trade.tp1OrderId));
