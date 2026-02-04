@@ -30,6 +30,7 @@ const { planRunnerTarget } = require("./targetPlanner");
 const { detectRegime } = require("../strategy/selector");
 const { costGate, estimateRoundTripCostInr } = require("./costModel");
 const { costCalibrator } = require("./costCalibrator");
+const { backfillCandles } = require("../market/backfill");
 const { optimizer } = require("../optimizer/adaptiveOptimizer");
 const { equityService } = require("../account/equityService");
 const { buildPositionsSnapshot } = require("./positionService");
@@ -5189,6 +5190,47 @@ class TradeManager {
         // For options, also fetch option-premium candles (premium-aware exits)
         let premiumCandles = null;
         if (s.option_meta) {
+          const backfillEnabled =
+            String(env.OPT_PLAN_PREM_BACKFILL_ENABLED || "true") === "true";
+          if (
+            backfillEnabled &&
+            typeof this.kite?.getHistoricalData === "function"
+          ) {
+            const daysOverride = Number(
+              env.OPT_PLAN_PREM_BACKFILL_DAYS ||
+                env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS_OPT ||
+                env.BACKFILL_DAYS ||
+                3,
+            );
+            try {
+              await backfillCandles({
+                kite: this.kite,
+                instrument_token: token,
+                intervalMin,
+                timezone: env.CANDLE_TZ,
+                daysOverride,
+              });
+              logger.info(
+                { token, intervalMin, daysOverride },
+                "[plan] option premium backfill ok",
+              );
+            } catch (e) {
+              logger.warn(
+                {
+                  token,
+                  intervalMin,
+                  daysOverride,
+                  e: e?.message || String(e),
+                },
+                "[plan] option premium backfill failed",
+              );
+            }
+          } else if (backfillEnabled) {
+            logger.warn(
+              { token, intervalMin },
+              "[plan] option premium backfill skipped (kite unavailable)",
+            );
+          }
           premiumCandles = await getRecentCandles(
             token, // option token (not underlying)
             intervalMin,
