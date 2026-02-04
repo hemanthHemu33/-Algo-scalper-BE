@@ -499,6 +499,76 @@ function buildApp() {
     },
   );
 
+  // PATCH: DB purge (delete all docs except keep list)
+  app.post("/admin/db/purge", requirePerm("admin"), async (req, res) => {
+    try {
+      if (String(env.DB_PURGE_ENABLED || "false") !== "true") {
+        return res.status(403).json({ ok: false, error: "purge_disabled" });
+      }
+
+      const confirm = String(req.body?.confirm || "");
+      if (confirm !== "PURGE") {
+        return res.status(400).json({
+          ok: false,
+          error: "confirm_required",
+          hint: 'send { "confirm": "PURGE" } to proceed',
+        });
+      }
+
+      const keepEnv = String(env.DB_PURGE_KEEP_COLLECTIONS || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      const keepBody = Array.isArray(req.body?.keepCollections)
+        ? req.body.keepCollections
+            .map((s) => String(s || "").trim())
+            .filter(Boolean)
+        : [];
+
+      const keepSet = new Set([...keepEnv, ...keepBody]);
+
+      const dryRun = Boolean(req.body?.dryRun);
+
+      const db = getDb();
+      const collections = await db
+        .listCollections({}, { nameOnly: true })
+        .toArray();
+
+      const results = [];
+      for (const c of collections || []) {
+        const name = c?.name;
+        if (!name) continue;
+        if (name.startsWith("system.")) continue;
+        if (keepSet.has(name)) continue;
+
+        if (dryRun) {
+          const count = await db.collection(name).countDocuments();
+          results.push({ collection: name, deletedCount: 0, count });
+        } else {
+          const out = await db.collection(name).deleteMany({});
+          results.push({ collection: name, deletedCount: out.deletedCount || 0 });
+        }
+      }
+
+      await recordAudit({
+        actor: actorFromReq(req),
+        action: "db_purge",
+        resource: "db",
+        status: "ok",
+        meta: {
+          dryRun,
+          keepCollections: Array.from(keepSet),
+          results,
+        },
+      });
+
+      return res.json({ ok: true, dryRun, keepCollections: Array.from(keepSet), results });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
   // Derivatives universe snapshot (FUT or OPT underlying subscription)
   app.get("/admin/fno", requirePerm("read"), (req, res) => {
     try {
