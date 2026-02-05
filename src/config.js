@@ -325,9 +325,15 @@ const schema = z.object({
   OPT_RUNTIME_SUBSCRIBE_BACKFILL: z.string().default("true"),
   OPT_DYN_EXIT_ALLOW_UNDERLYING_LTP_FETCH: z.string().default("false"),
 
+  // Exit order placement for options: BROKER (default) or VIRTUAL (only SL + virtual target)
+  OPT_TARGET_MODE: z.string().default("BROKER"),
+
   // Virtual target (margin-blocked target fallback)
   VIRTUAL_TARGET_LTP_FETCH_ENABLED: z.string().default("true"),
   VIRTUAL_TARGET_LTP_FETCH_THROTTLE_MS: z.coerce.number().default(1500),
+
+  // Risk fail-safe controls
+  RESET_FAILURES_ON_START: z.string().default("false"),
 
   CANDLE_INTERVALS: z.string().default("1,3"),
   CANDLE_COLLECTION_PREFIX: z.string().default("candles_"),

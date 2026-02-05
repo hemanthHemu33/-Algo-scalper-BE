@@ -402,6 +402,18 @@ class TradeManager {
     );
   }
 
+  _isOptionInstrument(instrument) {
+    const segment = String(instrument?.segment || "").toUpperCase();
+    const type = String(instrument?.instrument_type || "").toUpperCase();
+    const symbol = String(instrument?.tradingsymbol || "").toUpperCase();
+
+    return (
+      segment.includes("-OPT") ||
+      ["CE", "PE", "OPT"].includes(type) ||
+      /(?:CE|PE)$/.test(symbol)
+    );
+  }
+
   _shouldFallbackToVirtualTarget(msg) {
     const s = String(msg || "").toLowerCase();
     return (
@@ -421,6 +433,13 @@ class TradeManager {
     } catch {}
     await this._ensureDailyRisk();
     await this._hydrateRiskStateFromDb();
+    if (String(env.RESET_FAILURES_ON_START || "false") === "true") {
+      this.risk.resetFailures();
+      this.risk.setKillSwitch(false);
+      logger.warn(
+        "[risk] RESET_FAILURES_ON_START enabled: cleared consecutive failures and kill switch",
+      );
+    }
     await this.refreshRiskLimits();
     await this._hydrateRiskFromDb();
     await this._loadActiveTradeId();
@@ -7329,15 +7348,33 @@ class TradeManager {
     return enabled && initQty >= 2 && !trade?.tp1Aborted;
   }
 
-  _computeTp1Qty(totalQty) {
+  _computeTp1Qty(totalQty, lotSize = 1) {
     const total = Number(totalQty);
     if (!Number.isFinite(total) || total < 2) return null;
 
     const pct = Number(env.TP1_QTY_PCT || 50);
     const raw = Math.floor((total * pct) / 100);
-    const tp1Qty = Math.max(1, Math.min(raw, total - 1));
-    const runnerQty = total - tp1Qty;
-    if (runnerQty < 1) return null;
+    const lot = Math.max(1, Number(lotSize) || 1);
+
+    if (lot <= 1) {
+      const tp1Qty = Math.max(1, Math.min(raw, total - 1));
+      const runnerQty = total - tp1Qty;
+      if (runnerQty < 1) return null;
+      return { tp1Qty, runnerQty, pct };
+    }
+
+    if (total % lot !== 0) return null;
+
+    let tp1Qty = Math.floor(raw / lot) * lot;
+    let runnerQty = total - tp1Qty;
+
+    while (tp1Qty > 0 && runnerQty % lot !== 0) {
+      tp1Qty -= lot;
+      runnerQty = total - tp1Qty;
+    }
+
+    if (tp1Qty <= 0 || runnerQty <= 0) return null;
+    if (tp1Qty % lot !== 0 || runnerQty % lot !== 0) return null;
 
     return { tp1Qty, runnerQty, pct };
   }
@@ -7360,7 +7397,10 @@ class TradeManager {
   async _placeTp1Only(trade) {
     const tradeId = trade.tradeId;
     const initQty = Number(trade.initialQty || trade.qty || 0);
-    const sizing = this._computeTp1Qty(initQty);
+    const sizing = this._computeTp1Qty(
+      initQty,
+      Number(trade?.instrument?.lot_size || 1),
+    );
     if (!sizing) throw new Error("SCALE_OUT_NOT_ELIGIBLE");
 
     const tp1Price = this._computeTp1Price(trade);
@@ -7975,6 +8015,19 @@ class TradeManager {
       // place TP1 / TARGET (runner) depending on scale-out stage
       const fresh2 = await getTrade(tradeId);
       if (!fresh2) return;
+
+      const optTargetMode = String(env.OPT_TARGET_MODE || "BROKER").toUpperCase();
+      const isOptInstrument = this._isOptionInstrument(trade?.instrument);
+      if (isOptInstrument && optTargetMode === "VIRTUAL") {
+        if (!fresh2.targetOrderId && !fresh2.targetVirtual) {
+          await this._enableVirtualTarget(
+            { ...trade, ...fresh2 },
+            { reason: "OPT_TARGET_MODE_VIRTUAL", source: "opt_mode" },
+          );
+        }
+        await updateTrade(tradeId, { status: STATUS.LIVE });
+        return;
+      }
 
       const scaleEnabled = String(env.SCALE_OUT_ENABLED) === "true";
       const initQty = Number(fresh2.initialQty || fresh2.qty || trade.qty || 0);
