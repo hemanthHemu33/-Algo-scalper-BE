@@ -8030,6 +8030,15 @@ class TradeManager {
             { reason: "OPT_TARGET_MODE_VIRTUAL", source: "opt_mode" },
           );
         }
+        logger.info(
+          {
+            tradeId,
+            targetPrice: fresh2.targetPrice,
+            targetVirtual: true,
+            optTargetMode,
+          },
+          "[trade] OPT_TARGET_MODE=VIRTUAL -> tracking virtual target",
+        );
         await updateTrade(tradeId, { status: STATUS.LIVE });
         return;
       }
