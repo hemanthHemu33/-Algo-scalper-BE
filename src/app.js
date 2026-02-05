@@ -6,6 +6,11 @@ const {
   getSubscribedTokens,
 } = require("./kite/tickerManager");
 const { isHalted, getHaltInfo, resetHalt } = require("./runtime/halt");
+const {
+  getTradingEnabled,
+  getTradingEnabledSource,
+  setTradingEnabled,
+} = require("./runtime/tradingEnabled");
 const { getDb } = require("./db");
 const { telemetry } = require("./telemetry/signalTelemetry");
 const { tradeTelemetry } = require("./telemetry/tradeTelemetry");
@@ -236,7 +241,9 @@ function buildApp() {
 
   app.get("/admin/config", requirePerm("read"), (req, res) => {
     res.json({
-      tradingEnabled: env.TRADING_ENABLED,
+      tradingEnabled: getTradingEnabled(),
+      tradingEnabledSource: getTradingEnabledSource(),
+      tradingEnabledEnv: env.TRADING_ENABLED,
       tokensCollection: env.TOKENS_COLLECTION,
       tokenFilters: {
         user_id: env.TOKEN_FILTER_USER_ID || null,
@@ -251,6 +258,40 @@ function buildApp() {
       signalIntervals: env.SIGNAL_INTERVALS,
       reconcileIntervalSec: env.RECONCILE_INTERVAL_SEC,
     });
+  });
+
+  app.get("/admin/trading", requirePerm("read"), (req, res) => {
+    res.json({
+      ok: true,
+      tradingEnabled: getTradingEnabled(),
+      source: getTradingEnabledSource(),
+    });
+  });
+
+  app.post("/admin/trading", requirePerm("trade"), async (req, res) => {
+    const raw = req.query?.enabled ?? req.body?.enabled;
+    if (typeof raw === "undefined") {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_enabled",
+        hint: "send enabled=true|false",
+      });
+    }
+
+    const enabled = String(raw) === "true";
+    try {
+      const status = setTradingEnabled(enabled);
+      await recordAudit({
+        actor: actorFromReq(req),
+        action: "trading_enabled",
+        resource: "trading",
+        status: "ok",
+        meta: { enabled: status.enabled, source: status.source },
+      });
+      return res.json({ ok: true, ...status });
+    } catch (e) {
+      return res.status(503).json({ ok: false, error: e?.message || String(e) });
+    }
   });
 
   app.get("/ready", async (req, res) => {

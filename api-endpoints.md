@@ -159,6 +159,8 @@ app.use("/admin", buildAdminAuth());
 ```json
 {
   "tradingEnabled": true,
+  "tradingEnabledSource": "runtime",
+  "tradingEnabledEnv": "false",
   "tokensCollection": "tokens",
   "tokenFilters": {
     "user_id": null,
@@ -177,6 +179,38 @@ app.use("/admin", buildAdminAuth());
 
 ---
 
+### `GET /admin/trading`
+
+**Purpose:** Fetch current trading enablement (runtime override or env default).
+
+**200**
+
+```json
+{
+  "ok": true,
+  "tradingEnabled": true,
+  "source": "runtime"
+}
+```
+
+---
+
+### `POST /admin/trading?enabled=true|false`
+
+**Purpose:** Enable/disable trading at runtime (overrides env until restart).
+
+**200**
+
+```json
+{
+  "ok": true,
+  "enabled": false,
+  "source": "runtime"
+}
+```
+
+---
+
 ### `GET /admin/status`
 
 **Purpose:** Overall status (pipeline + ticker + halt info).
@@ -187,6 +221,7 @@ app.use("/admin", buildAdminAuth());
 {
   "ok": true,
   "tradingEnabled": true,
+  "tradingEnabledSource": "runtime",
   "killSwitch": false,
   "tradesToday": 0,
   "activeTradeId": null,
