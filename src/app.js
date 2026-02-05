@@ -918,9 +918,30 @@ function buildApp() {
   });
 
   // Telemetry endpoints (signal observability)
-  app.get("/admin/telemetry/snapshot", requirePerm("read"), (req, res) => {
-    res.json({ ok: true, data: telemetry.snapshot() });
-  });
+  app.get(
+    "/admin/telemetry/snapshot",
+    requirePerm("read"),
+    async (req, res) => {
+      const snapshot = telemetry.snapshot();
+      const isEmpty =
+        Number(snapshot.candidatesTotal || 0) === 0 &&
+        Number(snapshot.decisionsTotal || 0) === 0 &&
+        Number(snapshot.blockedTotal || 0) === 0;
+
+      if (!isEmpty) {
+        res.json({ ok: true, source: "memory", data: snapshot });
+        return;
+      }
+
+      const doc = await telemetry.readDailyFromDb(snapshot.dayKey);
+      if (doc) {
+        res.json({ ok: true, source: "db", data: doc });
+        return;
+      }
+
+      res.json({ ok: true, source: "memory", data: snapshot });
+    },
+  );
 
   app.post("/admin/telemetry/flush", requirePerm("admin"), async (req, res) => {
     try {
