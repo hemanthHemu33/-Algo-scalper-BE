@@ -332,6 +332,9 @@ const schema = z.object({
   VIRTUAL_TARGET_LTP_FETCH_ENABLED: z.string().default("true"),
   VIRTUAL_TARGET_LTP_FETCH_THROTTLE_MS: z.coerce.number().default(1500),
 
+  // Risk fail-safe controls
+  RESET_FAILURES_ON_START: z.string().default("false"),
+
   CANDLE_INTERVALS: z.string().default("1,3"),
   CANDLE_COLLECTION_PREFIX: z.string().default("candles_"),
   CANDLE_TZ: z.string().default("Asia/Kolkata"),

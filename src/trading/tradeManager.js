@@ -433,6 +433,13 @@ class TradeManager {
     } catch {}
     await this._ensureDailyRisk();
     await this._hydrateRiskStateFromDb();
+    if (String(env.RESET_FAILURES_ON_START || "false") === "true") {
+      this.risk.resetFailures();
+      this.risk.setKillSwitch(false);
+      logger.warn(
+        "[risk] RESET_FAILURES_ON_START enabled: cleared consecutive failures and kill switch",
+      );
+    }
     await this.refreshRiskLimits();
     await this._hydrateRiskFromDb();
     await this._loadActiveTradeId();
