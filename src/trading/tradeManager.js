@@ -418,6 +418,79 @@ class TradeManager {
     );
   }
 
+  _isOptTargetModeVirtual(trade) {
+    const optTargetMode = String(env.OPT_TARGET_MODE || "BROKER").toUpperCase();
+    return optTargetMode === "VIRTUAL" && this._isOptionInstrument(trade?.instrument);
+  }
+
+  async _enforceOptVirtualTargetMode(trade, source = "opt_mode") {
+    try {
+      if (!this._isOptTargetModeVirtual(trade)) return { applied: false };
+
+      const tradeId = String(trade?.tradeId || "");
+      if (!tradeId) return { applied: false };
+
+      const qty = Number(trade?.qty || 0);
+      if (!Number.isFinite(qty) || qty <= 0) return { applied: false };
+
+      const targetOrderId = trade?.targetOrderId
+        ? String(trade.targetOrderId)
+        : null;
+      const targetOrderType = String(trade?.targetOrderType || "").toUpperCase();
+      const targetIsVirtualMarket =
+        trade?.targetVirtual && targetOrderId && targetOrderType === "MARKET";
+
+      let changed = false;
+      let targetOrderCleared = false;
+
+      if (targetOrderId && !targetIsVirtualMarket) {
+        try {
+          this.expectedCancelOrderIds.add(String(targetOrderId));
+        } catch {}
+        try {
+          await this._safeCancelOrder(
+            env.DEFAULT_ORDER_VARIETY,
+            targetOrderId,
+            {
+              purpose: "OPT_TARGET_MODE_VIRTUAL_CANCEL",
+              tradeId,
+            },
+          );
+        } catch (e) {
+          logger.warn(
+            { tradeId, targetOrderId, e: e?.message || String(e) },
+            "[opt_mode] failed to cancel broker target; continuing with virtual target",
+          );
+        }
+        await updateTrade(tradeId, {
+          targetOrderId: null,
+          targetOrderType: null,
+        });
+        this._clearTargetWatch(tradeId);
+        changed = true;
+        targetOrderCleared = true;
+      }
+
+      if (!trade?.targetVirtual) {
+        await this._enableVirtualTarget(trade, {
+          reason: "OPT_TARGET_MODE_VIRTUAL",
+          source,
+        });
+        changed = true;
+      } else {
+        this._registerVirtualTargetFromTrade(trade);
+      }
+
+      return { applied: changed, targetOrderCleared };
+    } catch (e) {
+      logger.warn(
+        { tradeId: trade?.tradeId, e: e?.message || String(e), source },
+        "[opt_mode] enforce virtual target failed",
+      );
+      return { applied: false, error: e?.message || String(e) };
+    }
+  }
+
   _shouldFallbackToVirtualTarget(msg) {
     const s = String(msg || "").toLowerCase();
     return (
@@ -3363,6 +3436,19 @@ class TradeManager {
     const hasPosInfo = posQtyByToken instanceof Map;
     const netQty = hasPosInfo ? Number(posQtyByToken.get(token) || 0) : null;
 
+    await this._virtualTargetHeartbeat(trade, netQty, "reconcile");
+    const optEnforced = await this._enforceOptVirtualTargetMode(
+      trade,
+      "reconcile",
+    );
+    if (optEnforced?.targetOrderCleared) {
+      trade.targetOrderId = null;
+      trade.targetOrderType = null;
+    }
+    if (optEnforced?.applied && !trade?.targetVirtual) {
+      trade.targetVirtual = true;
+    }
+
     const panic = trade.panicExitOrderId
       ? byId.get(String(trade.panicExitOrderId))
       : null;
@@ -3374,8 +3460,6 @@ class TradeManager {
       ? byId.get(String(trade.targetOrderId))
       : null;
     const tp1 = trade.tp1OrderId ? byId.get(String(trade.tp1OrderId)) : null;
-
-    await this._virtualTargetHeartbeat(trade, netQty, "reconcile");
 
     // If broker shows NO position but trade thinks it's live/filled, someone manually exited
     // (or RMS square-off happened). Treat as a critical safety event: kill-switch + close trade.
@@ -8021,21 +8105,17 @@ class TradeManager {
       const fresh2 = await getTrade(tradeId);
       if (!fresh2) return;
 
-      const optTargetMode = String(env.OPT_TARGET_MODE || "BROKER").toUpperCase();
-      const isOptInstrument = this._isOptionInstrument(trade?.instrument);
-      if (isOptInstrument && optTargetMode === "VIRTUAL") {
-        if (!fresh2.targetOrderId && !fresh2.targetVirtual) {
-          await this._enableVirtualTarget(
-            { ...trade, ...fresh2 },
-            { reason: "OPT_TARGET_MODE_VIRTUAL", source: "opt_mode" },
-          );
-        }
+      if (this._isOptTargetModeVirtual(trade)) {
+        await this._enforceOptVirtualTargetMode(
+          { ...trade, ...fresh2 },
+          "opt_mode",
+        );
         logger.info(
           {
             tradeId,
             targetPrice: fresh2.targetPrice,
             targetVirtual: true,
-            optTargetMode,
+            optTargetMode: "VIRTUAL",
           },
           "[trade] OPT_TARGET_MODE=VIRTUAL -> tracking virtual target",
         );
