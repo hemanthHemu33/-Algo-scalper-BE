@@ -126,6 +126,18 @@ function worseSlippageInr({ side, expected, actual, qty, leg }) {
   return diff > 0 ? diff * q : 0;
 }
 
+function toFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function averageAbsoluteBps(a, b) {
+  const n1 = Number(a);
+  const n2 = Number(b);
+  if (!Number.isFinite(n1) || !Number.isFinite(n2)) return null;
+  return (Math.abs(n1) + Math.abs(n2)) / 2;
+}
+
 class TradeManager {
   constructor({ kite, riskEngine }) {
     this.kite = kite;
@@ -6130,7 +6142,12 @@ class TradeManager {
       initialStopLoss: stopLoss,
       quoteAtEntry,
       expectedEntryPrice,
+      entrySpread: toFiniteNumber(quoteAtEntry?.bps),
+      spreadAtEntry: toFiniteNumber(quoteAtEntry?.bps),
+      spread: null,
       regimeMeta: reg?.meta || null,
+      regime: reg?.meta?.regime || null,
+      marketRegime: reg?.meta?.regime || null,
       costMeta: edge?.meta || null,
       // planned risk cap used for sizing / gating (₹)
       riskInr: Number(_riskInrOverride || env.RISK_PER_TRADE_INR || 0),
@@ -6138,6 +6155,13 @@ class TradeManager {
       maxEntrySlippageBps: maxEntrySlipBps,
       maxEntrySlippageKillBps: maxEntrySlipKillBps,
       entrySlippageBps: null,
+      entrySlippage: null,
+      exitSlippage: null,
+      slippage: null,
+      mae: null,
+      mfe: null,
+      maxAdverseExcursion: null,
+      maxFavorableExcursion: null,
       rr: rrTarget,
       plannedTargetPrice: plannedTargetPrice || null,
       planMeta: planMeta || null,
@@ -6493,6 +6517,8 @@ class TradeManager {
           entryPrice: avg,
           qty: filledQty,
           entrySlippageBps: slipBps,
+          entrySlippage: slipBps,
+          slippage: averageAbsoluteBps(slipBps, trade.exitSlippageBpsWorse),
         });
 
         // Slippage guard (primarily for MARKET entries). Options are noisier; thresholds are segment-aware.
@@ -7809,6 +7835,11 @@ class TradeManager {
         exitQuoteAt: tp1QuoteAt,
         exitSlippageBpsWorse: tp1SlippageBpsWorse,
         exitSlippageInrWorse: tp1SlippageInrWorse,
+        exitSlippage: tp1SlippageBpsWorse,
+        slippage: averageAbsoluteBps(
+          fresh.entrySlippageBps ?? fresh.entrySlippage,
+          tp1SlippageBpsWorse,
+        ),
         closeReason: "TP1_FULL_EXIT",
       });
       await this._bookRealizedPnl(tradeId);
@@ -8341,6 +8372,11 @@ class TradeManager {
       exitQuoteAt,
       exitSlippageBpsWorse,
       exitSlippageInrWorse,
+      exitSlippage: exitSlippageBpsWorse,
+      slippage: averageAbsoluteBps(
+        trade.entrySlippageBps ?? trade.entrySlippage,
+        exitSlippageBpsWorse,
+      ),
       closeReason: "TARGET_HIT",
     });
     alert("info", "🏁 TARGET HIT", { tradeId, exitPrice }).catch(() => {});
@@ -8425,6 +8461,11 @@ class TradeManager {
       exitQuoteAt,
       exitSlippageBpsWorse,
       exitSlippageInrWorse,
+      exitSlippage: exitSlippageBpsWorse,
+      slippage: averageAbsoluteBps(
+        trade.entrySlippageBps ?? trade.entrySlippage,
+        exitSlippageBpsWorse,
+      ),
       closeReason: "SL_HIT",
     });
     alert("warn", "🛑 SL HIT", { tradeId, exitPrice }).catch(() => {});
@@ -8611,6 +8652,7 @@ class TradeManager {
         pnlExpectedInr,
         pnlSlippageDeltaInr,
         spreadBpsUsed,
+        spread: spreadBpsUsed,
         pnlNetAfterEstCostsInr: netAfterEstCostsInr,
         estCostsInr: estCostInr,
         feeMultiple,
