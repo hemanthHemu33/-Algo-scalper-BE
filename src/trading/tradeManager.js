@@ -2,6 +2,10 @@
 const crypto = require("crypto");
 const { DateTime } = require("luxon");
 const { env } = require("../config");
+const {
+  getTradingEnabled,
+  getTradingEnabledSource,
+} = require("../runtime/tradingEnabled");
 const { logger } = require("../logger");
 const { telemetry } = require("../telemetry/signalTelemetry");
 const { tradeTelemetry } = require("../telemetry/tradeTelemetry");
@@ -4940,14 +4944,15 @@ class TradeManager {
       return;
     }
 
-    if (String(env.TRADING_ENABLED) !== "true") {
+    if (!getTradingEnabled()) {
       logger.info(
         {
           token: signal.instrument_token,
           side: signal.side,
           reason: signal.reason,
+          source: getTradingEnabledSource(),
         },
-        "[trade] dry-run (TRADING_ENABLED=false)",
+        "[trade] dry-run (trading disabled)",
       );
       return;
     }
@@ -8646,7 +8651,8 @@ class TradeManager {
       : null;
     const risk = await getDailyRisk(todayKey());
     return {
-      tradingEnabled: String(env.TRADING_ENABLED) === "true",
+      tradingEnabled: getTradingEnabled(),
+      tradingEnabledSource: getTradingEnabledSource(),
       killSwitch: this.risk.getKillSwitch(),
       tradesToday: this.risk.tradesToday,
       activeTradeId: this.activeTradeId,
