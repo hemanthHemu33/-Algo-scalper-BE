@@ -8119,6 +8119,10 @@ class TradeManager {
           },
           "[trade] OPT_TARGET_MODE=VIRTUAL -> tracking virtual target",
         );
+        alert("info", "🎯 OPT_TARGET_MODE=VIRTUAL -> tracking virtual target", {
+          tradeId,
+          targetPrice: fresh2.targetPrice,
+        }).catch(() => {});
         await updateTrade(tradeId, { status: STATUS.LIVE });
         return;
       }
