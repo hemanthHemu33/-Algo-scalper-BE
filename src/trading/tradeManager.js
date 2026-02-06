@@ -32,7 +32,11 @@ const { OrderRateLimiter } = require("./orderRateLimiter");
 const { computeDynamicExitPlan } = require("./dynamicExitManager");
 const { planRunnerTarget } = require("./targetPlanner");
 const { detectRegime } = require("../strategy/selector");
-const { costGate, estimateRoundTripCostInr } = require("./costModel");
+const {
+  costGate,
+  estimateRoundTripCostInr,
+  estimateMinGreen,
+} = require("./costModel");
 const { costCalibrator } = require("./costCalibrator");
 const { backfillCandles } = require("../market/backfill");
 const { optimizer } = require("../optimizer/adaptiveOptimizer");
@@ -137,6 +141,7 @@ class TradeManager {
     }
 
     this.lastPriceByToken = new Map(); // token -> ltp
+    this.lastTickAtByToken = new Map(); // token -> ts
     this.activeTradeId = null; // single-stock mode
     this.recoveredPosition = null; // set when positions exist but trade state missing
 
@@ -180,6 +185,9 @@ class TradeManager {
 
     // Dynamic exit adjustments (trail SL / adjust target)
     this._dynExitLastAt = new Map(); // tradeId -> last adjust ts
+    this._lastOrdersById = new Map(); // last broker order map (reconcile)
+    this._exitLoopTimer = null;
+    this._exitLoopInFlight = false;
 
     // Injected by pipeline: runtime token subscription (needed for OPT mode correctness)
     this.runtimeAddTokens = null;
@@ -324,8 +332,6 @@ class TradeManager {
       .toUpperCase()
       .trim();
 
-    // Safety: default to SL for derivatives if misconfigured
-    if (isDeriv && raw === "SL-M") return "SL";
     if (raw === "SL" || raw === "SL-M") return raw;
 
     // Fallbacks
@@ -369,6 +375,34 @@ class TradeManager {
       px = Number.isFinite(tick) && tick > 0 ? tick : 0.05;
 
     return px;
+  }
+
+  _computeRiskStopLoss({ entryPrice, side, instrument, qty, riskInr }) {
+    const entry = Number(entryPrice);
+    const baseRisk = Number(riskInr || env.RISK_PER_TRADE_INR || 0);
+    const lotSize = Number(
+      instrument?.lot_size || instrument?.lotSize || qty || 1,
+    );
+    const safeLot = Number.isFinite(lotSize) && lotSize > 0 ? lotSize : 1;
+    const riskPts = safeLot > 0 ? baseRisk / safeLot : 0;
+    const tick = Number(instrument?.tick_size || 0.05);
+    const raw =
+      String(side || "BUY").toUpperCase() === "BUY"
+        ? entry - riskPts
+        : entry + riskPts;
+    const stopLoss = roundToTick(
+      raw,
+      tick,
+      String(side || "BUY").toUpperCase() === "BUY" ? "down" : "up",
+    );
+
+    return {
+      stopLoss,
+      riskPts,
+      riskInr: riskPts * safeLot,
+      lotSize: safeLot,
+      tick,
+    };
   }
 
   _isSlmBlockedError(msg) {
@@ -521,6 +555,32 @@ class TradeManager {
     await this._hydrateRiskFromDb();
     await this._loadActiveTradeId();
     await this._hydrateOpenPositionFromActiveTrade();
+    this._startExitLoop();
+  }
+
+  _startExitLoop() {
+    if (this._exitLoopTimer) return;
+    const everyMs = Number(env.EXIT_LOOP_MS || 0);
+    if (!Number.isFinite(everyMs) || everyMs <= 0) return;
+
+    this._exitLoopTimer = setInterval(() => {
+      this._exitLoopTick().catch(() => {});
+    }, Math.max(250, everyMs));
+  }
+
+  async _exitLoopTick() {
+    if (this._exitLoopInFlight) return;
+    this._exitLoopInFlight = true;
+    try {
+      if (!this.activeTradeId) return;
+      const trade = await getTrade(this.activeTradeId);
+      if (!trade) return;
+      if (![STATUS.ENTRY_FILLED, STATUS.LIVE].includes(trade.status)) return;
+
+      await this._maybeDynamicAdjustExits(trade, this._lastOrdersById);
+    } finally {
+      this._exitLoopInFlight = false;
+    }
   }
 
   async _ensureDailyRisk() {
@@ -532,13 +592,54 @@ class TradeManager {
         kill: false,
         reason: null,
         ordersPlaced: 0,
+        state: "RUNNING",
+        stateReason: null,
       });
       return;
     }
     // Backfill newer fields
     const patch = {};
     if (cur.ordersPlaced == null) patch.ordersPlaced = 0;
+    if (!cur.state) patch.state = "RUNNING";
+    if (cur.stateReason === undefined) patch.stateReason = null;
     if (Object.keys(patch).length) await upsertDailyRisk(key, patch);
+  }
+
+  async _updateDailyPnlState({ realized, openPnl, total, prevState }) {
+    const lossCap = Number(
+      (this.risk?.getLimits?.().dailyLossCapInr ?? env.DAILY_MAX_LOSS_INR) || 0,
+    );
+    const profitGoal = Number(env.DAILY_PROFIT_GOAL_INR || 0);
+
+    let state = "RUNNING";
+    let reason = null;
+
+    if (Number.isFinite(lossCap) && lossCap > 0 && total <= -lossCap) {
+      state = "HARD_STOP";
+      reason = "DAILY_MAX_LOSS";
+    } else if (
+      Number.isFinite(profitGoal) &&
+      profitGoal > 0 &&
+      total >= profitGoal
+    ) {
+      state = "SOFT_STOP";
+      reason = "DAILY_PROFIT_GOAL";
+    }
+
+    const patch = {
+      lastRealizedPnl: realized,
+      lastOpenPnl: openPnl,
+      lastTotal: total,
+      state,
+      stateReason: reason,
+    };
+    if (state !== String(prevState || "RUNNING")) {
+      patch.stateUpdatedAt = new Date();
+    }
+
+    await upsertDailyRisk(todayKey(), patch);
+
+    return { state, reason };
   }
 
   async _hydrateRiskFromDb() {
@@ -730,6 +831,7 @@ class TradeManager {
     if (Number.isFinite(ltp)) this.lastPriceByToken.set(token, ltp);
 
     const now = Date.now();
+    this.lastTickAtByToken.set(token, now);
 
     const lossEveryMs = Number(env.DAILY_LOSS_CHECK_MS || 2000);
     if (
@@ -1921,7 +2023,15 @@ class TradeManager {
   async _getLtp(token, instrument) {
     const tok = Number(token);
     const cached = this.lastPriceByToken.get(tok);
-    if (Number.isFinite(cached)) return cached;
+    const staleMs = Number(env.STALE_TICK_MS || 0);
+    const lastTickAt = Number(this.lastTickAtByToken.get(tok) || 0);
+    const isStale =
+      Number.isFinite(staleMs) &&
+      staleMs > 0 &&
+      lastTickAt > 0 &&
+      Date.now() - lastTickAt > staleMs;
+
+    if (Number.isFinite(cached) && !isStale) return cached;
 
     const ex = instrument?.exchange || env.DEFAULT_EXCHANGE || "NSE";
     const sym = instrument?.tradingsymbol;
@@ -1934,6 +2044,7 @@ class TradeManager {
         const ltp = Number(resp?.[key]?.last_price);
         if (Number.isFinite(ltp)) {
           this.lastPriceByToken.set(tok, ltp);
+          this.lastTickAtByToken.set(tok, Date.now());
           return ltp;
         }
       }
@@ -1942,6 +2053,7 @@ class TradeManager {
         const ltp = Number(resp?.[key]?.last_price);
         if (Number.isFinite(ltp)) {
           this.lastPriceByToken.set(tok, ltp);
+          this.lastTickAtByToken.set(tok, Date.now());
           return ltp;
         }
       }
@@ -1991,20 +2103,30 @@ class TradeManager {
     const realized = Number(day?.realizedPnl || 0);
     const total = realized + openPnl;
 
-    const lossCap = Number(
-      (this.risk?.getLimits?.().dailyLossCapInr ?? env.DAILY_MAX_LOSS_INR) ||
-        1000,
-    );
-    if (Number.isFinite(lossCap) && total <= -lossCap) {
+    const prevState = day?.state || "RUNNING";
+    const { state } = await this._updateDailyPnlState({
+      realized,
+      openPnl,
+      total,
+      prevState,
+    });
+
+    if (state === "HARD_STOP") {
+      const lossCap = Number(
+        (this.risk?.getLimits?.().dailyLossCapInr ?? env.DAILY_MAX_LOSS_INR) ||
+          1000,
+      );
       logger.error(
         { total, realized, openPnl },
         "[risk] DAILY_MAX_LOSS hit -> kill switch",
       );
-      alert("error", "🛑 DAILY_MAX_LOSS hit -> kill switch", {
-        total,
-        realized,
-        openPnl,
-      }).catch(() => {});
+      if (prevState !== "HARD_STOP") {
+        alert("error", "🛑 DAILY_MAX_LOSS hit -> kill switch", {
+          total,
+          realized,
+          openPnl,
+        }).catch(() => {});
+      }
       this.risk.setKillSwitch(true);
       await upsertDailyRisk(todayKey(), {
         kill: true,
@@ -2014,6 +2136,18 @@ class TradeManager {
 
       if (String(env.AUTO_EXIT_ON_DAILY_LOSS) === "true") {
         await this._panicExit(trade, "DAILY_MAX_LOSS");
+      }
+    } else if (state === "SOFT_STOP") {
+      if (prevState !== "SOFT_STOP") {
+        logger.warn(
+          { total, realized, openPnl },
+          "[risk] DAILY_PROFIT_GOAL reached -> soft stop entries",
+        );
+        alert("info", "✅ DAILY_PROFIT_GOAL reached -> soft stop entries", {
+          total,
+          realized,
+          openPnl,
+        }).catch(() => {});
       }
     }
   }
@@ -3027,6 +3161,7 @@ class TradeManager {
     const byId = new Map(
       (orders || []).map((o) => [String(o.order_id || o.orderId), o]),
     );
+    this._lastOrdersById = byId;
 
     // 2) Read positions (net positions)
     let positions = null;
@@ -3803,11 +3938,21 @@ class TradeManager {
       return;
     }
 
+    if (plan?.tradePatch && Object.keys(plan.tradePatch).length) {
+      try {
+        await updateTrade(tradeId, plan.tradePatch);
+      } catch {}
+    }
+
     let did = false;
 
     // ---- SL trail (SL / SL-M) ----
     if (plan.sl?.stopLoss && trade.slOrderId) {
-      const sl = byId?.get(String(trade.slOrderId));
+      let sl = byId?.get(String(trade.slOrderId));
+      if (!sl) {
+        const statusInfo = await this._getOrderStatus(trade.slOrderId);
+        sl = statusInfo?.order || null;
+      }
       const slStatus = String(sl?.status || "").toUpperCase();
       const slType = String(sl?.order_type || "").toUpperCase();
 
@@ -3831,7 +3976,10 @@ class TradeManager {
             patch,
             { purpose: "DYN_TRAIL_SL", tradeId },
           );
-          await updateTrade(tradeId, { stopLoss: plan.sl.stopLoss });
+          await updateTrade(tradeId, {
+            stopLoss: plan.sl.stopLoss,
+            slTrigger: plan.sl.stopLoss,
+          });
           try {
             this._updateSlWatchTrigger(tradeId, plan.sl.stopLoss);
           } catch {}
@@ -3851,7 +3999,11 @@ class TradeManager {
 
     // ---- TARGET adjust (LIMIT) ----
     if (!keepTp2Resting && plan.target?.targetPrice && trade.targetOrderId) {
-      const tgt = byId?.get(String(trade.targetOrderId));
+      let tgt = byId?.get(String(trade.targetOrderId));
+      if (!tgt) {
+        const statusInfo = await this._getOrderStatus(trade.targetOrderId);
+        tgt = statusInfo?.order || null;
+      }
       const tgtStatus = String(tgt?.status || "").toUpperCase();
       const tgtType = String(tgt?.order_type || "").toUpperCase();
       // Only modify an open LIMIT target (market targets can't be modified meaningfully)
@@ -5204,6 +5356,16 @@ class TradeManager {
           }
         : null,
     });
+    const dailyRisk = await getDailyRisk(todayKey());
+    const dailyState = String(dailyRisk?.state || "RUNNING");
+    if (dailyState === "SOFT_STOP") {
+      logger.warn({ token, dailyState }, "[trade] blocked (daily soft stop)");
+      return;
+    }
+    if (dailyState === "HARD_STOP") {
+      logger.warn({ token, dailyState }, "[trade] blocked (daily hard stop)");
+      return;
+    }
     const check = this.risk.canTrade(token);
     if (!check.ok) {
       logger.info({ token, reason: check.reason }, "[trade] blocked");
@@ -6113,6 +6275,24 @@ class TradeManager {
       return;
     }
 
+    const minGreenEnabled =
+      String(env.MIN_GREEN_ENABLED || "true") === "true";
+    const minGreen = minGreenEnabled
+      ? estimateMinGreen({
+          entryPrice: expectedEntryPrice,
+          qty,
+          spreadBps: Number(sp?.meta?.bps || 0),
+          env,
+          instrument,
+        })
+      : {
+          estChargesInr: 0,
+          slippageBufferInr: 0,
+          minGreenInr: 0,
+          minGreenPts: 0,
+          meta: null,
+        };
+
     const tradeId = crypto.randomUUID();
     const trade = {
       tradeId,
@@ -6128,10 +6308,20 @@ class TradeManager {
       option_meta: s.option_meta || null,
       stopLoss,
       initialStopLoss: stopLoss,
+      slTrigger: stopLoss,
+      beLocked: false,
+      peakLtp: null,
+      trailSl: null,
+      entryFilledAt: null,
+      timeStopAt: null,
       quoteAtEntry,
       expectedEntryPrice,
       regimeMeta: reg?.meta || null,
       costMeta: edge?.meta || null,
+      estChargesInr: minGreen.estChargesInr,
+      slippageBufferInr: minGreen.slippageBufferInr,
+      minGreenInr: minGreen.minGreenInr,
+      minGreenPts: minGreen.minGreenPts,
       // planned risk cap used for sizing / gating (₹)
       riskInr: Number(_riskInrOverride || env.RISK_PER_TRADE_INR || 0),
       entryOrderType,
@@ -6493,6 +6683,7 @@ class TradeManager {
           entryPrice: avg,
           qty: filledQty,
           entrySlippageBps: slipBps,
+          entryFilledAt: new Date(),
         });
 
         // Slippage guard (primarily for MARKET entries). Options are noisier; thresholds are segment-aware.
@@ -6547,6 +6738,52 @@ class TradeManager {
           return;
         }
 
+        const minGreenEnabled =
+          String(env.MIN_GREEN_ENABLED || "true") === "true";
+        const minGreen = minGreenEnabled
+          ? estimateMinGreen({
+              entryPrice: avg,
+              qty: filledQty,
+              spreadBps: Number(trade?.quoteAtEntry?.bps || 0),
+              env,
+              instrument: trade.instrument,
+            })
+          : {
+              estChargesInr: 0,
+              slippageBufferInr: 0,
+              minGreenInr: 0,
+              minGreenPts: 0,
+              meta: null,
+            };
+
+        const riskStop = this._computeRiskStopLoss({
+          entryPrice: avg,
+          side: trade.side,
+          instrument: trade.instrument,
+          qty: filledQty,
+          riskInr: Number(env.RISK_PER_TRADE_INR || 0),
+        });
+
+        const timeStopMin = Number(env.TIME_STOP_MIN || 0);
+        const timeStopAt =
+          Number.isFinite(timeStopMin) && timeStopMin > 0
+            ? new Date(Date.now() + timeStopMin * 60 * 1000)
+            : null;
+
+        await updateTrade(trade.tradeId, {
+          stopLoss: riskStop.stopLoss,
+          initialStopLoss: riskStop.stopLoss,
+          slTrigger: riskStop.stopLoss,
+          riskPts: riskStop.riskPts,
+          riskInr: riskStop.riskInr,
+          lotSize: riskStop.lotSize,
+          estChargesInr: minGreen.estChargesInr,
+          slippageBufferInr: minGreen.slippageBufferInr,
+          minGreenInr: minGreen.minGreenInr,
+          minGreenPts: minGreen.minGreenPts,
+          timeStopAt,
+        });
+
         alert("info", "✅ ENTRY filled", {
           tradeId: trade.tradeId,
           avg,
@@ -6595,6 +6832,48 @@ class TradeManager {
           status: STATUS.ENTRY_OPEN,
           entryPrice: avgNow > 0 ? avgNow : trade.entryPrice,
           qty: filledNow,
+        });
+        const minGreenEnabled =
+          String(env.MIN_GREEN_ENABLED || "true") === "true";
+        const minGreen = minGreenEnabled
+          ? estimateMinGreen({
+              entryPrice: avgNow,
+              qty: filledNow,
+              spreadBps: Number(trade?.quoteAtEntry?.bps || 0),
+              env,
+              instrument: trade.instrument,
+            })
+          : {
+              estChargesInr: 0,
+              slippageBufferInr: 0,
+              minGreenInr: 0,
+              minGreenPts: 0,
+              meta: null,
+            };
+        const riskStop = this._computeRiskStopLoss({
+          entryPrice: avgNow,
+          side: trade.side,
+          instrument: trade.instrument,
+          qty: filledNow,
+          riskInr: Number(env.RISK_PER_TRADE_INR || 0),
+        });
+        const timeStopMin = Number(env.TIME_STOP_MIN || 0);
+        const timeStopAt =
+          Number.isFinite(timeStopMin) && timeStopMin > 0
+            ? new Date(Date.now() + timeStopMin * 60 * 1000)
+            : null;
+        await updateTrade(trade.tradeId, {
+          stopLoss: riskStop.stopLoss,
+          initialStopLoss: riskStop.stopLoss,
+          slTrigger: riskStop.stopLoss,
+          riskPts: riskStop.riskPts,
+          riskInr: riskStop.riskInr,
+          lotSize: riskStop.lotSize,
+          estChargesInr: minGreen.estChargesInr,
+          slippageBufferInr: minGreen.slippageBufferInr,
+          minGreenInr: minGreen.minGreenInr,
+          minGreenPts: minGreen.minGreenPts,
+          timeStopAt,
         });
         await this._placeExitsIfMissing({
           ...trade,
@@ -7277,6 +7556,9 @@ class TradeManager {
 
   async _recalcTargetFromActualFill({ tradeId, entryPrice }) {
     try {
+      if (String(env.OPT_TP_ENABLED || "false") !== "true") {
+        return { ok: true, skipped: true };
+      }
       const t = await getTrade(tradeId);
       if (!t) return { ok: true, skipped: true };
 
@@ -7684,6 +7966,12 @@ class TradeManager {
       realizedPnl: realized + pnl,
       lastTradeId: tradeId,
     });
+    await this._updateDailyPnlState({
+      realized: realized + pnl,
+      openPnl: 0,
+      total: realized + pnl,
+      prevState: cur?.state || "RUNNING",
+    });
 
     try {
       const t = await getTrade(tradeId);
@@ -7937,24 +8225,28 @@ class TradeManager {
 
       // place SL if missing
       if (!fresh.slOrderId) {
-        const slSide = trade.side === "BUY" ? "SELL" : "BUY";
+        const liveTrade = { ...trade, ...fresh };
+        const slSide = liveTrade.side === "BUY" ? "SELL" : "BUY";
+        const liveStopLoss = Number(liveTrade.stopLoss);
+        const liveQty = Number(liveTrade.qty);
+        const liveInstrument = liveTrade.instrument;
 
         // If SL trigger is already breached (fast move), exit MARKET immediately instead of placing an invalid/instant SL
-        const tokenNow = Number(trade.instrument_token);
-        const ltpNow = await this._getLtp(tokenNow, trade.instrument);
+        const tokenNow = Number(liveTrade.instrument_token);
+        const ltpNow = await this._getLtp(tokenNow, liveInstrument);
         const slBreached =
           Number.isFinite(ltpNow) &&
-          ((slSide === "SELL" && Number(ltpNow) <= Number(trade.stopLoss)) ||
-            (slSide === "BUY" && Number(ltpNow) >= Number(trade.stopLoss)));
+          ((slSide === "SELL" && Number(ltpNow) <= liveStopLoss) ||
+            (slSide === "BUY" && Number(ltpNow) >= liveStopLoss));
         if (slBreached) {
           logger.warn(
-            { tradeId, ltpNow, stopLoss: trade.stopLoss, slSide },
+            { tradeId, ltpNow, stopLoss: liveStopLoss, slSide },
             "[trade] SL already breached -> MARKET exit",
           );
           alert("error", "🛑 SL already breached -> MARKET exit", {
             tradeId,
             ltp: ltpNow,
-            stopLoss: trade.stopLoss,
+            stopLoss: liveStopLoss,
           }).catch(() => {});
           this.risk.setKillSwitch(true);
           await upsertDailyRisk(todayKey(), {
@@ -7966,13 +8258,13 @@ class TradeManager {
           return;
         }
 
-        const slOrderType = this._getStopLossOrderType(trade.instrument);
+        const slOrderType = this._getStopLossOrderType(liveInstrument);
         const slLimitPrice =
           slOrderType === "SL"
             ? this._buildStopLossLimitPrice({
-                triggerPrice: trade.stopLoss,
+                triggerPrice: liveStopLoss,
                 exitSide: slSide,
-                instrument: trade.instrument,
+                instrument: liveInstrument,
               })
             : null;
 
@@ -7980,13 +8272,13 @@ class TradeManager {
         let slLimitPriceUsed = slLimitPrice;
 
         const slParams = {
-          exchange: trade.instrument.exchange,
-          tradingsymbol: trade.instrument.tradingsymbol,
+          exchange: liveInstrument.exchange,
+          tradingsymbol: liveInstrument.tradingsymbol,
           transaction_type: slSide,
-          quantity: trade.qty,
+          quantity: liveQty,
           product: env.DEFAULT_PRODUCT,
           order_type: slOrderType,
-          trigger_price: trade.stopLoss,
+          trigger_price: liveStopLoss,
           ...(slOrderType === "SL" ? { price: slLimitPrice } : {}),
           validity: "DAY",
           tag: makeTag(tradeId, "SL"),
@@ -7995,8 +8287,8 @@ class TradeManager {
         logger.info({ tradeId, slParams }, "[trade] placing SL");
         alert("info", "🛡️ SL placing", {
           tradeId,
-          stopLoss: trade.stopLoss,
-          qty: trade.qty,
+          stopLoss: liveStopLoss,
+          qty: liveQty,
         }).catch(() => {});
 
         if (isHalted()) {
@@ -8027,9 +8319,9 @@ class TradeManager {
                 price: this._buildStopLossLimitPrice({
                   // NOTE: if SL-M is blocked, SL-L is used and should be watchdogged.
 
-                  triggerPrice: trade.stopLoss,
+                  triggerPrice: liveStopLoss,
                   exitSide: slSide,
-                  instrument: trade.instrument,
+                  instrument: liveInstrument,
                 }),
               };
 
@@ -8094,11 +8386,25 @@ class TradeManager {
         alert("info", "✅ SL placed", {
           tradeId,
           slOrderId,
-          stopLoss: trade.stopLoss,
+          stopLoss: liveStopLoss,
         }).catch(() => {});
 
         // Immediate verification for SL
         this._watchExitLeg(tradeId, slOrderId, "SL").catch(() => {});
+      }
+
+      const tpEnabled = String(env.OPT_TP_ENABLED || "false") === "true";
+      if (!tpEnabled) {
+        await updateTrade(tradeId, {
+          status: STATUS.LIVE,
+          targetOrderId: null,
+          targetOrderType: null,
+          targetPrice: null,
+          targetVirtual: false,
+          tp1OrderId: null,
+          tp1Aborted: true,
+        });
+        return;
       }
 
       // place TP1 / TARGET (runner) depending on scale-out stage

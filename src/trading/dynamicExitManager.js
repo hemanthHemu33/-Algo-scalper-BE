@@ -90,6 +90,17 @@ function profitPct({ side, entry, ltp }) {
   return raw * 100;
 }
 
+function unrealizedPnlInr({ side, entry, ltp, qty }) {
+  if (
+    !Number.isFinite(entry) ||
+    !Number.isFinite(ltp) ||
+    !Number.isFinite(qty)
+  )
+    return 0;
+  if (side === "BUY") return (ltp - entry) * qty;
+  return (entry - ltp) * qty;
+}
+
 function computeTargetFromRisk({ side, entry, risk, rr, tick }) {
   if (
     !Number.isFinite(entry) ||
@@ -143,6 +154,143 @@ function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
       mult,
       buffer,
       costMeta: meta || null,
+    },
+  };
+}
+
+function applyMinGreenExitRules({
+  trade,
+  ltp,
+  now,
+  env,
+  basePlan,
+  entry,
+  sl0,
+  side,
+  tick,
+}) {
+  const qty = Number(trade?.qty || trade?.initialQty || 0);
+  const minGreenEnabled = String(env.MIN_GREEN_ENABLED || "true") === "true";
+  const minGreenInr = minGreenEnabled ? Number(trade?.minGreenInr || 0) : 0;
+  const minGreenPts = minGreenEnabled ? Number(trade?.minGreenPts || 0) : 0;
+
+  const curSL = Number(trade?.stopLoss || sl0);
+  let newSL =
+    basePlan?.sl?.stopLoss && Number.isFinite(basePlan.sl.stopLoss)
+      ? Number(basePlan.sl.stopLoss)
+      : curSL;
+
+  const tradePatch = { ...(basePlan?.tradePatch || {}) };
+
+  const pnlInr = unrealizedPnlInr({ side, entry, ltp, qty });
+
+  const timeStopMin = Number(env.TIME_STOP_MIN || 0);
+  const entryTs =
+    tsFrom(trade?.entryFilledAt) ||
+    tsFrom(trade?.createdAt || trade?.updatedAt) ||
+    now;
+  const timeStopAtMs =
+    Number.isFinite(timeStopMin) && timeStopMin > 0
+      ? entryTs + timeStopMin * 60 * 1000
+      : null;
+
+  if (
+    Number.isFinite(timeStopAtMs) &&
+    now >= timeStopAtMs &&
+    pnlInr < minGreenInr
+  ) {
+    return {
+      ...basePlan,
+      ok: true,
+      action: { exitNow: true, reason: "TIME_STOP" },
+      tradePatch: {
+        ...tradePatch,
+        timeStopTriggeredAt: new Date(now),
+      },
+      meta: {
+        ...(basePlan?.meta || {}),
+        timeStopAtMs,
+        pnlInr,
+        minGreenInr,
+      },
+    };
+  }
+
+  const beLockAt = Number(env.BE_LOCK_AT_PROFIT_INR || 0);
+  if (
+    Number.isFinite(beLockAt) &&
+    beLockAt > 0 &&
+    pnlInr >= beLockAt &&
+    minGreenPts > 0
+  ) {
+    const desired =
+      side === "BUY" ? entry + minGreenPts : entry - minGreenPts;
+    if (side === "BUY") newSL = Math.max(newSL, desired);
+    else newSL = Math.min(newSL, desired);
+    if (!trade?.beLocked) {
+      tradePatch.beLocked = true;
+      tradePatch.beLockedAt = new Date(now);
+      tradePatch.beLockedAtPrice = desired;
+    }
+  }
+
+  const trailGap = Number(env.TRAIL_GAP_PREMIUM_POINTS || 0);
+  if (Number.isFinite(trailGap) && trailGap > 0 && Number.isFinite(ltp)) {
+    const prevPeak = Number(trade?.peakLtp || NaN);
+    let peakLtp = prevPeak;
+    if (side === "BUY") {
+      peakLtp = Number.isFinite(prevPeak) ? Math.max(prevPeak, ltp) : ltp;
+    } else {
+      peakLtp = Number.isFinite(prevPeak) ? Math.min(prevPeak, ltp) : ltp;
+    }
+    const trailSl = side === "BUY" ? peakLtp - trailGap : peakLtp + trailGap;
+    if (!Number.isFinite(prevPeak) || peakLtp !== prevPeak) {
+      tradePatch.peakLtp = peakLtp;
+    }
+    if (!Number.isFinite(Number(trade?.trailSl)) || trailSl !== trade?.trailSl) {
+      tradePatch.trailSl = trailSl;
+    }
+
+    const threshold = 2 * tick;
+    if (side === "BUY") {
+      if (trailSl > newSL + threshold) newSL = trailSl;
+    } else if (trailSl < newSL - threshold) {
+      newSL = trailSl;
+    }
+  }
+
+  // Never loosen beyond initial SL
+  if (Number.isFinite(sl0)) {
+    if (side === "BUY") newSL = Math.max(newSL, sl0);
+    else newSL = Math.min(newSL, sl0);
+  }
+
+  // Broker-valid guard: SL should not be beyond market
+  const buffer = tick;
+  if (Number.isFinite(ltp)) {
+    if (side === "BUY") newSL = clamp(newSL, undefined, ltp - buffer);
+    else newSL = clamp(newSL, ltp + buffer, undefined);
+  }
+
+  newSL = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
+
+  const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 2);
+  const step = stepTicks * tick;
+  const slMove = side === "BUY" ? newSL - curSL : curSL - newSL;
+  const shouldMoveSL = Number.isFinite(slMove) && slMove >= step;
+
+  return {
+    ...basePlan,
+    ok: true,
+    sl: shouldMoveSL ? { stopLoss: newSL } : basePlan?.sl || null,
+    tradePatch,
+    meta: {
+      ...(basePlan?.meta || {}),
+      pnlInr,
+      minGreenInr,
+      minGreenPts,
+      beLockAt,
+      trailGap,
     },
   };
 }
@@ -448,6 +596,8 @@ function computeDynamicExitPlan({
   const now = Number(nowTs || Date.now());
   const beInfo = estimateTrueBreakeven({ trade, entry, side, tick, env });
 
+  let basePlan = null;
+
   // -----------------------
   // OPTIONS-AWARE FALLBACKS
   // -----------------------
@@ -462,7 +612,7 @@ function computeDynamicExitPlan({
       beInfo,
     });
     if (plan?.ok) {
-      return {
+      basePlan = {
         ...plan,
         meta: {
           ...(plan.meta || {}),
@@ -481,166 +631,180 @@ function computeDynamicExitPlan({
   // -----------------------
   // CASH / DEFAULT LOGIC
   // -----------------------
-  if (!candles || candles.length < 20)
-    return { ok: false, reason: "not_enough_candles" };
+  if (!basePlan) {
+    if (!candles || candles.length < 20)
+      return { ok: false, reason: "not_enough_candles" };
 
-  const pr = profitR({ side, entry, ltp, risk });
+    const pr = profitR({ side, entry, ltp, risk });
 
-  // ---------- trailing stop ----------
-  const atrPeriod = Number(env.DYN_ATR_PERIOD || 14);
-  const a = atr(candles, atrPeriod);
-  const atrMult = Number(env.DYN_TRAIL_ATR_MULT || 1.2);
+    // ---------- trailing stop ----------
+    const atrPeriod = Number(env.DYN_ATR_PERIOD || 14);
+    const a = atr(candles, atrPeriod);
+    const atrMult = Number(env.DYN_TRAIL_ATR_MULT || 1.2);
 
-  // Start ATR trailing only after X R in profit
-  const trailStartR = Number(env.DYN_TRAIL_START_R || 1.0);
+    // Start ATR trailing only after X R in profit
+    const trailStartR = Number(env.DYN_TRAIL_START_R || 1.0);
 
-  // Move SL to "true breakeven" after Y R in profit
-  const beAtR = Number(env.DYN_MOVE_SL_TO_BE_AT_R || 0.8);
+    // Move SL to "true breakeven" after Y R in profit
+    const beAtR = Number(env.DYN_MOVE_SL_TO_BE_AT_R || 0.8);
 
-  const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 2); // minimum move before modifying
-  const step = stepTicks * tick;
+    const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 2); // minimum move before modifying
+    const step = stepTicks * tick;
 
-  // candles since entry
-  const entryTs = tsFrom(trade.createdAt || trade.updatedAt) || Date.now();
-  const since = candles.filter((c) => {
-    const ts = tsFrom(c?.ts) || tsFrom(c?.time) || null;
-    return Number.isFinite(ts) && ts >= entryTs;
-  });
-  const slice = since.length ? since : candles.slice(-60);
-
-  const hi = maxHigh(slice);
-  const lo = minLow(slice);
-
-  // Current stop in DB (may already be trailed)
-  const curSL = Number(trade.stopLoss || sl0);
-  let newSL = curSL;
-
-  // Break-even move (fee-safe BE)
-  if (risk > 0 && Number.isFinite(beAtR) && pr >= beAtR) {
-    if (side === "BUY") newSL = Math.max(newSL, beInfo.be);
-    else newSL = Math.min(newSL, beInfo.be);
-  }
-
-  // ATR trail from swing extremes (conservative) - only after trailStartR
-  if (risk > 0 && pr >= trailStartR && Number.isFinite(a) && a > 0) {
-    if (side === "BUY") newSL = Math.max(newSL, hi - atrMult * a);
-    else newSL = Math.min(newSL, lo + atrMult * a);
-  }
-
-  // Never loosen beyond initial SL
-  if (side === "BUY") newSL = Math.max(newSL, sl0);
-  else newSL = Math.min(newSL, sl0);
-
-  // Broker-valid guard: SL should not be beyond market (avoid immediate invalid trigger)
-  const buffer = tick; // keep at least 1 tick away
-  if (side === "BUY") newSL = clamp(newSL, undefined, ltp - buffer);
-  else newSL = clamp(newSL, ltp + buffer, undefined);
-
-  newSL = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
-
-  const slMove = side === "BUY" ? newSL - curSL : curSL - newSL;
-  const shouldMoveSL = Number.isFinite(slMove) && slMove >= step;
-
-  // ---------- dynamic target ----------
-  const mode = String(env.DYN_TARGET_MODE || "STATIC").toUpperCase(); // STATIC|FOLLOW_RR|TIGHTEN_VWAP
-  const rrFollow = Number(env.DYN_TARGET_RR || rr);
-  const tightenVwapFrac = Number(env.DYN_TARGET_TIGHTEN_FRAC || 0.6); // how aggressively to pull target in
-
-  const curTarget = Number(trade.targetPrice || 0);
-  let newTarget = curTarget > 0 ? curTarget : null;
-
-  const allowTargetTighten =
-    String(env.DYN_ALLOW_TARGET_TIGHTEN || "false") === "true" ||
-    pr >= Number(env.DYN_TARGET_TIGHTEN_AFTER_R || 1.5);
-
-  if (mode === "FOLLOW_RR" && allowTargetTighten) {
-    // Keep RR aligned to the *current* stop (as SL trails up, target tightens too)
-    const riskNow = Math.abs(entry - newSL);
-    const t = computeTargetFromRisk({
-      side,
-      entry,
-      risk: riskNow,
-      rr: rrFollow,
-      tick,
+    // candles since entry
+    const entryTs = tsFrom(trade.createdAt || trade.updatedAt) || Date.now();
+    const since = candles.filter((c) => {
+      const ts = tsFrom(c?.ts) || tsFrom(c?.time) || null;
+      return Number.isFinite(ts) && ts >= entryTs;
     });
-    if (t != null) newTarget = t;
-  }
+    const slice = since.length ? since : candles.slice(-60);
 
-  if (mode === "TIGHTEN_VWAP" && allowTargetTighten) {
-    // If price comes back to VWAP, tighten target to get out quicker (only after enough profit).
-    const vwap = rollingVWAP(candles, Number(env.DYN_VWAP_LOOKBACK || 120));
-    if (Number.isFinite(vwap) && vwap > 0) {
-      const dist = Math.abs(ltp - vwap);
-      // If we're close to VWAP relative to initial risk, reduce target to secure profit.
-      if (risk > 0 && dist <= risk) {
-        if (side === "BUY") {
-          const desired = ltp + tightenVwapFrac * risk;
-          newTarget = roundToTick(
-            Math.max(curTarget || 0, desired),
-            tick,
-            "up",
-          );
-        } else {
-          const desired = ltp - tightenVwapFrac * risk;
-          newTarget = roundToTick(
-            Math.min(curTarget || desired, desired),
-            tick,
-            "down",
-          );
+    const hi = maxHigh(slice);
+    const lo = minLow(slice);
+
+    // Current stop in DB (may already be trailed)
+    const curSL = Number(trade.stopLoss || sl0);
+    let newSL = curSL;
+
+    // Break-even move (fee-safe BE)
+    if (risk > 0 && Number.isFinite(beAtR) && pr >= beAtR) {
+      if (side === "BUY") newSL = Math.max(newSL, beInfo.be);
+      else newSL = Math.min(newSL, beInfo.be);
+    }
+
+    // ATR trail from swing extremes (conservative) - only after trailStartR
+    if (risk > 0 && pr >= trailStartR && Number.isFinite(a) && a > 0) {
+      if (side === "BUY") newSL = Math.max(newSL, hi - atrMult * a);
+      else newSL = Math.min(newSL, lo + atrMult * a);
+    }
+
+    // Never loosen beyond initial SL
+    if (side === "BUY") newSL = Math.max(newSL, sl0);
+    else newSL = Math.min(newSL, sl0);
+
+    // Broker-valid guard: SL should not be beyond market (avoid immediate invalid trigger)
+    const buffer = tick; // keep at least 1 tick away
+    if (side === "BUY") newSL = clamp(newSL, undefined, ltp - buffer);
+    else newSL = clamp(newSL, ltp + buffer, undefined);
+
+    newSL = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
+
+    const slMove = side === "BUY" ? newSL - curSL : curSL - newSL;
+    const shouldMoveSL = Number.isFinite(slMove) && slMove >= step;
+
+    // ---------- dynamic target ----------
+    const mode = String(env.DYN_TARGET_MODE || "STATIC").toUpperCase(); // STATIC|FOLLOW_RR|TIGHTEN_VWAP
+    const rrFollow = Number(env.DYN_TARGET_RR || rr);
+    const tightenVwapFrac = Number(env.DYN_TARGET_TIGHTEN_FRAC || 0.6); // how aggressively to pull target in
+
+    const curTarget = Number(trade.targetPrice || 0);
+    let newTarget = curTarget > 0 ? curTarget : null;
+
+    const allowTargetTighten =
+      String(env.DYN_ALLOW_TARGET_TIGHTEN || "false") === "true" ||
+      pr >= Number(env.DYN_TARGET_TIGHTEN_AFTER_R || 1.5);
+
+    if (mode === "FOLLOW_RR" && allowTargetTighten) {
+      // Keep RR aligned to the *current* stop (as SL trails up, target tightens too)
+      const riskNow = Math.abs(entry - newSL);
+      const t = computeTargetFromRisk({
+        side,
+        entry,
+        risk: riskNow,
+        rr: rrFollow,
+        tick,
+      });
+      if (t != null) newTarget = t;
+    }
+
+    if (mode === "TIGHTEN_VWAP" && allowTargetTighten) {
+      // If price comes back to VWAP, tighten target to get out quicker (only after enough profit).
+      const vwap = rollingVWAP(candles, Number(env.DYN_VWAP_LOOKBACK || 120));
+      if (Number.isFinite(vwap) && vwap > 0) {
+        const dist = Math.abs(ltp - vwap);
+        // If we're close to VWAP relative to initial risk, reduce target to secure profit.
+        if (risk > 0 && dist <= risk) {
+          if (side === "BUY") {
+            const desired = ltp + tightenVwapFrac * risk;
+            newTarget = roundToTick(
+              Math.max(curTarget || 0, desired),
+              tick,
+              "up",
+            );
+          } else {
+            const desired = ltp - tightenVwapFrac * risk;
+            newTarget = roundToTick(
+              Math.min(curTarget || desired, desired),
+              tick,
+              "down",
+            );
+          }
         }
       }
     }
+
+    // Ensure target stays on profitable side of entry
+    if (newTarget != null && Number.isFinite(newTarget)) {
+      if (side === "BUY") newTarget = Math.max(newTarget, entry + tick);
+      else newTarget = Math.min(newTarget, entry - tick);
+    } else {
+      newTarget = null;
+    }
+
+    const tMove =
+      newTarget != null && curTarget > 0
+        ? Math.abs(newTarget - curTarget)
+        : newTarget != null
+          ? Infinity
+          : 0;
+
+    const shouldMoveTarget =
+      mode !== "STATIC" &&
+      allowTargetTighten &&
+      newTarget != null &&
+      tMove >= step;
+
+    basePlan = {
+      ok: true,
+      sl: shouldMoveSL ? { stopLoss: newSL } : null,
+      target: shouldMoveTarget ? { targetPrice: newTarget } : null,
+      meta: {
+        at: new Date(now).toISOString(),
+        side,
+        ltp,
+        entry,
+        sl0,
+        curSL,
+        newSL,
+        atr: a,
+        hi,
+        lo,
+        risk,
+        profitR: pr,
+        rr,
+        mode,
+        allowTargetTighten,
+        curTarget: curTarget || null,
+        newTarget,
+        trueBE: beInfo?.be,
+        trueBEMeta: beInfo?.meta || null,
+        trailStartR,
+        beAtR,
+      },
+    };
   }
 
-  // Ensure target stays on profitable side of entry
-  if (newTarget != null && Number.isFinite(newTarget)) {
-    if (side === "BUY") newTarget = Math.max(newTarget, entry + tick);
-    else newTarget = Math.min(newTarget, entry - tick);
-  } else {
-    newTarget = null;
-  }
-
-  const tMove =
-    newTarget != null && curTarget > 0
-      ? Math.abs(newTarget - curTarget)
-      : newTarget != null
-        ? Infinity
-        : 0;
-
-  const shouldMoveTarget =
-    mode !== "STATIC" &&
-    allowTargetTighten &&
-    newTarget != null &&
-    tMove >= step;
-
-  return {
-    ok: true,
-    sl: shouldMoveSL ? { stopLoss: newSL } : null,
-    target: shouldMoveTarget ? { targetPrice: newTarget } : null,
-    meta: {
-      at: new Date(now).toISOString(),
-      side,
-      ltp,
-      entry,
-      sl0,
-      curSL,
-      newSL,
-      atr: a,
-      hi,
-      lo,
-      risk,
-      profitR: pr,
-      rr,
-      mode,
-      allowTargetTighten,
-      curTarget: curTarget || null,
-      newTarget,
-      trueBE: beInfo?.be,
-      trueBEMeta: beInfo?.meta || null,
-      trailStartR,
-      beAtR,
-    },
-  };
+  return applyMinGreenExitRules({
+    trade,
+    ltp,
+    now,
+    env,
+    basePlan,
+    entry,
+    sl0,
+    side,
+    tick,
+  });
 }
 
 module.exports = { computeDynamicExitPlan };

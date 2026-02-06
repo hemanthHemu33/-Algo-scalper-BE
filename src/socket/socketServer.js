@@ -176,7 +176,7 @@ function attachSocketServer(httpServer) {
       const rows = await db
         .collection("trades")
         .find({})
-        .sort({ createdAt: -1 })
+        .sort({ updatedAt: -1, createdAt: -1 })
         .limit(safeLimit)
         .toArray();
       socket.emit("trades:snapshot", { ok: true, rows });
@@ -192,14 +192,16 @@ function attachSocketServer(httpServer) {
       const db = getDb();
       const rows = await db
         .collection("trades")
-        .find({ createdAt: { $gt: new Date(since) } })
-        .sort({ createdAt: 1 })
+        .find({ updatedAt: { $gt: new Date(since) } })
+        .sort({ updatedAt: 1 })
         .limit(200)
         .toArray();
 
       if (rows.length) {
         const last = rows[rows.length - 1];
-        const lastMs = new Date(last.createdAt || last.updatedAt || Date.now()).getTime();
+        const lastMs = new Date(
+          last.updatedAt || last.createdAt || Date.now(),
+        ).getTime();
         if (Number.isFinite(lastMs) && lastMs > tradesCursorMs) tradesCursorMs = lastMs;
         socket.emit("trades:delta", { ok: true, rows });
       }
@@ -295,7 +297,11 @@ function attachSocketServer(httpServer) {
       const limit = Number(payload.limit || 50);
       const rows = await sendTradesSnapshot(limit);
       const mostRecent = rows[0];
-      const cursor = mostRecent ? new Date(mostRecent.createdAt || mostRecent.updatedAt || Date.now()).getTime() : 0;
+      const cursor = mostRecent
+        ? new Date(
+            mostRecent.updatedAt || mostRecent.createdAt || Date.now(),
+          ).getTime()
+        : 0;
       tradesCursorMs = cursor || Date.now();
       startTimer("trades", intervalMs, pollTradesDelta);
     });
