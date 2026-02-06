@@ -548,6 +548,40 @@ function buildApp() {
         null;
       const state = s?.dailyRiskState ?? s?.dailyRisk?.state ?? "RUNNING";
       const activeTrade = normalizeActiveTrade(s?.activeTrade);
+      const activeTradeId = s?.activeTradeId ?? null;
+      const targetMode =
+        activeTrade?.optTargetMode ||
+        (activeTrade?.targetVirtual ? "VIRTUAL" : null) ||
+        (env.OPT_TARGET_MODE ? String(env.OPT_TARGET_MODE).toUpperCase() : null);
+      const stopMode = activeTrade?.optStopMode || env.OPT_STOP_MODE || null;
+      const targetStatus = activeTrade
+        ? activeTrade?.targetOrderId
+          ? activeTrade?.targetVirtual
+            ? "VIRTUAL"
+            : "PLACED"
+          : activeTrade?.targetPrice
+            ? "PENDING"
+            : null
+        : null;
+      const tradeTracking = {
+        tracker: activeTrade?.strategyId || activeTrade?.tracker || null,
+        targetMode,
+        targetStatus,
+        stopMode,
+        lastEvent: activeTrade?.lastEvent || null,
+        lastUpdate: activeTrade?.updatedAt || null,
+        activeTradeId,
+        activeTrade,
+      };
+      const systemHealth = {
+        lastSocketEvent: s?.lastSocketEvent || null,
+        lastDisconnect: normalizedTicker.lastDisconnect || null,
+        rejectedTrades:
+          s?.rejectedTrades ??
+          s?.dailyRisk?.rejectedTrades ??
+          s?.dailyRisk?.rejections ??
+          null,
+      };
 
       res.json({
         ok: true,
@@ -562,8 +596,10 @@ function buildApp() {
         ordersPlacedToday: s?.ordersPlacedToday ?? 0,
         dailyPnL,
         state,
-        activeTradeId: s?.activeTradeId ?? null,
+        activeTradeId,
         activeTrade,
+        tradeTracking,
+        systemHealth,
       });
     } catch (e) {
       res.status(503).json({ ok: false, error: e.message });
