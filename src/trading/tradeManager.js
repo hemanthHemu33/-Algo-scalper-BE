@@ -4540,6 +4540,7 @@ class TradeManager {
     );
 
     try {
+      this.expectedCancelOrderIds.add(String(entryOrderId));
       await this._safeCancelOrder(
         env.DEFAULT_ORDER_VARIETY || "regular",
         entryOrderId,
