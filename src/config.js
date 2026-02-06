@@ -64,6 +64,8 @@ const schema = z.object({
   // Local dotenv loader toggle (config.js pre-loads dotenv using process.env too)
   DOTENV_ENABLED: z.string().optional(),
   DOTENV_PATH: z.string().optional(),
+  PROFILE_PRESET: z.string().optional(),
+  PROFILE_VALIDATE: z.string().default("true"),
 
   // Observability / telemetry (pro tuning support)
   TELEMETRY_ENABLED: z.string().default("true"),
@@ -930,6 +932,72 @@ if (!hasRawEnv("OPT_STRIKE_OFFSET_STEPS") && hasRawEnv("OPT_STRIKE_OFFSET")) {
 if (!hasRawEnv("OPT_ATM_SCAN_STEPS") && hasRawEnv("OPT_STRIKE_SCAN_STEPS")) {
   env.OPT_ATM_SCAN_STEPS = Number(env.OPT_STRIKE_SCAN_STEPS);
 }
+
+const PROFILE_PRESETS = {
+  NIFTY_OPT_SCALP_SAFE: {
+    STOPLOSS_ORDER_TYPE_FO: "SL",
+    SL_LIMIT_BUFFER_BPS: 50,
+    SL_LIMIT_BUFFER_TICKS: 10,
+    PANIC_EXIT_LIMIT_FALLBACK_ENABLED: "true",
+    ENTRY_SLIPPAGE_GUARD_FOR_LIMIT: "true",
+    MAX_ENTRY_SLIPPAGE_BPS_OPT: 120,
+    MAX_ENTRY_SLIPPAGE_KILL_BPS_OPT: 250,
+    OPT_TP_ENABLED: "false",
+    TIME_STOP_MIN: 5,
+  },
+};
+
+const presetKey = String(env.PROFILE_PRESET || "").trim().toUpperCase();
+if (presetKey && PROFILE_PRESETS[presetKey]) {
+  const preset = PROFILE_PRESETS[presetKey];
+  for (const [key, value] of Object.entries(preset)) {
+    if (!hasRawEnv(key)) {
+      env[key] = value;
+    }
+  }
+}
+
+function failOrWarn(msg) {
+  if (String(env.NODE_ENV || "development") === "production") {
+    throw new Error(msg);
+  }
+  // eslint-disable-next-line no-console
+  console.warn(msg);
+}
+
+function validateProfileCombos() {
+  if (String(env.PROFILE_VALIDATE || "true") !== "true") return;
+
+  const fnoEnabled = String(env.FNO_ENABLED || "false") === "true";
+  const stopTypeFo = String(env.STOPLOSS_ORDER_TYPE_FO || "")
+    .toUpperCase()
+    .trim();
+  if (fnoEnabled && stopTypeFo === "SL-M") {
+    failOrWarn(
+      "[config] Unsafe combo: STOPLOSS_ORDER_TYPE_FO=SL-M can be rejected in F&O. Use SL with buffers instead.",
+    );
+  }
+
+  const forceLot =
+    String(env.FNO_MIN_LOT_POLICY || "STRICT").toUpperCase() ===
+    "FORCE_ONE_LOT";
+  const riskInr = Number(env.RISK_PER_TRADE_INR || 0);
+  if (fnoEnabled && forceLot && Number.isFinite(riskInr) && riskInr < 100) {
+    failOrWarn(
+      "[config] Unsafe combo: FORCE_ONE_LOT with very low RISK_PER_TRADE_INR may block trades or force oversized risk.",
+    );
+  }
+
+  const optTpEnabled = String(env.OPT_TP_ENABLED || "false") === "true";
+  const timeStopMin = Number(env.TIME_STOP_MIN || 0);
+  if (!optTpEnabled && (!Number.isFinite(timeStopMin) || timeStopMin <= 0)) {
+    failOrWarn(
+      "[config] Unsafe combo: OPT_TP_ENABLED=false requires a positive TIME_STOP_MIN to avoid lingering positions.",
+    );
+  }
+}
+
+validateProfileCombos();
 
 // --- Trading window validation (PROD SAFETY) ---
 // We must NEVER trade with an invalid window configuration.
