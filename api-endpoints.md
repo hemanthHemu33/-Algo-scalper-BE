@@ -400,6 +400,57 @@ You should move these route definitions **outside** `/admin/status`.
 
 ---
 
+## LTP endpoints
+
+### `GET /admin/ltp/latest`
+
+**Purpose:** Latest LTP payloads from live WebSocket ticks (in-memory cache).
+
+**Query params**
+
+- `token` (single token)
+- `tokens` (comma-separated tokens)
+
+**200 (single)**
+
+```json
+{
+  "ok": true,
+  "row": {
+    "token": 256265,
+    "ltp": 482.5,
+    "exchangeTimestamp": "2026-01-27T10:00:01.123Z",
+    "lastTradeTime": "2026-01-27T10:00:01.123Z",
+    "updatedAt": "2026-01-27T10:00:01.123Z"
+  }
+}
+```
+
+**200 (multi)**
+
+```json
+{
+  "ok": true,
+  "rows": [
+    {
+      "token": 256265,
+      "ltp": 482.5,
+      "exchangeTimestamp": "2026-01-27T10:00:01.123Z",
+      "lastTradeTime": "2026-01-27T10:00:01.123Z",
+      "updatedAt": "2026-01-27T10:00:01.123Z"
+    }
+  ]
+}
+```
+
+**400 (invalid token)**
+
+```json
+{ "ok": false, "error": "invalid_token" }
+```
+
+---
+
 ## DB retention (TTL) endpoints (PATCH-9)
 
 ### `GET /admin/db/retention`
