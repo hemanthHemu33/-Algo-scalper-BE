@@ -9325,7 +9325,13 @@ function optionStopLossFromUnderlyingATR({
 }
 
 function calcOpenPnl(trade, ltp) {
-  const entry = Number(trade.entryPrice || trade.candle?.close || 0);
+  const entry = Number(
+    trade.entryPrice ||
+      trade.expectedEntryPrice ||
+      trade.quoteAtEntry?.ltp ||
+      trade.candle?.close ||
+      0,
+  );
   const qty = Number(trade.qty || 0);
   if (!entry || !qty) return 0;
   return trade.side === "BUY" ? (ltp - entry) * qty : (entry - ltp) * qty;
