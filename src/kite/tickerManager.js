@@ -9,6 +9,7 @@ const { alert } = require("../alerts/alertService");
 const { isHalted } = require("../runtime/halt");
 const { createTicker, createKiteConnect } = require("./kiteClients");
 const { buildPipeline } = require("../pipeline");
+const { updateFromTicks } = require("../market/ltpStream");
 
 let kite = null;
 let ticker = null;
@@ -508,6 +509,8 @@ function wireEvents() {
   ticker.on("ticks", (ticks) => {
     try {
       if (!pipeline) return;
+
+      updateFromTicks(ticks || []);
 
       tickQueue.push(ticks || []);
 

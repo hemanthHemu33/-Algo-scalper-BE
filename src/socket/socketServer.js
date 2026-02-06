@@ -9,6 +9,7 @@ const {
 const { isHalted, getHaltInfo } = require("../runtime/halt");
 const { getDb } = require("../db");
 const { getRecentCandles, getCandlesSince } = require("../market/candleStore");
+const { ltpStream, getLatestLtp } = require("../market/ltpStream");
 
 function parseCorsAllowList() {
   const raw = String(env.CORS_ORIGIN || "*").trim();
@@ -160,6 +161,7 @@ function attachSocketServer(httpServer) {
 
     const timers = new Map();
     const chartSubs = new Map();
+    const ltpSubs = new Map();
 
     let lastStatusHash = null;
     let lastSubsHash = null;
@@ -219,6 +221,19 @@ function attachSocketServer(httpServer) {
         .toArray();
       socket.emit("trades:snapshot", { ok: true, rows });
       return rows;
+    };
+
+    const sendLtpSnapshot = (sub) => {
+      const payload = getLatestLtp(sub.token);
+      if (payload) {
+        socket.emit("ltp:update", { ok: true, ...payload });
+      }
+    };
+
+    const handleLtpTick = (payload) => {
+      const sub = ltpSubs.get(payload.token);
+      if (!sub) return;
+      socket.emit("ltp:update", { ok: true, ...payload });
     };
 
     // trades: keep a per-socket tail cursor
@@ -432,15 +447,67 @@ function attachSocketServer(httpServer) {
       if (!chartSubs.size) stopTimer("charts");
     });
 
+    socket.on("ltp:subscribe", (payload = {}) => {
+      const tokens = Array.isArray(payload.tokens)
+        ? payload.tokens
+        : payload.token != null
+          ? [payload.token]
+          : [];
+      const list = tokens
+        .map((t) => Number(t))
+        .filter((t) => Number.isFinite(t) && t > 0);
+
+      if (!list.length) {
+        socket.emit("server:error", { ok: false, channel: "ltp", error: "missing_tokens" });
+        return;
+      }
+
+      for (const token of list) {
+        ltpSubs.set(token, { token });
+        sendLtpSnapshot({ token });
+      }
+
+      if (!timers.get("ltp")) {
+        ltpStream.on("tick", handleLtpTick);
+        timers.set("ltp", "event");
+      }
+    });
+
+    socket.on("ltp:unsubscribe", (payload = {}) => {
+      const tokens = Array.isArray(payload.tokens)
+        ? payload.tokens
+        : payload.token != null
+          ? [payload.token]
+          : [];
+      const list = tokens
+        .map((t) => Number(t))
+        .filter((t) => Number.isFinite(t) && t > 0);
+
+      if (!list.length) {
+        ltpSubs.clear();
+      } else {
+        for (const token of list) ltpSubs.delete(token);
+      }
+
+      if (!ltpSubs.size && timers.get("ltp")) {
+        ltpStream.off("tick", handleLtpTick);
+        timers.delete("ltp");
+      }
+    });
+
     // Optional: lightweight client pings (for UI debugging)
     socket.on("client:ping", (payload = {}) => {
       socket.emit("server:pong", { ok: true, now: new Date().toISOString(), echo: payload });
     });
 
     socket.on("disconnect", () => {
-      for (const t of timers.values()) clearInterval(t);
+      for (const t of timers.values()) {
+        if (t && typeof t !== "string") clearInterval(t);
+      }
       timers.clear();
       chartSubs.clear();
+      ltpSubs.clear();
+      ltpStream.off("tick", handleLtpTick);
       logger.info({ sid }, "[socket] disconnect");
     });
 

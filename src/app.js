@@ -46,6 +46,7 @@ const {
   reloadMarketCalendar,
 } = require("./market/marketCalendar");
 const { getRecentCandles } = require("./market/candleStore");
+const { getLatestLtp, getLatestLtps } = require("./market/ltpStream");
 const { getQuoteGuardStats } = require("./kite/quoteGuard");
 const { exchangeAndStoreKiteSession } = require("./kite/kiteLogin");
 
@@ -721,6 +722,36 @@ function buildApp() {
         } catch {}
       }
 
+      return res.json({ ok: true, rows });
+    } catch (e) {
+      return res
+        .status(503)
+        .json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  // FE: latest LTPs from live ticks
+  // GET /admin/ltp/latest?token=123
+  // GET /admin/ltp/latest?tokens=123,456
+  app.get("/admin/ltp/latest", requirePerm("read"), (req, res) => {
+    try {
+      const token = Number(req.query.token);
+      const tokensRaw = req.query.tokens;
+      if (Number.isFinite(token) && token > 0) {
+        const row = getLatestLtp(token);
+        return res.json({ ok: true, row: row || null });
+      }
+
+      const tokens = String(tokensRaw || "")
+        .split(",")
+        .map((t) => Number(t.trim()))
+        .filter((t) => Number.isFinite(t) && t > 0);
+
+      if (!tokens.length) {
+        return res.status(400).json({ ok: false, error: "invalid_token" });
+      }
+
+      const rows = getLatestLtps(tokens);
       return res.json({ ok: true, rows });
     } catch (e) {
       return res
