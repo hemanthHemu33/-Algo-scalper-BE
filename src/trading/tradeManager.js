@@ -3050,6 +3050,7 @@ class TradeManager {
         await updateTrade(tradeId, {
           status: STATUS.CLOSED,
           closeReason: `PANIC_EXIT_SKIPPED_NO_POSITION | ${reason}`,
+          exitReason: "PANIC_EXIT",
           closedAt: new Date(),
         });
         await this._finalizeClosed(tradeId, Number(fresh.instrument_token));
@@ -3374,6 +3375,7 @@ class TradeManager {
             instrument_token: token,
             instrument,
             strategyId: "recovery",
+            tradeType: "RECOVERY_TRADE",
             side,
             qty: absQty,
             candle: null,
@@ -3381,13 +3383,13 @@ class TradeManager {
             initialStopLoss: stopLoss,
             slTrigger: stopLoss,
             rr: null,
-            status: STATUS.ENTRY_FILLED,
+            status: STATUS.LIVE,
             entryOrderId: null,
             slOrderId: null,
             targetOrderId: null,
             entryPrice: avgPrice || null,
             exitPrice: null,
-            closeReason: "RECOVERY_ADOPTED_OPEN_POSITION",
+            recoveryReason: "RECOVERY_ADOPTED_OPEN_POSITION",
             recoveredAt: new Date(),
           });
 
@@ -3595,6 +3597,7 @@ class TradeManager {
             await updateTrade(tradeId, {
               status: STATUS.CLOSED,
               closeReason: "OCO_BROKER_POSITION_FLAT",
+              exitReason: "RECONCILE_EXIT",
               closedAt: new Date(),
             });
             await this._finalizeClosed(tradeId, token);
@@ -3751,6 +3754,7 @@ class TradeManager {
       await updateTrade(tradeId, {
         status: STATUS.CLOSED,
         closeReason: "BROKER_POSITION_FLAT_MANUAL_EXIT",
+        exitReason: "RECONCILE_EXIT",
         closedAt: new Date(),
       });
       await this._finalizeClosed(tradeId, token);
@@ -3770,6 +3774,7 @@ class TradeManager {
             exitPrice: exitPrice > 0 ? exitPrice : trade.exitPrice,
             closeReason:
               (trade.closeReason || "GUARD_FAILED") + " | PANIC_FILLED",
+            exitReason: "PANIC_EXIT",
             closedAt: new Date(),
           });
           await this._bookRealizedPnl(tradeId);
@@ -6705,6 +6710,7 @@ class TradeManager {
           status: STATUS.CLOSED,
           exitPrice: exitPrice > 0 ? exitPrice : trade.exitPrice,
           closeReason: (trade.closeReason || "PANIC_EXIT") + " | FILLED",
+          exitReason: "PANIC_EXIT",
           closedAt: new Date(),
         });
 
@@ -7957,13 +7963,21 @@ class TradeManager {
       { purpose: "TARGET", tradeId },
     );
 
-    await updateTrade(tradeId, {
+    const fresh = await getTrade(tradeId);
+    const shouldMarkLive = [STATUS.ENTRY_FILLED, STATUS.LIVE].includes(
+      fresh?.status,
+    );
+    const patch = {
       targetOrderId,
       targetPrice,
       targetOrderType: targetParams.order_type,
       targetVirtual: false,
       status: STATUS.LIVE,
-    });
+    };
+    if (!shouldMarkLive) {
+      delete patch.status;
+    }
+    await updateTrade(tradeId, patch);
     this._clearVirtualTarget(tradeId);
     this._registerTargetWatchFromTrade({
       ...trade,
@@ -8177,7 +8191,11 @@ class TradeManager {
       { purpose: "TARGET", tradeId },
     );
 
-    await updateTrade(tradeId, {
+    const fresh = await getTrade(tradeId);
+    const shouldMarkLive = [STATUS.ENTRY_FILLED, STATUS.LIVE].includes(
+      fresh?.status,
+    );
+    const patch = {
       targetOrderId,
       targetPrice,
       targetOrderType: params.order_type,
@@ -8185,7 +8203,11 @@ class TradeManager {
       runnerTargetMeta: plan.meta,
       targetVirtual: false,
       status: STATUS.LIVE,
-    });
+    };
+    if (!shouldMarkLive) {
+      delete patch.status;
+    }
+    await updateTrade(tradeId, patch);
     this._clearVirtualTarget(tradeId);
     this._registerTargetWatchFromTrade({
       ...trade,
@@ -8501,6 +8523,9 @@ class TradeManager {
     try {
       const fresh = await getTrade(tradeId);
       if (!fresh) return;
+      const shouldMarkLive = [STATUS.ENTRY_FILLED, STATUS.LIVE].includes(
+        fresh.status,
+      );
 
       // place SL if missing
       if (!fresh.slOrderId) {
@@ -8679,7 +8704,7 @@ class TradeManager {
 
       const tpEnabled = String(env.OPT_TP_ENABLED || "false") === "true";
       if (!tpEnabled) {
-        await updateTrade(tradeId, {
+        const patch = {
           status: STATUS.LIVE,
           targetOrderId: null,
           targetOrderType: null,
@@ -8690,7 +8715,11 @@ class TradeManager {
           ...this._eventPatch("TP_DISABLED", {
             reason: "OPT_TP_ENABLED=false",
           }),
-        });
+        };
+        if (!shouldMarkLive) {
+          delete patch.status;
+        }
+        await updateTrade(tradeId, patch);
         return;
       }
 
@@ -8716,7 +8745,9 @@ class TradeManager {
           tradeId,
           targetPrice: fresh2.targetPrice,
         }).catch(() => {});
-        await updateTrade(tradeId, { status: STATUS.LIVE });
+        if (shouldMarkLive) {
+          await updateTrade(tradeId, { status: STATUS.LIVE });
+        }
         return;
       }
 
@@ -8758,7 +8789,9 @@ class TradeManager {
                     { ...trade, ...fresh2, initialQty: initQty },
                     { reason: msg, source: "tp1_fallback_target" },
                   );
-                  await updateTrade(tradeId, { status: STATUS.LIVE });
+                  if (shouldMarkLive) {
+                    await updateTrade(tradeId, { status: STATUS.LIVE });
+                  }
                   return;
                 }
                 logger.warn(
@@ -8769,10 +8802,14 @@ class TradeManager {
                   tradeId,
                   message: msg,
                 }).catch(() => {});
-                await updateTrade(tradeId, {
+                const patch = {
                   status: STATUS.LIVE,
                   closeReason: "TARGET_PLACE_FAILED | " + msg,
-                });
+                };
+                if (!shouldMarkLive) {
+                  delete patch.status;
+                }
+                await updateTrade(tradeId, patch);
                 return;
               }
             }
@@ -8793,7 +8830,9 @@ class TradeManager {
                   { ...trade, ...fresh2, initialQty: initQty },
                   { reason: msg, source: "runner_target" },
                 );
-                await updateTrade(tradeId, { status: STATUS.LIVE });
+                if (shouldMarkLive) {
+                  await updateTrade(tradeId, { status: STATUS.LIVE });
+                }
                 return;
               }
               logger.warn(
@@ -8804,10 +8843,14 @@ class TradeManager {
                 tradeId,
                 message: msg,
               }).catch(() => {});
-              await updateTrade(tradeId, {
+              const patch = {
                 status: STATUS.LIVE,
                 closeReason: "RUNNER_TARGET_PLACE_FAILED | " + msg,
-              });
+              };
+              if (!shouldMarkLive) {
+                delete patch.status;
+              }
+              await updateTrade(tradeId, patch);
               return;
             }
           }
@@ -8828,7 +8871,9 @@ class TradeManager {
                 { ...trade, ...fresh2, initialQty: initQty },
                 { reason: msg, source: "target" },
               );
-              await updateTrade(tradeId, { status: STATUS.LIVE });
+              if (shouldMarkLive) {
+                await updateTrade(tradeId, { status: STATUS.LIVE });
+              }
               return;
             }
             logger.warn(
@@ -8840,15 +8885,21 @@ class TradeManager {
               message: msg,
             }).catch(() => {});
             // Do not kill-switch; SL is safety critical and is already placed.
-            await updateTrade(tradeId, {
+            const patch = {
               status: STATUS.LIVE,
               closeReason: "TARGET_PLACE_FAILED | " + msg,
-            });
+            };
+            if (!shouldMarkLive) {
+              delete patch.status;
+            }
+            await updateTrade(tradeId, patch);
             return;
           }
         }
       }
-      await updateTrade(tradeId, { status: STATUS.LIVE });
+      if (shouldMarkLive) {
+        await updateTrade(tradeId, { status: STATUS.LIVE });
+      }
     } finally {
       this.exitPlacementLocks.delete(tradeId);
     }
@@ -8935,6 +8986,7 @@ class TradeManager {
       exitSlippageBpsWorse,
       exitSlippageInrWorse,
       closeReason: "TARGET_HIT",
+      exitReason: "TARGET_HIT",
     });
     alert("info", "🏁 TARGET HIT", { tradeId, exitPrice }).catch(() => {});
     this.risk.resetFailures();
@@ -9019,6 +9071,7 @@ class TradeManager {
       exitSlippageBpsWorse,
       exitSlippageInrWorse,
       closeReason: "SL_HIT",
+      exitReason: "SL_HIT",
     });
     alert("warn", "🛑 SL HIT", { tradeId, exitPrice }).catch(() => {});
     this.risk.resetFailures();

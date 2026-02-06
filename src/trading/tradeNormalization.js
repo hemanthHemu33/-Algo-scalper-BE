@@ -37,6 +37,7 @@ function normalizeActiveTrade(activeTrade) {
     peakLtp: activeTrade.peakLtp ?? activeTrade.peak_ltp ?? null,
     trailSl: activeTrade.trailSl ?? activeTrade.trail_sl ?? null,
     timeStopAt,
+    exitReason: activeTrade.exitReason ?? activeTrade.exit_reason ?? null,
   };
 }
 
@@ -104,6 +105,7 @@ function normalizeTradeRow(row) {
     timeStopAt,
     status: row.status ?? null,
     closeReason: row.closeReason ?? row.close_reason ?? null,
+    exitReason: row.exitReason ?? row.exit_reason ?? null,
     createdAt: row.createdAt ?? row.created_at ?? null,
     updatedAt: row.updatedAt ?? row.updated_at ?? null,
     regime: row.regime ?? regimeValue,
