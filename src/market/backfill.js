@@ -43,6 +43,8 @@ async function backfillCandles({
 
   await ensureIndexes(intervalMin);
   await insertManyCandles(intervalMin, mapped);
+
+  return mapped;
 }
 
 module.exports = { backfillCandles };

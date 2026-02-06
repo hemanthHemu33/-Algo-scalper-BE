@@ -444,6 +444,8 @@ const schema = z.object({
   CANDLE_FINALIZER_INTERVAL_MS: z.coerce.number().default(1000),
   CANDLE_FINALIZE_GRACE_MS: z.coerce.number().default(1500),
   CANDLE_FINALIZE_MAX_BARS_PER_RUN: z.coerce.number().default(3),
+  CANDLE_CACHE_MAX: z.coerce.number().default(800),
+  CANDLE_CACHE_LIMIT: z.coerce.number().default(400),
 
   ALLOW_SYNTHETIC_SIGNALS: z.string().default("false"),
 
@@ -459,7 +461,7 @@ const schema = z.object({
   // Stop-loss order type controls
   // NOTE: Many F&O segments disallow SL-M, so default for derivatives is SL (stoploss-limit).
   STOPLOSS_ORDER_TYPE_EQ: z.string().default("SL-M"), // equities (NSE cash etc.)
-  STOPLOSS_ORDER_TYPE_FO: z.string().default("SL-M"), // derivatives (NFO/BFO/CDS/MCX etc.)
+  STOPLOSS_ORDER_TYPE_FO: z.string().default("SL"), // derivatives (NFO/BFO/CDS/MCX etc.)
 
   // If STOPLOSS_ORDER_TYPE_* is "SL", we must provide a LIMIT price.
   // We set it near the trigger to behave like SL-M without violating execution ranges.

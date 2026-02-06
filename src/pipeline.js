@@ -6,6 +6,7 @@ const {
 } = require("./market/marketCalendar");
 const { logger } = require("./logger");
 const { CandleBuilder } = require("./market/candleBuilder");
+const { CandleCache } = require("./market/candleCache");
 const { CandleWriteBuffer } = require("./market/candleWriteBuffer");
 const { ensureIndexes } = require("./market/candleStore");
 const { backfillCandles } = require("./market/backfill");
@@ -27,6 +28,9 @@ function buildPipeline({ kite, tickerCtrl }) {
   const candleBuilder = new CandleBuilder({
     intervalsMinutes: intervals,
     timezone: env.CANDLE_TZ,
+  });
+  const candleCache = new CandleCache({
+    maxCandles: Number(env.CANDLE_CACHE_MAX || 800),
   });
 
   const candleWriter = new CandleWriteBuffer();
@@ -84,12 +88,13 @@ function buildPipeline({ kite, tickerCtrl }) {
     for (const token of tokensRef) {
       for (const intervalMin of intervals) {
         try {
-          await backfillCandles({
+          const candles = await backfillCandles({
             kite,
             instrument_token: token,
             intervalMin,
             timezone: env.CANDLE_TZ,
           });
+          candleCache.addCandles(candles);
           logger.info({ token, intervalMin }, "[backfill] ok");
         } catch (e) {
           logger.warn(
@@ -170,13 +175,14 @@ function buildPipeline({ kite, tickerCtrl }) {
           for (const token of toAdd) {
             for (const intervalMin of intervals) {
               try {
-                await backfillCandles({
+                const candles = await backfillCandles({
                   kite,
                   instrument_token: token,
                   intervalMin,
                   timezone: env.CANDLE_TZ,
                   daysOverride,
                 });
+                candleCache.addCandles(candles);
                 logger.info(
                   { token, intervalMin, daysOverride, isOptRuntime },
                   "[runtime-backfill] ok",
@@ -245,6 +251,10 @@ function buildPipeline({ kite, tickerCtrl }) {
         signalTokensSet.size &&
         signalTokensSet.has(tok);
 
+      if (isSignalTok) {
+        candleCache.addCandle(c);
+      }
+
       // Persist candles asynchronously (avoid DB writes in the hot tick loop)
       // Default: persist only signal tokens (underlying universe).
       // Enable CANDLE_PERSIST_NON_SIGNAL_TOKENS=true if you want option candles persisted too.
@@ -274,9 +284,15 @@ function buildPipeline({ kite, tickerCtrl }) {
         }
       }
 
+      const cached = candleCache.getCandles(
+        c.instrument_token,
+        c.interval_min,
+        Number(env.CANDLE_CACHE_LIMIT || 400),
+      );
       const signal = await evaluateOnCandleClose({
         instrument_token: c.instrument_token,
         intervalMin: c.interval_min,
+        candles: cached.length ? cached : null,
       });
 
       if (signal) {
@@ -351,10 +367,16 @@ function buildPipeline({ kite, tickerCtrl }) {
           lastCandleTs: candleTs,
         });
 
+        const cached = candleCache.getCandles(
+          tok,
+          intervalMin,
+          Number(env.CANDLE_CACHE_LIMIT || 400),
+        );
         const signal = await evaluateOnCandleTick({
           instrument_token: tok,
           intervalMin,
           liveCandle: live,
+          candles: cached.length ? cached : null,
         });
 
         if (signal) {
