@@ -730,10 +730,7 @@ function buildApp() {
     }
   });
 
-  // FE: latest LTPs from live ticks
-  // GET /admin/ltp/latest?token=123
-  // GET /admin/ltp/latest?tokens=123,456
-  app.get("/admin/ltp/latest", requirePerm("read"), (req, res) => {
+  const handleLatestLtp = (req, res) => {
     try {
       const token = Number(req.query.token);
       const tokensRaw = req.query.tokens;
@@ -758,7 +755,15 @@ function buildApp() {
         .status(503)
         .json({ ok: false, error: e?.message || String(e) });
     }
-  });
+  };
+
+  // FE: latest LTPs from live ticks
+  // GET /admin/ltp?token=123
+  // GET /admin/ltp?tokens=123,456
+  // GET /admin/ltp/latest?token=123
+  // GET /admin/ltp/latest?tokens=123,456
+  app.get("/admin/ltp", requirePerm("read"), handleLatestLtp);
+  app.get("/admin/ltp/latest", requirePerm("read"), handleLatestLtp);
 
   // PATCH-9: DB retention (TTL) visibility + manual ensure
   app.get("/admin/db/retention", requirePerm("read"), async (req, res) => {
