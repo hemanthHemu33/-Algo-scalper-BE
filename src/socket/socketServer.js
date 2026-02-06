@@ -86,6 +86,42 @@ function safeJsonHash(obj) {
   }
 }
 
+function buildLiveCandleSnapshot(candle) {
+  if (!candle) return null;
+  return {
+    ...candle,
+    live: true,
+    updatedAt: new Date(),
+  };
+}
+
+function mergeLiveCandle(rows, live) {
+  if (!live) return rows;
+  const out = Array.isArray(rows) ? rows.slice() : [];
+  const liveTs = live?.ts ? new Date(live.ts).getTime() : null;
+  if (!Number.isFinite(liveTs)) return out;
+  const last = out[out.length - 1];
+  const lastTs = last?.ts ? new Date(last.ts).getTime() : null;
+  if (Number.isFinite(lastTs) && lastTs === liveTs) {
+    out[out.length - 1] = live;
+  } else if (!Number.isFinite(lastTs) || liveTs > lastTs) {
+    out.push(live);
+  }
+  return out;
+}
+
+function hashLiveCandle(live) {
+  if (!live) return null;
+  return safeJsonHash({
+    ts: live.ts,
+    open: live.open,
+    high: live.high,
+    low: live.low,
+    close: live.close,
+    volume: live.volume,
+  });
+}
+
 function attachSocketServer(httpServer) {
   const enabled = String(env.SOCKET_ENABLED || "true") === "true";
   if (!enabled) {
@@ -127,6 +163,8 @@ function attachSocketServer(httpServer) {
 
     let lastStatusHash = null;
     let lastSubsHash = null;
+    const includeLiveCharts =
+      String(env.WS_CHART_INCLUDE_LIVE || "true") === "true";
 
     // ---- helpers
     const stopTimer = (key) => {
@@ -207,17 +245,33 @@ function attachSocketServer(httpServer) {
       }
     };
 
+    const getLiveCandleForSub = (sub) => {
+      if (!includeLiveCharts) return null;
+      try {
+        const pipeline = getPipeline();
+        if (pipeline?.getLiveCandle) {
+          return pipeline.getLiveCandle(sub.token, sub.intervalMin);
+        }
+      } catch {}
+      return null;
+    };
+
     const sendChartSnapshot = async (sub) => {
       const rows = await getRecentCandles(sub.token, sub.intervalMin, sub.limit);
-      const last = rows[rows.length - 1];
+      const live = buildLiveCandleSnapshot(getLiveCandleForSub(sub));
+      const merged = mergeLiveCandle(rows, live);
+      const last = merged[merged.length - 1];
       sub.lastTsMs = last ? new Date(last.ts).getTime() : 0;
-      sub.lastUpdatedAtMs = last ? new Date(last.updatedAt || last.ts).getTime() : 0;
+      sub.lastUpdatedAtMs = last
+        ? new Date(last.updatedAt || last.ts).getTime()
+        : 0;
+      sub.lastLiveHash = hashLiveCandle(live);
       socket.emit("chart:snapshot", {
         ok: true,
         chartId: sub.chartId,
         token: sub.token,
         intervalMin: sub.intervalMin,
-        rows,
+        rows: merged,
       });
     };
 
@@ -237,27 +291,48 @@ function attachSocketServer(httpServer) {
           since,
           Math.min(env.WS_CHART_MAX_DELTA || 200, 2000),
         );
+        const live = buildLiveCandleSnapshot(getLiveCandleForSub(sub));
+        const liveHash = hashLiveCandle(live);
 
-        if (!rows.length) continue;
+        let emitRows = rows;
+        if (live) {
+          emitRows = mergeLiveCandle(emitRows, live);
+        }
 
-        const last = rows[rows.length - 1];
-        const lastTs = new Date(last.ts).getTime();
-        const lastUpd = new Date(last.updatedAt || last.ts).getTime();
+        if (!emitRows.length) {
+          if (!live || liveHash === sub.lastLiveHash) {
+            continue;
+          }
+          emitRows = [live];
+        }
 
-        // If the only row returned is the same candle and updatedAt didn't change, skip emitting.
-        if (rows.length === 1 && lastTs === sub.lastTsMs && lastUpd === sub.lastUpdatedAtMs) {
+        const last = emitRows[emitRows.length - 1];
+        const lastTs = last?.ts ? new Date(last.ts).getTime() : 0;
+        const lastUpd = last?.updatedAt
+          ? new Date(last.updatedAt).getTime()
+          : last?.ts
+            ? new Date(last.ts).getTime()
+            : 0;
+
+        if (
+          rows.length === 1 &&
+          lastTs === sub.lastTsMs &&
+          lastUpd === sub.lastUpdatedAtMs &&
+          liveHash === sub.lastLiveHash
+        ) {
           continue;
         }
 
-        sub.lastTsMs = lastTs;
-        sub.lastUpdatedAtMs = lastUpd;
+        sub.lastTsMs = lastTs || sub.lastTsMs;
+        sub.lastUpdatedAtMs = lastUpd || sub.lastUpdatedAtMs;
+        sub.lastLiveHash = liveHash;
 
         socket.emit("chart:delta", {
           ok: true,
           chartId: sub.chartId,
           token: sub.token,
           intervalMin: sub.intervalMin,
-          rows,
+          rows: emitRows,
         });
       }
     };
@@ -338,6 +413,7 @@ function attachSocketServer(httpServer) {
         limit,
         lastTsMs: 0,
         lastUpdatedAtMs: 0,
+        lastLiveHash: null,
       };
 
       chartSubs.set(chartId, sub);

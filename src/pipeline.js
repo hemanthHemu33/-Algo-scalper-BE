@@ -494,6 +494,10 @@ function buildPipeline({ kite, tickerCtrl }) {
     return trader.status();
   }
 
+  function getLiveCandle(token, intervalMin) {
+    return candleBuilder.getCurrentCandle(token, intervalMin);
+  }
+
   async function candleFinalizerTick() {
     if (String(env.CANDLE_TIMER_FINALIZER_ENABLED || "true") !== "true") return;
     if (!isWithinMarketHours(new Date())) return;
@@ -525,6 +529,7 @@ function buildPipeline({ kite, tickerCtrl }) {
     ocoReconcile,
     setKillSwitch,
     status,
+    getLiveCandle,
     trader,
   };
 }
