@@ -380,11 +380,9 @@ class TradeManager {
   _computeRiskStopLoss({ entryPrice, side, instrument, qty, riskInr }) {
     const entry = Number(entryPrice);
     const baseRisk = Number(riskInr || env.RISK_PER_TRADE_INR || 0);
-    const lotSize = Number(
-      instrument?.lot_size || instrument?.lotSize || qty || 1,
-    );
-    const safeLot = Number.isFinite(lotSize) && lotSize > 0 ? lotSize : 1;
-    const riskPts = safeLot > 0 ? baseRisk / safeLot : 0;
+    const riskQty = Number(qty || instrument?.lot_size || instrument?.lotSize || 1);
+    const safeQty = Number.isFinite(riskQty) && riskQty > 0 ? riskQty : 1;
+    const riskPts = safeQty > 0 ? baseRisk / safeQty : 0;
     const tick = Number(instrument?.tick_size || 0.05);
     const raw =
       String(side || "BUY").toUpperCase() === "BUY"
@@ -399,8 +397,9 @@ class TradeManager {
     return {
       stopLoss,
       riskPts,
-      riskInr: riskPts * safeLot,
-      lotSize: safeLot,
+      riskInr: riskPts * safeQty,
+      lotSize: safeQty,
+      riskQty: safeQty,
       tick,
     };
   }
@@ -583,6 +582,19 @@ class TradeManager {
     }
   }
 
+  _isTargetRequired() {
+    return String(env.OPT_TP_ENABLED || "false") === "true";
+  }
+
+  _eventPatch(event, meta) {
+    if (!event) return {};
+    return {
+      lastEvent: String(event),
+      lastEventAt: new Date(),
+      lastEventMeta: meta || null,
+    };
+  }
+
   async _ensureDailyRisk() {
     const key = todayKey();
     const cur = await getDailyRisk(key);
@@ -635,6 +647,29 @@ class TradeManager {
     };
     if (state !== String(prevState || "RUNNING")) {
       patch.stateUpdatedAt = new Date();
+      logger.warn(
+        { prevState: prevState || "RUNNING", state, reason },
+        "[risk] daily state changed",
+      );
+      if (state === "SOFT_STOP") {
+        alert("warn", "⚠️ Daily soft stop reached", {
+          state,
+          reason,
+          total,
+        }).catch(() => {});
+      } else if (state === "HARD_STOP") {
+        alert("error", "🛑 Daily hard stop reached", {
+          state,
+          reason,
+          total,
+        }).catch(() => {});
+      } else if (state === "RUNNING") {
+        alert("info", "✅ Daily risk state reset to RUNNING", {
+          state,
+          reason,
+          total,
+        }).catch(() => {});
+      }
     }
 
     await upsertDailyRisk(todayKey(), patch);
@@ -3744,7 +3779,9 @@ class TradeManager {
           entry?.average_price || trade.entryPrice || trade.candle?.close,
         );
 
-        const missingExits = !trade.slOrderId || !trade.targetOrderId;
+        const missingExits =
+          !trade.slOrderId ||
+          (this._isTargetRequired() && !trade.targetOrderId);
         const qtyChanged = filledNow !== Number(trade.qty || 0);
 
         if (qtyChanged || missingExits) {
@@ -3814,7 +3851,7 @@ class TradeManager {
         tp1Aborted: true,
         tp1DeadReason: "TP1_" + String(tp1.status).toUpperCase(),
       });
-      if (!trade.targetOrderId) {
+      if (this._isTargetRequired() && !trade.targetOrderId) {
         try {
           await this._placeTargetOnly(trade);
         } catch {}
@@ -3854,7 +3891,7 @@ class TradeManager {
       }
 
       // If exits missing (rare), place them
-      if (!trade.slOrderId || !trade.targetOrderId) {
+      if (!trade.slOrderId || (this._isTargetRequired() && !trade.targetOrderId)) {
         await this._placeExitsIfMissing(trade);
       }
 
@@ -3933,6 +3970,33 @@ class TradeManager {
     if (!plan?.ok) return;
 
     if (plan?.action?.exitNow) {
+      if (plan?.tradePatch && Object.keys(plan.tradePatch).length) {
+        const patch = { ...plan.tradePatch };
+        if (plan.action.reason === "TIME_STOP") {
+          Object.assign(
+            patch,
+            this._eventPatch("TIME_STOP_TRIGGERED", {
+              tradeId,
+              timeStopAtMs: plan?.meta?.timeStopAtMs,
+              pnlInr: plan?.meta?.pnlInr,
+              minGreenInr: plan?.meta?.minGreenInr,
+            }),
+          );
+          alert("warn", "⏱️ Time stop triggered -> exit", {
+            tradeId,
+            timeStopAtMs: plan?.meta?.timeStopAtMs,
+            pnlInr: plan?.meta?.pnlInr,
+            minGreenInr: plan?.meta?.minGreenInr,
+          }).catch(() => {});
+          logger.warn(
+            { tradeId, meta: plan?.meta || null },
+            "[dyn_exit] time stop triggered",
+          );
+        }
+        try {
+          await updateTrade(tradeId, patch);
+        } catch {}
+      }
       await this._panicExit(trade, plan.action.reason || "DYN_EXIT_ACTION");
       this._dynExitLastAt.set(tradeId, now);
       return;
@@ -3940,7 +4004,29 @@ class TradeManager {
 
     if (plan?.tradePatch && Object.keys(plan.tradePatch).length) {
       try {
-        await updateTrade(tradeId, plan.tradePatch);
+        const patch = { ...plan.tradePatch };
+        if (patch.beLocked && !trade.beLocked) {
+          Object.assign(
+            patch,
+            this._eventPatch("BE_LOCK_ACTIVE", {
+              tradeId,
+              beLockedAtPrice: patch.beLockedAtPrice,
+              minGreenPts: trade?.minGreenPts,
+              minGreenInr: trade?.minGreenInr,
+            }),
+          );
+          alert("info", "🔒 BE lock active", {
+            tradeId,
+            beLockedAtPrice: patch.beLockedAtPrice,
+            minGreenPts: trade?.minGreenPts,
+            minGreenInr: trade?.minGreenInr,
+          }).catch(() => {});
+          logger.info(
+            { tradeId, beLockedAtPrice: patch.beLockedAtPrice },
+            "[dyn_exit] BE lock active",
+          );
+        }
+        await updateTrade(tradeId, patch);
       } catch {}
     }
 
@@ -3979,6 +4065,11 @@ class TradeManager {
           await updateTrade(tradeId, {
             stopLoss: plan.sl.stopLoss,
             slTrigger: plan.sl.stopLoss,
+            ...this._eventPatch("SL_TRAILED", {
+              tradeId,
+              stopLoss: plan.sl.stopLoss,
+              trailSl: plan?.tradePatch?.trailSl ?? trade?.trailSl,
+            }),
           });
           try {
             this._updateSlWatchTrigger(tradeId, plan.sl.stopLoss);
@@ -3988,6 +4079,10 @@ class TradeManager {
             { tradeId, stopLoss: plan.sl.stopLoss, meta: plan.meta },
             "[dyn_exit] SL trailed",
           );
+          alert("info", "🧭 SL trailed", {
+            tradeId,
+            stopLoss: plan.sl.stopLoss,
+          }).catch(() => {});
         } catch (e) {
           logger.warn(
             { tradeId, e: e.message, stopLoss: plan.sl.stopLoss },
@@ -4015,7 +4110,13 @@ class TradeManager {
             { price: plan.target.targetPrice },
             { purpose: "DYN_ADJUST_TARGET", tradeId },
           );
-          await updateTrade(tradeId, { targetPrice: plan.target.targetPrice });
+          await updateTrade(tradeId, {
+            targetPrice: plan.target.targetPrice,
+            ...this._eventPatch("TARGET_ADJUSTED", {
+              tradeId,
+              targetPrice: plan.target.targetPrice,
+            }),
+          });
           try {
             this._refreshTargetWatchAfterAdjust(
               { ...trade, targetPrice: plan.target.targetPrice },
@@ -4027,6 +4128,10 @@ class TradeManager {
             { tradeId, targetPrice: plan.target.targetPrice, meta: plan.meta },
             "[dyn_exit] TARGET adjusted",
           );
+          alert("info", "🎯 TARGET adjusted", {
+            tradeId,
+            targetPrice: plan.target.targetPrice,
+          }).catch(() => {});
         } catch (e) {
           logger.warn(
             { tradeId, e: e.message, targetPrice: plan.target.targetPrice },
@@ -6423,7 +6528,15 @@ class TradeManager {
       }
     }
 
-    await updateTrade(tradeId, { entryOrderId, status: STATUS.ENTRY_OPEN });
+    await updateTrade(tradeId, {
+      entryOrderId,
+      status: STATUS.ENTRY_OPEN,
+      ...this._eventPatch("ENTRY_PLACED", {
+        orderId: entryOrderId,
+        qty,
+        side,
+      }),
+    });
     await linkOrder({ order_id: String(entryOrderId), tradeId, role: "ENTRY" });
     await this._replayOrphanUpdates(entryOrderId);
 
@@ -6684,6 +6797,11 @@ class TradeManager {
           qty: filledQty,
           entrySlippageBps: slipBps,
           entryFilledAt: new Date(),
+          ...this._eventPatch("ENTRY_FILLED", {
+            avg,
+            filledQty,
+            slipBps,
+          }),
         });
 
         // Slippage guard (primarily for MARKET entries). Options are noisier; thresholds are segment-aware.
@@ -6770,6 +6888,19 @@ class TradeManager {
             ? new Date(Date.now() + timeStopMin * 60 * 1000)
             : null;
 
+        logger.info(
+          {
+            tradeId: trade.tradeId,
+            riskStopPrice: riskStop.stopLoss,
+            riskPts: riskStop.riskPts,
+            riskInr: riskStop.riskInr,
+            minGreenInr: minGreen.minGreenInr,
+            minGreenPts: minGreen.minGreenPts,
+            timeStopAt,
+          },
+          "[trade] risk/min-green computed",
+        );
+
         await updateTrade(trade.tradeId, {
           stopLoss: riskStop.stopLoss,
           initialStopLoss: riskStop.stopLoss,
@@ -6777,6 +6908,10 @@ class TradeManager {
           riskPts: riskStop.riskPts,
           riskInr: riskStop.riskInr,
           lotSize: riskStop.lotSize,
+          riskStopPrice: riskStop.stopLoss,
+          riskStopPts: riskStop.riskPts,
+          riskStopInr: riskStop.riskInr,
+          riskQty: riskStop.riskQty,
           estChargesInr: minGreen.estChargesInr,
           slippageBufferInr: minGreen.slippageBufferInr,
           minGreenInr: minGreen.minGreenInr,
@@ -6832,6 +6967,10 @@ class TradeManager {
           status: STATUS.ENTRY_OPEN,
           entryPrice: avgNow > 0 ? avgNow : trade.entryPrice,
           qty: filledNow,
+          ...this._eventPatch("ENTRY_PARTIAL_FILL", {
+            avg: avgNow,
+            filledQty: filledNow,
+          }),
         });
         const minGreenEnabled =
           String(env.MIN_GREEN_ENABLED || "true") === "true";
@@ -6862,6 +7001,19 @@ class TradeManager {
           Number.isFinite(timeStopMin) && timeStopMin > 0
             ? new Date(Date.now() + timeStopMin * 60 * 1000)
             : null;
+        logger.info(
+          {
+            tradeId: trade.tradeId,
+            riskStopPrice: riskStop.stopLoss,
+            riskPts: riskStop.riskPts,
+            riskInr: riskStop.riskInr,
+            minGreenInr: minGreen.minGreenInr,
+            minGreenPts: minGreen.minGreenPts,
+            timeStopAt,
+          },
+          "[trade] risk/min-green computed (partial)",
+        );
+
         await updateTrade(trade.tradeId, {
           stopLoss: riskStop.stopLoss,
           initialStopLoss: riskStop.stopLoss,
@@ -6869,6 +7021,10 @@ class TradeManager {
           riskPts: riskStop.riskPts,
           riskInr: riskStop.riskInr,
           lotSize: riskStop.lotSize,
+          riskStopPrice: riskStop.stopLoss,
+          riskStopPts: riskStop.riskPts,
+          riskStopInr: riskStop.riskInr,
+          riskQty: riskStop.riskQty,
           estChargesInr: minGreen.estChargesInr,
           slippageBufferInr: minGreen.slippageBufferInr,
           minGreenInr: minGreen.minGreenInr,
@@ -8182,7 +8338,14 @@ class TradeManager {
           { trigger_price: newSL, quantity: remaining },
           { purpose: "TP1_TO_BE_AND_RESIZE_SL", tradeId },
         );
-        await updateTrade(tradeId, { stopLoss: newSL });
+        await updateTrade(tradeId, {
+          stopLoss: newSL,
+          ...this._eventPatch("SL_MOVED_BE", {
+            tradeId,
+            stopLoss: newSL,
+            remaining,
+          }),
+        });
         try {
           this._updateSlWatchTrigger(tradeId, newSL);
         } catch {}
@@ -8190,6 +8353,11 @@ class TradeManager {
           { tradeId, stopLoss: newSL, remaining },
           "[tp1] SL moved to BE+buffer and resized",
         );
+        alert("info", "🧷 SL moved to BE+buffer", {
+          tradeId,
+          stopLoss: newSL,
+          remaining,
+        }).catch(() => {});
       } catch (e) {
         logger.error(
           { tradeId, e: e.message },
@@ -8370,6 +8538,11 @@ class TradeManager {
           slOrderId,
           slOrderType: slOrderTypeUsed,
           slLimitPrice: slLimitPriceUsed,
+          ...this._eventPatch("SL_PLACED", {
+            slOrderId,
+            stopLoss: liveStopLoss,
+            slOrderType: slOrderTypeUsed,
+          }),
         });
 
         // Register SL watchdog state (for SL-L)
@@ -8403,6 +8576,9 @@ class TradeManager {
           targetVirtual: false,
           tp1OrderId: null,
           tp1Aborted: true,
+          ...this._eventPatch("TP_DISABLED", {
+            reason: "OPT_TP_ENABLED=false",
+          }),
         });
         return;
       }
@@ -9058,6 +9234,8 @@ class TradeManager {
       activeTrade: active,
       recoveredPosition: this.recoveredPosition,
       dailyRisk: risk,
+      dailyRiskState: risk?.state || "RUNNING",
+      dailyRiskReason: risk?.stateReason || null,
       ordersPlacedToday: this.ordersPlacedToday,
     };
   }
