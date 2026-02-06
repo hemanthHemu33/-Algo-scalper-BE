@@ -7,9 +7,30 @@ const {
   getSubscribedTokens,
 } = require("../kite/tickerManager");
 const { isHalted, getHaltInfo } = require("../runtime/halt");
+const { getTradingEnabled } = require("../runtime/tradingEnabled");
 const { getDb } = require("../db");
+const { telemetry } = require("../telemetry/signalTelemetry");
+const { tradeTelemetry } = require("../telemetry/tradeTelemetry");
+const { optimizer } = require("../optimizer/adaptiveOptimizer");
+const { costCalibrator } = require("../trading/costCalibrator");
+const { equityService } = require("../account/equityService");
+const { buildPositionsSnapshot } = require("../trading/positionService");
+const { getOrdersSnapshot } = require("../trading/orderService");
+const { getRiskLimits } = require("../risk/riskLimits");
+const { getStrategyKpis } = require("../telemetry/strategyKpi");
+const { getExecutionQuality } = require("../execution/executionStats");
+const { marketHealth } = require("../market/marketHealth");
+const { listAuditLogs } = require("../audit/auditLog");
+const { listChannels, listIncidents } = require("../alerts/notificationCenter");
+const { getMarketCalendarMeta } = require("../market/marketCalendar");
+const { getLastFnoUniverse } = require("../fno/fnoUniverse");
+const { getQuoteGuardStats } = require("../kite/quoteGuard");
 const { getRecentCandles, getCandlesSince } = require("../market/candleStore");
 const { ltpStream, getLatestLtp } = require("../market/ltpStream");
+const {
+  normalizeActiveTrade,
+  normalizeTradeRow,
+} = require("../trading/tradeNormalization");
 
 function parseCorsAllowList() {
   const raw = String(env.CORS_ORIGIN || "*").trim();
@@ -69,13 +90,183 @@ async function buildStatusSnapshot() {
   const s = await pipeline.status();
   const ticker = getTickerStatus();
   const halted = isHalted();
+  const normalizedTicker = {
+    connected: false,
+    lastDisconnect: null,
+    hasSession: false,
+    ...(ticker || {}),
+  };
+  const dailyPnL =
+    s?.dailyRisk?.lastTotal ??
+    s?.dailyRisk?.lastRealizedPnl ??
+    s?.dailyRisk?.realizedPnl ??
+    null;
+  const state = s?.dailyRiskState ?? s?.dailyRisk?.state ?? "RUNNING";
+  const activeTrade = normalizeActiveTrade(s?.activeTrade);
+  const activeTradeId = s?.activeTradeId ?? null;
+  const targetMode =
+    activeTrade?.optTargetMode ||
+    (activeTrade?.targetVirtual ? "VIRTUAL" : null) ||
+    (env.OPT_TARGET_MODE ? String(env.OPT_TARGET_MODE).toUpperCase() : null);
+  const stopMode = activeTrade?.optStopMode || env.OPT_STOP_MODE || null;
+  const targetStatus = activeTrade
+    ? activeTrade?.targetOrderId
+      ? activeTrade?.targetVirtual
+        ? "VIRTUAL"
+        : "PLACED"
+      : activeTrade?.targetPrice
+        ? "PENDING"
+        : null
+    : null;
+  const tradeTracking = {
+    tracker: activeTrade?.strategyId || activeTrade?.tracker || null,
+    targetMode,
+    targetStatus,
+    stopMode,
+    lastEvent: activeTrade?.lastEvent || null,
+    lastUpdate: activeTrade?.updatedAt || null,
+    activeTradeId,
+    activeTrade,
+  };
+  const systemHealth = {
+    lastSocketEvent: s?.lastSocketEvent || null,
+    lastDisconnect: normalizedTicker.lastDisconnect || null,
+    rejectedTrades:
+      s?.rejectedTrades ??
+      s?.dailyRisk?.rejectedTrades ??
+      s?.dailyRisk?.rejections ??
+      null,
+  };
   return {
     ok: true,
     ...s,
+    tradingEnabled: s?.tradingEnabled ?? getTradingEnabled(),
+    killSwitch: s?.killSwitch ?? false,
     halted,
     haltInfo: getHaltInfo(),
-    ticker,
+    ticker: normalizedTicker,
     now: new Date().toISOString(),
+    tradesToday: s?.tradesToday ?? 0,
+    ordersPlacedToday: s?.ordersPlacedToday ?? 0,
+    dailyPnL,
+    state,
+    activeTradeId,
+    activeTrade,
+    tradeTracking,
+    systemHealth,
+  };
+}
+
+function getKiteClient() {
+  try {
+    const pipeline = getPipeline();
+    return pipeline?.trader?.kite || null;
+  } catch {
+    return null;
+  }
+}
+
+async function buildCriticalHealthSnapshot() {
+  const ticker = getTickerStatus();
+  const halted = isHalted();
+  const haltInfo = getHaltInfo();
+  const quoteGuard = getQuoteGuardStats();
+
+  let pipeline = null;
+  try {
+    pipeline = getPipeline();
+  } catch {}
+
+  const killSwitch = !!pipeline?.trader?.risk?.killSwitch;
+  const checks = [];
+
+  if (env.CRITICAL_HEALTH_REQUIRE_TICKER_CONNECTED && !ticker?.connected) {
+    checks.push({ ok: false, code: "TICKER_NOT_CONNECTED" });
+  } else {
+    checks.push({ ok: true, code: "TICKER_CONNECTED" });
+  }
+
+  if (env.CRITICAL_HEALTH_FAIL_ON_HALT && halted) {
+    checks.push({ ok: false, code: "HALTED", meta: haltInfo || null });
+  } else {
+    checks.push({ ok: true, code: "NOT_HALTED" });
+  }
+
+  if (env.CRITICAL_HEALTH_FAIL_ON_KILL_SWITCH && killSwitch) {
+    checks.push({ ok: false, code: "KILL_SWITCH" });
+  } else {
+    checks.push({ ok: true, code: "KILL_SWITCH_OFF" });
+  }
+
+  const breakerUntil = Number(quoteGuard?.breakerOpenUntil || 0);
+  const breakerOpen = breakerUntil > Date.now();
+  if (env.CRITICAL_HEALTH_FAIL_ON_QUOTE_BREAKER && breakerOpen) {
+    checks.push({
+      ok: false,
+      code: "QUOTE_BREAKER_OPEN",
+      meta: {
+        breakerOpenUntil: breakerUntil,
+        failStreak: quoteGuard?.failStreak || 0,
+        lastError: quoteGuard?.lastError || null,
+      },
+    });
+  } else {
+    checks.push({ ok: true, code: "QUOTE_BREAKER_OK" });
+  }
+
+  const ok = checks.every((c) => c.ok);
+  return {
+    ok,
+    now: new Date().toISOString(),
+    checks,
+    ticker,
+    halted,
+    haltInfo,
+    killSwitch,
+    quoteGuard,
+    pipeline: pipeline ? { ok: true } : { ok: false },
+  };
+}
+
+async function buildTelemetrySnapshot() {
+  const snapshot = telemetry.snapshot();
+  const isEmpty =
+    Number(snapshot.candidatesTotal || 0) === 0 &&
+    Number(snapshot.decisionsTotal || 0) === 0 &&
+    Number(snapshot.blockedTotal || 0) === 0;
+
+  if (!isEmpty) {
+    return { ok: true, source: "memory", data: snapshot };
+  }
+
+  const doc = await telemetry.readDailyFromDb(snapshot.dayKey);
+  if (doc) {
+    return { ok: true, source: "db", data: doc };
+  }
+
+  return { ok: true, source: "memory", data: snapshot };
+}
+
+function buildTradeTelemetrySnapshot() {
+  const data = tradeTelemetry.snapshot();
+  const lastUpdated = data?.lastUpdated ?? data?.updatedAt ?? null;
+  return {
+    ok: true,
+    data: {
+      ...data,
+      targetMode: data?.targetMode ?? null,
+      targetStatus: data?.targetStatus ?? null,
+      stopMode: data?.stopMode ?? null,
+      trackerStatus: data?.trackerStatus ?? null,
+      lastEvent: data?.lastEvent ?? null,
+      lastUpdated,
+      target_mode: data?.target_mode ?? data?.targetMode ?? null,
+      target_status: data?.target_status ?? data?.targetStatus ?? null,
+      stop_mode: data?.stop_mode ?? data?.stopMode ?? null,
+      tracker_status: data?.tracker_status ?? data?.trackerStatus ?? null,
+      last_event: data?.last_event ?? data?.lastEvent ?? null,
+      last_updated: data?.last_updated ?? lastUpdated,
+    },
   };
 }
 
@@ -162,11 +353,12 @@ function attachSocketServer(httpServer) {
     const timers = new Map();
     const chartSubs = new Map();
     const ltpSubs = new Map();
-
-    let lastStatusHash = null;
-    let lastSubsHash = null;
+    const snapshotHashes = new Map();
     const includeLiveCharts =
       String(env.WS_CHART_INCLUDE_LIVE || "true") === "true";
+    const defaultSnapshotIntervalMs = Number(
+      env.WS_ADMIN_SNAPSHOT_INTERVAL_MS || 5000,
+    );
 
     // ---- helpers
     const stopTimer = (key) => {
@@ -190,50 +382,67 @@ function attachSocketServer(httpServer) {
       timers.set(key, t);
     };
 
+    const emitSnapshot = (names, payload) => {
+      const list = Array.isArray(names) ? names : [names];
+      for (const name of list) {
+        socket.emit(name, payload);
+      }
+    };
+
+    const emitIfChanged = (key, names, payload) => {
+      const h = safeJsonHash(payload);
+      if (h === snapshotHashes.get(key)) return;
+      snapshotHashes.set(key, h);
+      emitSnapshot(names, payload);
+    };
+
     const sendStatus = async () => {
       const snap = await buildStatusSnapshot();
-      const h = safeJsonHash(snap);
-      if (h !== lastStatusHash) {
-        lastStatusHash = h;
-        socket.emit("status:update", snap);
-      }
+      emitIfChanged("status", ["status:update", "status"], snap);
     };
 
     const sendSubs = async () => {
       const tokens = getSubscribedTokens ? getSubscribedTokens() : [];
       const snap = { ok: true, count: tokens.length, tokens };
-      const h = safeJsonHash(snap);
-      if (h !== lastSubsHash) {
-        lastSubsHash = h;
-        socket.emit("subs:update", snap);
-      }
+      emitIfChanged("subs", ["subs:update", "subs", "subscriptions"], snap);
     };
 
-    const sendTradesSnapshot = async (limit = 50) => {
+    const fetchTradesSnapshot = async (limit = 50) => {
       const lim = Number(limit);
       const safeLimit = Number.isFinite(lim) ? Math.min(200, Math.max(1, lim)) : 50;
       const db = getDb();
       const rows = await db
         .collection("trades")
         .find({})
-        .sort({ updatedAt: -1, createdAt: -1 })
+        .sort({ createdAt: -1 })
         .limit(safeLimit)
         .toArray();
-      socket.emit("trades:snapshot", { ok: true, rows });
-      return rows;
+      return { ok: true, rows: rows.map((row) => normalizeTradeRow(row)), limit: safeLimit };
+    };
+
+    const sendTradesSnapshot = async (limit = 50) => {
+      const { limit: safeLimit, ...payload } = await fetchTradesSnapshot(limit);
+      emitIfChanged(`trades:snapshot:${safeLimit}`, "trades:snapshot", payload);
+      return payload.rows;
+    };
+
+    const sendTradesRecentSnapshot = async (limit = 10) => {
+      const { limit: safeLimit, ...payload } = await fetchTradesSnapshot(limit);
+      emitIfChanged("trades:recent", ["trades", "trades:recent"], payload);
+      return payload.rows;
     };
 
     const sendLtpSnapshot = (sub) => {
       const payload = getLatestLtp(sub.token);
       if (payload) {
-        socket.emit("ltp:update", { ok: true, ...payload });
+        emitSnapshot(["ltp:update", "ltp", "tick"], { ok: true, ...payload });
       }
     };
 
     const handleLtpTick = (payload) => {
       const sub = ltpSubs.get(payload.token);
       if (!sub) return;
-      socket.emit("ltp:update", { ok: true, ...payload });
+      emitSnapshot(["ltp:update", "ltp", "tick"], { ok: true, ...payload });
     };
 
     // trades: keep a per-socket tail cursor
@@ -256,7 +465,10 @@ function attachSocketServer(httpServer) {
           last.updatedAt || last.createdAt || Date.now(),
         ).getTime();
         if (Number.isFinite(lastMs) && lastMs > tradesCursorMs) tradesCursorMs = lastMs;
-        socket.emit("trades:delta", { ok: true, rows });
+        socket.emit("trades:delta", {
+          ok: true,
+          rows: rows.map((row) => normalizeTradeRow(row)),
+        });
       }
     };
 
@@ -288,7 +500,251 @@ function attachSocketServer(httpServer) {
         intervalMin: sub.intervalMin,
         rows: merged,
       });
+      emitIfChanged(`candles:${sub.chartId}`, ["candles", "candles:recent"], {
+        ok: true,
+        rows: merged,
+      });
     };
+
+    const sendCandlesSnapshot = async (sub) => {
+      const rows = await getRecentCandles(sub.token, sub.intervalMin, sub.limit);
+      const live = buildLiveCandleSnapshot(getLiveCandleForSub(sub));
+      const merged = mergeLiveCandle(rows, live);
+      emitIfChanged(`candles:${sub.chartId}`, ["candles", "candles:recent"], {
+        ok: true,
+        rows: merged,
+      });
+    };
+
+    const sendEquitySnapshot = async () => {
+      const kite = getKiteClient();
+      const data = await equityService.snapshot({ kite });
+      emitIfChanged("equity", "equity", { ok: true, ...data });
+    };
+
+    const sendPositionsSnapshot = async () => {
+      const kite = getKiteClient();
+      const rows = await buildPositionsSnapshot({ kite });
+      emitIfChanged("positions", "positions", { ok: true, rows });
+    };
+
+    const sendOrdersSnapshot = async () => {
+      const kite = getKiteClient();
+      const rows = await getOrdersSnapshot({ kite });
+      emitIfChanged("orders", "orders", { ok: true, rows });
+    };
+
+    const sendRiskLimitsSnapshot = async () => {
+      const limits = await getRiskLimits();
+      const resolved = limits?.limits || {};
+      const maxDailyLoss = resolved.dailyLossCapInr ?? null;
+      const maxDrawdown = resolved.maxDrawdownInr ?? null;
+      const maxOpenTrades = resolved.maxOpenTrades ?? null;
+      const maxExposureInr = resolved.maxPortfolioExposureInr ?? null;
+      const positions = await buildPositionsSnapshot({ kite: getKiteClient() });
+      const exposureBySymbol = {};
+      for (const p of positions) {
+        const key = p.tradingsymbol || String(p.instrument_token || "");
+        exposureBySymbol[key] = (exposureBySymbol[key] || 0) + (p.exposureInr || 0);
+      }
+      emitIfChanged("risk:limits", "risk:limits", {
+        ok: true,
+        ...limits,
+        maxDailyLoss,
+        maxDrawdown,
+        maxOpenTrades,
+        maxExposureInr,
+        usage: {
+          openPositions: positions.length,
+          exposureBySymbol,
+        },
+      });
+    };
+
+    const sendStrategyKpisSnapshot = async () => {
+      const data = await getStrategyKpis({ limit: 500 });
+      emitIfChanged("strategy:kpis", "strategy:kpis", { ok: true, ...data });
+    };
+
+    const sendExecutionQualitySnapshot = async () => {
+      const data = await getExecutionQuality({ limit: 500 });
+      emitIfChanged("execution:quality", "execution:quality", {
+        ok: true,
+        ...data,
+        fillRate: data?.fillRate ?? null,
+        avgSlippage:
+          data?.slippage?.avgEntrySlippageBps ??
+          data?.slippage?.avgExitSlippageInr ??
+          null,
+        avgLatencyMs:
+          data?.latency?.orderPlacementMs ??
+          data?.latency?.orderFillMs ??
+          data?.latency?.exitFillMs ??
+          null,
+        rejects: data?.rejections ?? {},
+      });
+    };
+
+    const sendMarketHealthSnapshot = async () => {
+      const data = marketHealth.snapshot({ tokens: null });
+      emitIfChanged("market:health", "market:health", { ok: true, ...data });
+    };
+
+    const sendAuditLogsSnapshot = async () => {
+      const rows = await listAuditLogs({ limit: 100 });
+      emitIfChanged("audit:logs", "audit:logs", { ok: true, rows });
+    };
+
+    const sendAlertsChannelsSnapshot = async () => {
+      const rows = await listChannels();
+      emitIfChanged("alerts:channels", "alerts:channels", { ok: true, rows });
+    };
+
+    const sendAlertsIncidentsSnapshot = async () => {
+      const rows = await listIncidents({ limit: 100 });
+      emitIfChanged("alerts:incidents", "alerts:incidents", { ok: true, rows });
+    };
+
+    const sendTelemetrySnapshot = async () => {
+      const snap = await buildTelemetrySnapshot();
+      emitIfChanged("telemetry", ["telemetry", "telemetry:snapshot"], snap);
+    };
+
+    const sendTradeTelemetrySnapshot = async () => {
+      const snap = buildTradeTelemetrySnapshot();
+      emitIfChanged("tradeTelemetry", ["tradeTelemetry", "tradeTelemetry:snapshot"], snap);
+    };
+
+    const sendOptimizerSnapshot = async () => {
+      const snap = { ok: true, data: optimizer.snapshot() };
+      emitIfChanged("optimizer", ["optimizer", "optimizer:snapshot"], snap);
+    };
+
+    const sendRejectionsSnapshot = async () => {
+      const snap = {
+        ok: true,
+        source: "memory",
+        data: telemetry.rejectionsSnapshot({}),
+      };
+      emitIfChanged("rejections", "rejections", snap);
+    };
+
+    const sendCostCalibrationSnapshot = async () => {
+      const snap = costCalibrator.snapshot();
+      const recent = await costCalibrator.recentRuns(10);
+      emitIfChanged("cost:calibration", "cost:calibration", {
+        ok: true,
+        calibration: snap,
+        recentRuns: recent,
+      });
+    };
+
+    const sendMarketCalendarSnapshot = async () => {
+      const meta = getMarketCalendarMeta();
+      emitIfChanged("market:calendar", "market:calendar", { ok: true, meta });
+    };
+
+    const sendFnoSnapshot = async () => {
+      const u = getLastFnoUniverse();
+      const payload = u || { ok: true, enabled: false, universe: null };
+      emitIfChanged("fno", "fno", payload);
+    };
+
+    const sendHealthCriticalSnapshot = async () => {
+      const snap = await buildCriticalHealthSnapshot();
+      emitIfChanged("health:critical", "health:critical", snap);
+    };
+
+    const tradesRecentLimit = Number(env.WS_TRADES_RECENT_LIMIT || 10);
+    const tradesRecentIntervalMs = Number(
+      env.WS_TRADES_RECENT_INTERVAL_MS || defaultSnapshotIntervalMs,
+    );
+
+    const bootstrapSnapshots = () => {
+      sendStatus().catch(() => {});
+      sendSubs().catch(() => {});
+      sendTradesRecentSnapshot(tradesRecentLimit).catch(() => {});
+      sendEquitySnapshot().catch(() => {});
+      sendPositionsSnapshot().catch(() => {});
+      sendOrdersSnapshot().catch(() => {});
+      sendRiskLimitsSnapshot().catch(() => {});
+      sendStrategyKpisSnapshot().catch(() => {});
+      sendExecutionQualitySnapshot().catch(() => {});
+      sendMarketHealthSnapshot().catch(() => {});
+      sendAuditLogsSnapshot().catch(() => {});
+      sendAlertsChannelsSnapshot().catch(() => {});
+      sendAlertsIncidentsSnapshot().catch(() => {});
+      sendTelemetrySnapshot().catch(() => {});
+      sendTradeTelemetrySnapshot().catch(() => {});
+      sendOptimizerSnapshot().catch(() => {});
+      sendRejectionsSnapshot().catch(() => {});
+      sendCostCalibrationSnapshot().catch(() => {});
+      sendMarketCalendarSnapshot().catch(() => {});
+      sendFnoSnapshot().catch(() => {});
+      sendHealthCriticalSnapshot().catch(() => {});
+    };
+
+    bootstrapSnapshots();
+
+    startTimer(
+      "status",
+      Number(env.WS_STATUS_INTERVAL_MS || 2000),
+      sendStatus,
+    );
+    startTimer(
+      "subs",
+      Number(env.WS_SUBS_INTERVAL_MS || 5000),
+      sendSubs,
+    );
+    startTimer("trades:recent", tradesRecentIntervalMs, () =>
+      sendTradesRecentSnapshot(tradesRecentLimit),
+    );
+    startTimer("equity", defaultSnapshotIntervalMs, sendEquitySnapshot);
+    startTimer("positions", defaultSnapshotIntervalMs, sendPositionsSnapshot);
+    startTimer("orders", defaultSnapshotIntervalMs, sendOrdersSnapshot);
+    startTimer("risk:limits", defaultSnapshotIntervalMs, sendRiskLimitsSnapshot);
+    startTimer("strategy:kpis", defaultSnapshotIntervalMs, sendStrategyKpisSnapshot);
+    startTimer(
+      "execution:quality",
+      defaultSnapshotIntervalMs,
+      sendExecutionQualitySnapshot,
+    );
+    startTimer("market:health", defaultSnapshotIntervalMs, sendMarketHealthSnapshot);
+    startTimer("audit:logs", defaultSnapshotIntervalMs, sendAuditLogsSnapshot);
+    startTimer(
+      "alerts:channels",
+      defaultSnapshotIntervalMs,
+      sendAlertsChannelsSnapshot,
+    );
+    startTimer(
+      "alerts:incidents",
+      defaultSnapshotIntervalMs,
+      sendAlertsIncidentsSnapshot,
+    );
+    startTimer("telemetry", defaultSnapshotIntervalMs, sendTelemetrySnapshot);
+    startTimer(
+      "tradeTelemetry",
+      defaultSnapshotIntervalMs,
+      sendTradeTelemetrySnapshot,
+    );
+    startTimer("optimizer", defaultSnapshotIntervalMs, sendOptimizerSnapshot);
+    startTimer("rejections", defaultSnapshotIntervalMs, sendRejectionsSnapshot);
+    startTimer(
+      "cost:calibration",
+      defaultSnapshotIntervalMs,
+      sendCostCalibrationSnapshot,
+    );
+    startTimer(
+      "market:calendar",
+      defaultSnapshotIntervalMs,
+      sendMarketCalendarSnapshot,
+    );
+    startTimer("fno", defaultSnapshotIntervalMs, sendFnoSnapshot);
+    startTimer(
+      "health:critical",
+      defaultSnapshotIntervalMs,
+      sendHealthCriticalSnapshot,
+    );
 
     const pollCharts = async () => {
       if (!chartSubs.size) return;
@@ -349,6 +805,7 @@ function attachSocketServer(httpServer) {
           intervalMin: sub.intervalMin,
           rows: emitRows,
         });
+        await sendCandlesSnapshot(sub);
       }
     };
 
