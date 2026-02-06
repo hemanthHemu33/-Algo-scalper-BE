@@ -6170,7 +6170,7 @@ class TradeManager {
 
     if (lotRiskCapEnforce && (qtyMode !== "MARGIN" || lotRiskApplyInMargin)) {
       const entryForRisk = Number(expectedEntryPrice || entryGuess || 0);
-      const perUnitRisk = Math.abs(entryForRisk - Number(stopLoss || 0));
+      let perUnitRisk = Math.abs(entryForRisk - Number(stopLoss || 0));
       const intendedRiskInr = Number(
         _riskInrOverride || env.RISK_PER_TRADE_INR || 0,
       );
@@ -6183,7 +6183,7 @@ class TradeManager {
         Number.isFinite(capInr) &&
         capInr > 0
       ) {
-        const trueRiskInr = perUnitRisk * qty;
+        let trueRiskInr = perUnitRisk * qty;
         if (trueRiskInr > capInr) {
           const lot = Math.max(1, Number(instrument?.lot_size || 1));
 
@@ -6195,6 +6195,7 @@ class TradeManager {
 
           newQty = this._normalizeQtyToLot(newQty, instrument);
 
+          let rescuedBySlFit = false;
           if (newQty < 1) {
             // FORCE_ONE_LOT + small cap can hard-block trades because you cannot take < 1 lot.
             // In OPT mode, a safe "rescue" is to tighten SL toward entry so 1-lot risk fits the cap.
@@ -6226,11 +6227,16 @@ class TradeManager {
               if (fit.ok) {
                 const oldSL = stopLoss;
                 const qtyOld = qty;
+                const perUnitRiskOld = perUnitRisk;
                 // In FORCE_ONE_LOT scenarios, prefer taking the minimum 1 lot (not multiple lots),
                 // otherwise even a fitted SL may still exceed cap for larger qty.
                 qty = this._normalizeQtyToLot(lot, instrument) || lot;
 
                 stopLoss = fit.stopLoss;
+                perUnitRisk = fit.perUnitRisk;
+                trueRiskInr = perUnitRisk * qty;
+                newQty = qty;
+                rescuedBySlFit = true;
 
                 // Keep planned target consistent with rrTarget if we already have a planned target.
                 if (plannedTargetPrice != null) {
@@ -6255,7 +6261,7 @@ class TradeManager {
                     oldSL,
                     newSL: stopLoss,
                     capInr,
-                    perUnitRiskOld: perUnitRisk,
+                    perUnitRiskOld,
                     perUnitRiskNew: fit.perUnitRisk,
                     allowedPerUnitRisk: fit.allowedPerUnitRisk,
                     minStopDistance: fit.minStop,
@@ -6310,23 +6316,25 @@ class TradeManager {
             }
           }
 
-          logger.warn(
-            {
-              token,
-              side: side,
-              qtyOld: qty,
-              qtyNew: newQty,
-              trueRiskInr,
-              capInr,
-              perUnitRisk,
-              lot,
-              qtyMode,
-              intendedRiskInr,
-            },
-            "[risk] qty reduced to respect lot risk cap",
-          );
+          if (!rescuedBySlFit) {
+            logger.warn(
+              {
+                token,
+                side: side,
+                qtyOld: qty,
+                qtyNew: newQty,
+                trueRiskInr,
+                capInr,
+                perUnitRisk,
+                lot,
+                qtyMode,
+                intendedRiskInr,
+              },
+              "[risk] qty reduced to respect lot risk cap",
+            );
 
-          qty = newQty;
+            qty = newQty;
+          }
         }
       }
     }
