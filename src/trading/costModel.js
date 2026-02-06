@@ -351,8 +351,66 @@ function costGate({
   };
 }
 
+function estimateMinGreen({
+  entryPrice,
+  qty,
+  spreadBps,
+  env,
+  instrument,
+  segmentKey,
+  product,
+} = {}) {
+  const price = n(entryPrice);
+  const q = n(qty);
+  const segKey = segmentKeyFromContext({
+    instrument,
+    segmentKey,
+    product,
+    env,
+  });
+
+  if (!(price > 0) || !(q > 0)) {
+    return {
+      estChargesInr: 0,
+      slippageBufferInr: 0,
+      minGreenInr: 0,
+      minGreenPts: 0,
+      meta: { segmentKey: segKey, note: "invalid_inputs" },
+    };
+  }
+
+  const { estCostInr, meta: costMeta } = estimateRoundTripCostInr({
+    entryPrice: price,
+    qty: q,
+    spreadBps,
+    env,
+    instrument,
+    segmentKey,
+    product,
+  });
+
+  const bufferPts =
+    segKey === "OPT" ? n(env?.MIN_GREEN_SLIPPAGE_PTS_OPT, 2) : 0;
+  const slippageBufferInr = bufferPts * q;
+  const minGreenInr = Math.max(0, n(estCostInr, 0) + slippageBufferInr);
+  const minGreenPts = q > 0 ? minGreenInr / q : 0;
+
+  return {
+    estChargesInr: n(estCostInr, 0),
+    slippageBufferInr,
+    minGreenInr,
+    minGreenPts,
+    meta: {
+      ...(costMeta || {}),
+      segmentKey: segKey,
+      bufferPts,
+    },
+  };
+}
+
 module.exports = {
   estimateRoundTripCostInr,
   costGate,
   segmentKeyFromContext,
+  estimateMinGreen,
 };

@@ -435,7 +435,7 @@ const schema = z.object({
   // Stop-loss order type controls
   // NOTE: Many F&O segments disallow SL-M, so default for derivatives is SL (stoploss-limit).
   STOPLOSS_ORDER_TYPE_EQ: z.string().default("SL-M"), // equities (NSE cash etc.)
-  STOPLOSS_ORDER_TYPE_FO: z.string().default("SL"), // derivatives (NFO/BFO/CDS/MCX etc.)
+  STOPLOSS_ORDER_TYPE_FO: z.string().default("SL-M"), // derivatives (NFO/BFO/CDS/MCX etc.)
 
   // If STOPLOSS_ORDER_TYPE_* is "SL", we must provide a LIMIT price.
   // We set it near the trigger to behave like SL-M without violating execution ranges.
@@ -466,6 +466,19 @@ const schema = z.object({
 
   // Risk limits
   RISK_PER_TRADE_INR: z.coerce.number().default(450),
+  DAILY_PROFIT_GOAL_INR: z.coerce.number().default(2000),
+
+  // Exit management (min-green, breakeven lock, trailing, time stop)
+  MIN_GREEN_ENABLED: z.string().default("true"),
+  MIN_GREEN_SLIPPAGE_PTS_OPT: z.coerce.number().default(2),
+  BE_LOCK_AT_PROFIT_INR: z.coerce.number().default(200),
+  TRAIL_GAP_PREMIUM_POINTS: z.coerce.number().default(8),
+  TIME_STOP_MIN: z.coerce.number().default(5),
+  EXIT_LOOP_MS: z.coerce.number().default(1500),
+  STALE_TICK_MS: z.coerce.number().default(3000),
+
+  // Disable TP orders (SL-only mode)
+  OPT_TP_ENABLED: z.string().default("false"),
 
   // PATCH-10: Post-fill risk recheck (fills can drift; re-fit SL or exit)
   POST_FILL_RISK_RECHECK_ENABLED: z.coerce.boolean().default(true),
