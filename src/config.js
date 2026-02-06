@@ -36,6 +36,7 @@ const schema = z.object({
   WS_TRADES_INTERVAL_MS: z.coerce.number().default(2000),
   WS_CHART_INTERVAL_MS: z.coerce.number().default(1000),
   WS_CHART_MAX_DELTA: z.coerce.number().default(200),
+  WS_CHART_INCLUDE_LIVE: z.string().default("true"),
 
   // Local dotenv loader toggle (config.js pre-loads dotenv using process.env too)
   DOTENV_ENABLED: z.string().optional(),

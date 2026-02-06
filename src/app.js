@@ -490,6 +490,9 @@ function buildApp() {
       const intervalMin = Number(
         req.query.intervalMin || req.query.interval || 1,
       );
+      const includeLive =
+        String(req.query.includeLive || req.query.live || "false") === "true" ||
+        String(req.query.includeLive || req.query.live || "0") === "1";
 
       const limitRaw = Number(req.query.limit || 300);
       const limit = Number.isFinite(limitRaw)
@@ -500,7 +503,27 @@ function buildApp() {
         return res.status(400).json({ ok: false, error: "invalid_token" });
       }
 
-      const rows = await getRecentCandles(token, intervalMin, limit);
+      let rows = await getRecentCandles(token, intervalMin, limit);
+
+      if (includeLive) {
+        try {
+          const pipeline = getPipeline();
+          const live = pipeline?.getLiveCandle
+            ? pipeline.getLiveCandle(token, intervalMin)
+            : null;
+          if (live?.ts) {
+            const liveRow = { ...live, live: true, updatedAt: new Date() };
+            const last = rows[rows.length - 1];
+            const lastTs = last?.ts ? new Date(last.ts).getTime() : null;
+            const liveTs = new Date(live.ts).getTime();
+            if (Number.isFinite(lastTs) && lastTs === liveTs) {
+              rows = rows.slice(0, -1).concat(liveRow);
+            } else if (!Number.isFinite(lastTs) || liveTs > lastTs) {
+              rows = rows.concat(liveRow);
+            }
+          }
+        } catch {}
+      }
 
       return res.json({ ok: true, rows });
     } catch (e) {
