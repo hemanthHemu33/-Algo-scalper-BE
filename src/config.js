@@ -10,6 +10,29 @@ try {
     const dotenvPath =
       process.env.DOTENV_PATH || path.join(process.cwd(), ".env");
     if (fs.existsSync(dotenvPath)) {
+      try {
+        const raw = fs.readFileSync(dotenvPath, "utf8");
+        const counts = new Map();
+        for (const line of raw.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith("#")) continue;
+          const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+          if (!match) continue;
+          const key = match[1];
+          counts.set(key, (counts.get(key) || 0) + 1);
+        }
+        const dupes = Array.from(counts.entries())
+          .filter(([, count]) => count > 1)
+          .map(([key]) => key);
+        if (dupes.length) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[config] duplicate keys detected in .env (${dupes.length}): ${dupes.join(
+              ", ",
+            )}`,
+          );
+        }
+      } catch {}
       // eslint-disable-next-line global-require
       require("dotenv").config({ path: dotenvPath });
     }

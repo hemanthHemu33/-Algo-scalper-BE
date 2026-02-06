@@ -3,6 +3,8 @@ const { getDb } = require("../db");
 const STATUSES = [
   "ENTRY_PLACED",
   "ENTRY_OPEN",
+  "ENTRY_REPLACED",
+  "ENTRY_CANCELLED",
   "ENTRY_FILLED",
   "LIVE",
   "CLOSED",
@@ -39,7 +41,11 @@ async function getExecutionQuality({ limit = 500 } = {}) {
   const rejections = {};
 
   for (const t of rows) {
-    if (t.status === "ENTRY_PLACED" || t.status === "ENTRY_OPEN") {
+    if (
+      t.status === "ENTRY_PLACED" ||
+      t.status === "ENTRY_OPEN" ||
+      t.status === "ENTRY_REPLACED"
+    ) {
       entryPlaced += 1;
     }
     if (
@@ -50,7 +56,7 @@ async function getExecutionQuality({ limit = 500 } = {}) {
       entryFilled += 1;
     }
 
-    if (["ENTRY_FAILED", "GUARD_FAILED"].includes(t.status)) {
+    if (["ENTRY_FAILED", "ENTRY_CANCELLED", "GUARD_FAILED"].includes(t.status)) {
       const reason = String(t.closeReason || t.status || "UNKNOWN");
       rejections[reason] = (rejections[reason] || 0) + 1;
     }

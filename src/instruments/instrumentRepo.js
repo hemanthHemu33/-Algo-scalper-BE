@@ -8,6 +8,7 @@ const COLLECTION = "instruments_cache";
 // In-memory instruments dump cache (per exchange). Prevents repeated downloads.
 // NOTE: instruments dumps are large; keep TTL conservative.
 const dumpCache = new Map(); // ex -> { fetchedAt:number, rows:Array }
+const tokenCache = new Map(); // token -> instrument doc
 
 function uniq(arr) {
   const out = [];
@@ -75,8 +76,13 @@ function isInstrumentCacheStale(doc) {
 
 async function ensureInstrument(kite, instrument_token) {
   const tok = Number(instrument_token);
+  const mem = tokenCache.get(tok);
+  if (mem && !isInstrumentCacheStale(mem)) return mem;
   let doc = await getInstrumentByToken(tok);
-  if (doc && !isInstrumentCacheStale(doc)) return doc;
+  if (doc && !isInstrumentCacheStale(doc)) {
+    tokenCache.set(tok, doc);
+    return doc;
+  }
   if (doc) {
     logger.info(
       { tok },
@@ -143,6 +149,7 @@ async function ensureInstrument(kite, instrument_token) {
     strike: row.strike,
   };
   await upsertInstrument(doc);
+  tokenCache.set(tok, doc);
   return doc;
 }
 
@@ -226,7 +233,59 @@ async function ensureInstrumentBySymbol(kite, symbol) {
     strike: row.strike,
   };
   await upsertInstrument(doc);
+  tokenCache.set(Number(doc.instrument_token), doc);
   return doc;
+}
+
+async function preloadInstrumentsByToken(kite, tokens = []) {
+  const wants = uniq(tokens)
+    .map((t) => Number(t))
+    .filter((t) => Number.isFinite(t) && t > 0);
+  if (!wants.length || typeof kite?.getInstruments !== "function") return;
+
+  const missing = wants.filter((t) => !tokenCache.has(t));
+  if (!missing.length) return;
+
+  const exchanges = uniq([
+    env.DEFAULT_EXCHANGE || "NSE",
+    ...parseCsvList(env.FNO_EXCHANGES || ""),
+    "NSE",
+    "NFO",
+    "BSE",
+    "BFO",
+  ]);
+
+  const missingSet = new Set(missing);
+  for (const ex of exchanges) {
+    if (!missingSet.size) break;
+    try {
+      const instruments = await getInstrumentsDump(kite, ex);
+      for (const row of instruments || []) {
+        const tok = Number(row.instrument_token);
+        if (!missingSet.has(tok)) continue;
+        const doc = {
+          instrument_token: tok,
+          exchange: row.exchange || ex,
+          tradingsymbol: row.tradingsymbol,
+          tick_size: Number(row.tick_size || 0.05),
+          lot_size: Number(row.lot_size || 1),
+          freeze_qty: Number(row.freeze_qty || row.freeze_quantity || 0) || null,
+          segment: row.segment,
+          instrument_type: row.instrument_type,
+          name: row.name,
+          expiry: row.expiry,
+          strike: row.strike,
+          updatedAt: new Date(),
+        };
+        await upsertInstrument(doc);
+        tokenCache.set(tok, doc);
+        missingSet.delete(tok);
+        if (!missingSet.size) break;
+      }
+    } catch (e) {
+      logger.warn({ ex, e: e.message }, "[instruments] preload failed");
+    }
+  }
 }
 
 async function resolveSubscribeTokens(
@@ -265,6 +324,7 @@ module.exports = {
   getInstrumentBySymbol,
   ensureInstrument,
   ensureInstrumentBySymbol,
+  preloadInstrumentsByToken,
   resolveSubscribeTokens,
   parseSymbol,
   getInstrumentsDump,

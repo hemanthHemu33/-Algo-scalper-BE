@@ -13,7 +13,10 @@ const { marginAwareQty } = require("./marginSizer");
 const { alert } = require("../alerts/alertService");
 const { halt, isHalted } = require("../runtime/halt");
 const { getDb } = require("../db");
-const { ensureInstrument } = require("../instruments/instrumentRepo");
+const {
+  ensureInstrument,
+  preloadInstrumentsByToken,
+} = require("../instruments/instrumentRepo");
 const { getLastFnoUniverse, buildFnoUniverse } = require("../fno/fnoUniverse");
 const { pickOptionContractForSignal } = require("../fno/optionsRouter");
 const { computePacingPolicy } = require("../policy/pacingPolicy");
@@ -63,6 +66,8 @@ const {
 const STATUS = {
   ENTRY_PLACED: "ENTRY_PLACED",
   ENTRY_OPEN: "ENTRY_OPEN",
+  ENTRY_REPLACED: "ENTRY_REPLACED",
+  ENTRY_CANCELLED: "ENTRY_CANCELLED",
   ENTRY_FILLED: "ENTRY_FILLED",
   LIVE: "LIVE",
   EXITED_TARGET: "EXITED_TARGET",
@@ -1253,6 +1258,7 @@ class TradeManager {
         STATUS.EXITED_TARGET,
         STATUS.EXITED_SL,
         STATUS.ENTRY_FAILED,
+        STATUS.ENTRY_CANCELLED,
         STATUS.CLOSED,
       ];
       if (terminal.includes(fresh.status)) {
@@ -1569,6 +1575,7 @@ class TradeManager {
         STATUS.EXITED_TARGET,
         STATUS.EXITED_SL,
         STATUS.ENTRY_FAILED,
+        STATUS.ENTRY_CANCELLED,
         STATUS.GUARD_FAILED,
         STATUS.CLOSED,
       ].includes(fresh.status)
@@ -1949,6 +1956,7 @@ class TradeManager {
         STATUS.EXITED_TARGET,
         STATUS.EXITED_SL,
         STATUS.ENTRY_FAILED,
+        STATUS.ENTRY_CANCELLED,
         STATUS.CLOSED,
       ];
       if (terminal.includes(fresh.status)) {
@@ -2111,20 +2119,28 @@ class TradeManager {
     )
       return;
 
-    const token = Number(trade.instrument_token);
-    let ltp = this.lastPriceByToken.get(token);
+    const pnlToken = Number(
+      trade?.option_meta?.instrument_token || trade.instrument_token,
+    );
+    if (!Number.isFinite(pnlToken) || pnlToken <= 0) return;
+
+    const needBrokerPosition = trade.status === STATUS.ENTRY_OPEN;
+    const filledStatuses = [STATUS.ENTRY_FILLED, STATUS.LIVE];
+    if (!filledStatuses.includes(trade.status) && !needBrokerPosition) return;
+
+    let ltp = this.lastPriceByToken.get(pnlToken);
 
     // OPT mode can have sparse ticks right after entry; allow a throttled quote fetch
     const allowFetch =
       String(env.DAILY_LOSS_ALLOW_LTP_FETCH || "true") === "true";
-    if (!Number.isFinite(ltp) && allowFetch && Number.isFinite(token)) {
+    if (!Number.isFinite(ltp) && allowFetch && Number.isFinite(pnlToken)) {
       const now = Date.now();
-      const last = Number(this._lastLtpFetchAtByToken.get(token) || 0);
+      const last = Number(this._lastLtpFetchAtByToken.get(pnlToken) || 0);
       if (now - last >= 1500) {
-        this._lastLtpFetchAtByToken.set(token, now);
+        this._lastLtpFetchAtByToken.set(pnlToken, now);
         try {
-          const instrument = await ensureInstrument(this.kite, token);
-          ltp = await this._getLtp(token, instrument);
+          const instrument = await ensureInstrument(this.kite, pnlToken);
+          ltp = await this._getLtp(pnlToken, instrument);
         } catch (_) {
           // ignore
         }
@@ -2133,10 +2149,57 @@ class TradeManager {
 
     if (!Number.isFinite(ltp)) return;
 
-    const openPnl = calcOpenPnl(trade, ltp);
+    let effectiveQty = Number(trade.qty || 0);
+    let entryPrice = Number(
+      trade.entryPrice ||
+        trade.expectedEntryPrice ||
+        trade.quoteAtEntry?.ltp ||
+        trade.candle?.close ||
+        0,
+    );
+    let side = trade.side;
+    if (needBrokerPosition) {
+      if (!this.kite || typeof this.kite.getPositions !== "function") return;
+      let positions = null;
+      try {
+        positions = await this.kite.getPositions();
+      } catch {
+        positions = null;
+      }
+      const net = positions?.net || positions?.day || [];
+      const pos = (net || []).find(
+        (p) => Number(p?.instrument_token) === pnlToken,
+      );
+      const netQty = Number(pos?.quantity ?? pos?.net_quantity ?? 0);
+      if (!Number.isFinite(netQty) || netQty === 0) return;
+      effectiveQty = Math.abs(netQty);
+      side = netQty > 0 ? "BUY" : "SELL";
+      const avg = Number(
+        pos?.average_price ?? pos?.buy_price ?? pos?.sell_price ?? 0,
+      );
+      if (Number.isFinite(avg) && avg > 0) entryPrice = avg;
+    }
+
+    if (!Number.isFinite(effectiveQty) || effectiveQty <= 0) return;
+
+    const openPnl = calcOpenPnl(
+      { ...trade, qty: effectiveQty, entryPrice, side },
+      ltp,
+    );
     const day = await getDailyRisk(todayKey());
     const realized = Number(day?.realizedPnl || 0);
     const total = realized + openPnl;
+    const maxPosVal = Number(env.MAX_POSITION_VALUE_INR || 0);
+    if (Number.isFinite(maxPosVal) && maxPosVal > 0) {
+      const maxAbs = Math.abs(Number(total || 0));
+      if (Number.isFinite(maxAbs) && maxAbs > maxPosVal * 2) {
+        logger.warn(
+          { total, realized, openPnl, maxPosVal },
+          "[risk] daily pnl sanity guard triggered; skipping update",
+        );
+        return;
+      }
+    }
 
     const prevState = day?.state || "RUNNING";
     const { state } = await this._updateDailyPnlState({
@@ -3259,34 +3322,6 @@ class TradeManager {
             );
           }
 
-          // Entry order type and slippage guard thresholds (segment-aware)
-          const entryOrderType = String(
-            env.ENTRY_ORDER_TYPE || "MARKET",
-          ).toUpperCase();
-
-          const isOptContract =
-            String(instrument?.segment || "")
-              .toUpperCase()
-              .includes("-OPT") ||
-            ["CE", "PE", "OPT"].includes(
-              String(instrument?.instrument_type || "").toUpperCase(),
-            ) ||
-            /(?:CE|PE)$/.test(
-              String(instrument?.tradingsymbol || "").toUpperCase(),
-            ) ||
-            /(?:CE|PE)$/.test(String(p?.tradingsymbol || "").toUpperCase());
-
-          const maxEntrySlipBps = Number(
-            isOptContract
-              ? Number(env.MAX_ENTRY_SLIPPAGE_BPS_OPT || 120)
-              : Number(env.MAX_ENTRY_SLIPPAGE_BPS || 25),
-          );
-          const maxEntrySlipKillBps = Number(
-            isOptContract
-              ? Number(env.MAX_ENTRY_SLIPPAGE_KILL_BPS_OPT || 250)
-              : Number(env.MAX_ENTRY_SLIPPAGE_KILL_BPS || 60),
-          );
-
           const tradeId = crypto.randomUUID();
           const side = qty > 0 ? "BUY" : "SELL";
           const avg = Number(
@@ -3305,15 +3340,14 @@ class TradeManager {
 
           logger.error(
             { ...this.recoveredPosition },
-            "[reconcile] OPEN POSITION FOUND without active trade. Kill-switch enabled; manual recovery needed.",
+            "[reconcile] OPEN POSITION FOUND without active trade. Adopting recovery trade.",
           );
           alert(
             "error",
-            "🛑 OPEN POSITION FOUND without active trade (manual recovery needed)",
+            "⚠️ OPEN POSITION FOUND without active trade (adopting recovery trade)",
             this.recoveredPosition,
           ).catch(() => {});
 
-          this.risk.setKillSwitch(true);
           this.risk.setOpenPosition(token, {
             tradeId,
             side,
@@ -3321,29 +3355,61 @@ class TradeManager {
           });
           this.activeTradeId = tradeId;
 
+          const absQty = Math.abs(qty);
+          const avgPrice = Number(avg || 0);
+          const riskStop =
+            Number.isFinite(avgPrice) && avgPrice > 0
+              ? this._computeRiskStopLoss({
+                  entryPrice: avgPrice,
+                  side,
+                  instrument,
+                  qty: absQty,
+                  riskInr: Number(env.RISK_PER_TRADE_INR || 0),
+                })
+              : null;
+          const stopLoss = riskStop?.stopLoss || null;
+
           await insertTrade({
             tradeId,
             instrument_token: token,
             instrument,
             strategyId: "recovery",
             side,
-            qty: Math.abs(qty),
+            qty: absQty,
             candle: null,
-            stopLoss: null,
+            stopLoss,
+            initialStopLoss: stopLoss,
+            slTrigger: stopLoss,
             rr: null,
-            status: STATUS.GUARD_FAILED,
+            status: STATUS.ENTRY_FILLED,
             entryOrderId: null,
             slOrderId: null,
             targetOrderId: null,
-            entryPrice: avg || null,
+            entryPrice: avgPrice || null,
             exitPrice: null,
-            closeReason: "RECOVERY_REQUIRED_OPEN_POSITION",
+            closeReason: "RECOVERY_ADOPTED_OPEN_POSITION",
+            recoveredAt: new Date(),
           });
-          await upsertDailyRisk(todayKey(), {
-            kill: true,
-            reason: "RECOVERY_REQUIRED_OPEN_POSITION",
-            lastTradeId: tradeId,
-          });
+
+          if (Number.isFinite(stopLoss) && stopLoss > 0) {
+            try {
+              await this._placeExitsIfMissing({
+                tradeId,
+                instrument_token: token,
+                instrument,
+                side,
+                qty: absQty,
+                stopLoss,
+                entryPrice: avgPrice || null,
+              });
+              await this._ensureExitQty(tradeId, absQty);
+            } catch (e) {
+              logger.warn(
+                { tradeId, token, e: e.message },
+                "[reconcile] recovery exits placement failed",
+              );
+            }
+          }
         }
       }
     }
@@ -3483,6 +3549,7 @@ class TradeManager {
           STATUS.EXITED_TARGET,
           STATUS.EXITED_SL,
           STATUS.ENTRY_FAILED,
+          STATUS.ENTRY_CANCELLED,
           STATUS.CLOSED,
         ].includes(trade.status);
 
@@ -3734,7 +3801,11 @@ class TradeManager {
 
     // If ENTRY got rejected/cancelled/lapsed while we were offline (or we missed order_update),
     // close the trade so we don't keep treating it as "active" after restart.
-    if ([STATUS.ENTRY_PLACED, STATUS.ENTRY_OPEN].includes(trade.status)) {
+    if (
+      [STATUS.ENTRY_PLACED, STATUS.ENTRY_OPEN, STATUS.ENTRY_REPLACED].includes(
+        trade.status,
+      )
+    ) {
       if (!trade.entryOrderId) {
         await updateTrade(tradeId, {
           status: STATUS.ENTRY_FAILED,
@@ -3761,9 +3832,11 @@ class TradeManager {
       }
 
       if (entryStatus && isDead(entryStatus)) {
+        const entryStatusUpper = String(entryStatus).toUpperCase();
+        const isRejected = entryStatusUpper === "REJECTED";
         await updateTrade(tradeId, {
-          status: STATUS.ENTRY_FAILED,
-          closeReason: `ENTRY_${String(entryStatus).toUpperCase()}${
+          status: isRejected ? STATUS.ENTRY_FAILED : STATUS.ENTRY_CANCELLED,
+          closeReason: `ENTRY_${entryStatusUpper}${
             entryMsg ? " | " + String(entryMsg) : ""
           }`,
         });
@@ -4152,6 +4225,9 @@ class TradeManager {
     while (Date.now() < deadline) {
       const t = await getTrade(tradeId);
       if (!t) return;
+      if (String(t.entryOrderId || "") !== String(entryOrderId)) {
+        return;
+      }
 
       // already progressed
       if (
@@ -4160,6 +4236,7 @@ class TradeManager {
           STATUS.EXITED_TARGET,
           STATUS.EXITED_SL,
           STATUS.ENTRY_FAILED,
+          STATUS.ENTRY_CANCELLED,
           STATUS.CLOSED,
           STATUS.GUARD_FAILED,
         ].includes(t.status)
@@ -4223,8 +4300,9 @@ class TradeManager {
       }
 
       if (isDead(status)) {
+        const isRejected = status === "REJECTED";
         await updateTrade(tradeId, {
-          status: STATUS.ENTRY_FAILED,
+          status: isRejected ? STATUS.ENTRY_FAILED : STATUS.ENTRY_CANCELLED,
           closeReason: `ENTRY_${status}${msg ? " | " + msg : ""}`,
         });
         await this._finalizeClosed(tradeId, t.instrument_token);
@@ -4243,6 +4321,7 @@ class TradeManager {
     const tFinal = await getTrade(tradeId);
 
     if (!tFinal) return;
+    if (String(tFinal.entryOrderId || "") !== String(entryOrderId)) return;
 
     // already progressed in between
 
@@ -4257,6 +4336,7 @@ class TradeManager {
         STATUS.ENTRY_FILLED,
 
         STATUS.ENTRY_FAILED,
+        STATUS.ENTRY_CANCELLED,
 
         STATUS.GUARD_FAILED,
 
@@ -4341,8 +4421,9 @@ class TradeManager {
     }
 
     if (isDead(status)) {
+      const isRejected = status === "REJECTED";
       await updateTrade(tradeId, {
-        status: STATUS.ENTRY_FAILED,
+        status: isRejected ? STATUS.ENTRY_FAILED : STATUS.ENTRY_CANCELLED,
 
         closeReason: `ENTRY_${status}${msg ? " | " + String(msg) : ""}`,
       });
@@ -4392,17 +4473,18 @@ class TradeManager {
         }
 
         if (isDead(lateStatus)) {
+          const isRejected = lateStatus === "REJECTED";
           const msgLate =
             lateOrder.status_message_raw || lateOrder.status_message || null;
           await updateTrade(tradeId, {
-            status: STATUS.ENTRY_FAILED,
+            status: isRejected ? STATUS.ENTRY_FAILED : STATUS.ENTRY_CANCELLED,
             closeReason: `ENTRY_${lateStatus}${
               msgLate ? " | " + String(msgLate) : ""
             }`,
           });
         } else {
           await updateTrade(tradeId, {
-            status: STATUS.ENTRY_FAILED,
+            status: STATUS.ENTRY_CANCELLED,
             closeReason: "ENTRY_TIMEOUT_CANCELLED",
           });
         }
@@ -4471,6 +4553,8 @@ class TradeManager {
       STATUS.EXITED_TARGET,
       STATUS.EXITED_SL,
       STATUS.ENTRY_FAILED,
+      STATUS.ENTRY_CANCELLED,
+      STATUS.ENTRY_REPLACED,
       STATUS.CLOSED,
       STATUS.GUARD_FAILED,
     ];
@@ -4505,13 +4589,34 @@ class TradeManager {
     }
 
     if (isDead(status)) {
-      await updateTrade(tradeId, {
-        status: STATUS.ENTRY_FAILED,
-        closeReason: `ENTRY_${status}`,
-      });
-      await this._finalizeClosed(tradeId, t.instrument_token);
-      this._clearEntryLimitFallbackTimer(tradeId);
-      return;
+      if (status === "REJECTED") {
+        await updateTrade(tradeId, {
+          status: STATUS.ENTRY_FAILED,
+          closeReason: `ENTRY_${status}`,
+        });
+        await this._finalizeClosed(tradeId, t.instrument_token);
+        this._clearEntryLimitFallbackTimer(tradeId);
+        return;
+      }
+      if (filledNow > 0) {
+        await updateTrade(tradeId, {
+          status: STATUS.ENTRY_OPEN,
+          entryPrice: avgNow > 0 ? avgNow : t.entryPrice,
+          qty: filledNow,
+        });
+        await this._placeExitsIfMissing({
+          ...t,
+          entryPrice: avgNow > 0 ? avgNow : t.entryPrice,
+          qty: filledNow,
+        });
+        await this._ensureExitQty(tradeId, filledNow);
+        logger.warn(
+          { tradeId, entryOrderId, filledQty: filledNow, status },
+          "[entry_fallback] dead status with partial fill; skipping MARKET fallback",
+        );
+        this._clearEntryLimitFallbackTimer(tradeId);
+        return;
+      }
     }
 
     if (filledNow > 0) {
@@ -4536,58 +4641,8 @@ class TradeManager {
 
     logger.warn(
       { tradeId, entryOrderId },
-      "[entry_fallback] timeout -> cancel LIMIT and place MARKET",
+      "[entry_fallback] timeout -> place MARKET then cancel LIMIT",
     );
-
-    try {
-      this.expectedCancelOrderIds.add(String(entryOrderId));
-      await this._safeCancelOrder(
-        env.DEFAULT_ORDER_VARIETY || "regular",
-        entryOrderId,
-        {
-          purpose: "ENTRY_LIMIT_FALLBACK_CANCEL",
-          tradeId,
-        },
-      );
-    } catch (e) {
-      logger.warn(
-        { tradeId, entryOrderId, e: e.message },
-        "[entry_fallback] cancel failed; will not place MARKET",
-      );
-      this._clearEntryLimitFallbackTimer(tradeId);
-      return;
-    }
-
-    const refresh = await this._getOrderStatus(entryOrderId);
-    const refreshStatus = String(refresh?.status || "").toUpperCase();
-    if (refreshStatus === "COMPLETE") {
-      const qty = Number(refresh?.order?.filled_quantity || t.qty);
-      const avg = Number(
-        refresh?.order?.average_price || t.entryPrice || t.candle?.close || 0,
-      );
-      await updateTrade(tradeId, {
-        status: STATUS.ENTRY_FILLED,
-        entryPrice: avg > 0 ? avg : t.entryPrice,
-        qty,
-      });
-      await this._placeExitsIfMissing({
-        ...t,
-        entryPrice: avg > 0 ? avg : t.entryPrice,
-        qty,
-      });
-      await this._ensureExitQty(tradeId, qty);
-      this._clearEntryLimitFallbackTimer(tradeId);
-      return;
-    }
-
-    if (!isDead(refreshStatus)) {
-      logger.warn(
-        { tradeId, entryOrderId, refreshStatus },
-        "[entry_fallback] cancel not confirmed; skipping MARKET",
-      );
-      this._clearEntryLimitFallbackTimer(tradeId);
-      return;
-    }
 
     const marketParams = {
       ...entryParams,
@@ -4616,7 +4671,7 @@ class TradeManager {
       entryOrderId: fallbackOrderId,
       entryFallbackFrom: entryOrderId,
       entryFallbackPlacedAt: new Date(),
-      status: STATUS.ENTRY_OPEN,
+      status: STATUS.ENTRY_REPLACED,
     });
     await linkOrder({
       order_id: String(fallbackOrderId),
@@ -4624,6 +4679,25 @@ class TradeManager {
       role: "ENTRY",
     });
     await this._replayOrphanUpdates(fallbackOrderId);
+
+    if (!isDead(status)) {
+      try {
+        this.expectedCancelOrderIds.add(String(entryOrderId));
+        await this._safeCancelOrder(
+          env.DEFAULT_ORDER_VARIETY || "regular",
+          entryOrderId,
+          {
+            purpose: "ENTRY_LIMIT_FALLBACK_CANCEL",
+            tradeId,
+          },
+        );
+      } catch (e) {
+        logger.warn(
+          { tradeId, entryOrderId, e: e.message },
+          "[entry_fallback] cancel failed after MARKET placement",
+        );
+      }
+    }
     this._clearEntryLimitFallbackTimer(tradeId);
   }
 
@@ -4644,6 +4718,7 @@ class TradeManager {
           STATUS.EXITED_TARGET,
           STATUS.EXITED_SL,
           STATUS.ENTRY_FAILED,
+          STATUS.ENTRY_CANCELLED,
           STATUS.GUARD_FAILED,
           STATUS.CLOSED,
         ].includes(t.status)
@@ -5417,6 +5492,18 @@ class TradeManager {
           "[trade] blocked (runtime subscribe unavailable)",
         );
         return;
+      }
+
+      try {
+        await preloadInstrumentsByToken(this.kite, [
+          Number(picked.instrument_token),
+          Number(underlyingToken),
+        ]);
+      } catch (e) {
+        logger.warn(
+          { token: picked.instrument_token, e: e?.message || String(e) },
+          "[instruments] preload failed for selected contract",
+        );
       }
 
       const warmMs = Number(env.OPT_LTP_WARMUP_MS || 1500);
@@ -6519,7 +6606,7 @@ class TradeManager {
     if (
       isOptContract &&
       entryOrderType === "LIMIT" &&
-      Boolean(env.ENTRY_LIMIT_FALLBACK_TO_MARKET) &&
+      String(env.ENTRY_LIMIT_FALLBACK_TO_MARKET || "false") === "true" &&
       Number(env.ENTRY_LIMIT_TIMEOUT_MS || 0) > 0
     ) {
       try {
@@ -6701,6 +6788,7 @@ class TradeManager {
         STATUS.EXITED_TARGET,
         STATUS.EXITED_SL,
         STATUS.ENTRY_FAILED,
+        STATUS.ENTRY_CANCELLED,
         STATUS.GUARD_FAILED,
         STATUS.CLOSED,
       ];
@@ -7068,23 +7156,30 @@ class TradeManager {
           return;
         }
         this._handleOrderRejection({ trade, order, role: link.role });
+        const isRejected = status === "REJECTED";
         await updateTrade(trade.tradeId, {
-          status: STATUS.ENTRY_FAILED,
+          status: isRejected ? STATUS.ENTRY_FAILED : STATUS.ENTRY_CANCELLED,
           closeReason:
             "ENTRY_" +
             status +
             (order.status_message_raw ? " | " + order.status_message_raw : ""),
         });
-        alert("error", "❌ ENTRY rejected/cancelled/lapsed", {
-          tradeId: trade.tradeId,
-          status,
-          msg: order.status_message_raw || order.status_message || null,
-        }).catch(() => {});
-        const fail = this.risk.markFailure("ENTRY_" + status);
-        if (fail.killed) {
-          alert("error", "🛑 Too many failures -> kill switch", fail).catch(
-            () => {},
-          );
+        alert(
+          "error",
+          isRejected ? "❌ ENTRY rejected" : "⚠️ ENTRY cancelled/lapsed",
+          {
+            tradeId: trade.tradeId,
+            status,
+            msg: order.status_message_raw || order.status_message || null,
+          },
+        ).catch(() => {});
+        if (isRejected) {
+          const fail = this.risk.markFailure("ENTRY_" + status);
+          if (fail.killed) {
+            alert("error", "🛑 Too many failures -> kill switch", fail).catch(
+              () => {},
+            );
+          }
         }
         await this._finalizeClosed(trade.tradeId, trade.instrument_token);
         return;
@@ -7100,6 +7195,7 @@ class TradeManager {
           STATUS.EXITED_TARGET,
           STATUS.EXITED_SL,
           STATUS.ENTRY_FAILED,
+          STATUS.ENTRY_CANCELLED,
           STATUS.GUARD_FAILED,
           STATUS.CLOSED,
         ].includes(progressedStatus)
@@ -7147,6 +7243,7 @@ class TradeManager {
             STATUS.EXITED_TARGET,
             STATUS.EXITED_SL,
             STATUS.ENTRY_FAILED,
+            STATUS.ENTRY_CANCELLED,
             STATUS.CLOSED,
           ].includes(tStatus)
         ) {
@@ -7202,6 +7299,7 @@ class TradeManager {
             STATUS.EXITED_TARGET,
             STATUS.EXITED_SL,
             STATUS.ENTRY_FAILED,
+            STATUS.ENTRY_CANCELLED,
             STATUS.CLOSED,
           ].includes(tStatus)
         ) {
@@ -7268,6 +7366,7 @@ class TradeManager {
             STATUS.EXITED_TARGET,
             STATUS.EXITED_SL,
             STATUS.ENTRY_FAILED,
+            STATUS.ENTRY_CANCELLED,
             STATUS.CLOSED,
           ].includes(tStatus)
         ) {
@@ -7308,6 +7407,7 @@ class TradeManager {
             STATUS.EXITED_TARGET,
             STATUS.EXITED_SL,
             STATUS.ENTRY_FAILED,
+            STATUS.ENTRY_CANCELLED,
             STATUS.CLOSED,
           ].includes(tStatus)
         ) {
@@ -7374,6 +7474,7 @@ class TradeManager {
             STATUS.EXITED_TARGET,
             STATUS.EXITED_SL,
             STATUS.ENTRY_FAILED,
+            STATUS.ENTRY_CANCELLED,
             STATUS.CLOSED,
           ].includes(tStatus)
         ) {
@@ -7433,6 +7534,7 @@ class TradeManager {
         STATUS.EXITED_TARGET,
         STATUS.EXITED_SL,
         STATUS.ENTRY_FAILED,
+        STATUS.ENTRY_CANCELLED,
         STATUS.GUARD_FAILED,
         STATUS.CLOSED,
       ].includes(fresh.status)
@@ -9180,6 +9282,7 @@ class TradeManager {
       STATUS.EXITED_TARGET,
       STATUS.EXITED_SL,
       STATUS.ENTRY_FAILED,
+      STATUS.ENTRY_CANCELLED,
     ];
 
     // Fee-multiple scoring (grossPnL / estimated costs) — helps tune to beat charges.

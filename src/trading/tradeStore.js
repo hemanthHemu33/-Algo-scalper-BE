@@ -101,6 +101,7 @@ async function getActiveTrades() {
         $in: [
           "ENTRY_PLACED",
           "ENTRY_OPEN",
+          "ENTRY_REPLACED",
           "ENTRY_FILLED",
           "LIVE",
           "GUARD_FAILED",
