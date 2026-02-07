@@ -189,10 +189,15 @@ class TradeManager {
     this.ordersPlacedToday = 0;
 
     // Dynamic exit adjustments (trail SL / adjust target)
-    this._dynExitLastAt = new Map(); // tradeId -> last adjust ts
+    this._dynExitLastAt = new Map(); // tradeId -> last eval ts
     this._lastOrdersById = new Map(); // last broker order map (reconcile)
     this._exitLoopTimer = null;
     this._exitLoopInFlight = false;
+    this._dynExitFailCount = new Map(); // tradeId -> failure count
+    this._dynExitDisabled = new Set(); // tradeId -> disable trailing
+    this._dynPeakLtpByTrade = new Map(); // tradeId -> peak ltp (tick-driven)
+    this._activeTradeToken = null;
+    this._activeTradeSide = null;
 
     // Injected by pipeline: runtime token subscription (needed for OPT mode correctness)
     this.runtimeAddTokens = null;
@@ -580,6 +585,7 @@ class TradeManager {
       const trade = await getTrade(this.activeTradeId);
       if (!trade) return;
       if (![STATUS.ENTRY_FILLED, STATUS.LIVE].includes(trade.status)) return;
+      this._syncActiveTradeState(trade);
 
       await this._maybeDynamicAdjustExits(trade, this._lastOrdersById);
     } finally {
@@ -895,6 +901,11 @@ class TradeManager {
 
     this._monitorPortfolioRisk("tick").catch(() => {});
 
+    // Tick-accurate peak tracking for live trade
+    try {
+      this._maybeUpdatePeakFromTick(token, ltp);
+    } catch {}
+
     // SL watchdog: track trigger crossings in fast moves (especially for SL-L fallback)
     try {
       this._maybeTriggerSlWatchFromTick(token, ltp, now);
@@ -909,6 +920,38 @@ class TradeManager {
     try {
       this._maybeTriggerTargetWatchFromTick(token, ltp, now);
     } catch {}
+  }
+
+  _syncActiveTradeState(trade) {
+    if (!trade) return;
+    const token = Number(trade.instrument_token);
+    if (Number.isFinite(token) && token > 0) {
+      this._activeTradeToken = token;
+    }
+    const side = String(trade.side || "").toUpperCase();
+    if (side) {
+      this._activeTradeSide = side;
+    }
+  }
+
+  _maybeUpdatePeakFromTick(token, ltp) {
+    if (!this.activeTradeId) return;
+    if (!Number.isFinite(ltp) || ltp <= 0) return;
+    if (!Number.isFinite(this._activeTradeToken)) return;
+    if (Number(token) !== Number(this._activeTradeToken)) return;
+    const side = String(this._activeTradeSide || "").toUpperCase();
+    if (side !== "BUY" && side !== "SELL") return;
+
+    const tradeId = String(this.activeTradeId);
+    const prev = Number(this._dynPeakLtpByTrade.get(tradeId) || NaN);
+    let next = prev;
+    if (!Number.isFinite(prev)) next = ltp;
+    else if (side === "BUY") next = Math.max(prev, ltp);
+    else next = Math.min(prev, ltp);
+
+    if (Number.isFinite(next)) {
+      this._dynPeakLtpByTrade.set(tradeId, next);
+    }
   }
 
   // =========================
@@ -3995,10 +4038,16 @@ class TradeManager {
       !trade.tp1Done
     )
       return;
+    if (trade?.dynExitDisabled || this._dynExitDisabled.has(tradeId)) {
+      this._dynExitDisabled.add(tradeId);
+      return;
+    }
+
     const minMs = Number(env.DYNAMIC_EXIT_MIN_INTERVAL_MS || 5000);
     const last = Number(this._dynExitLastAt.get(tradeId) || 0);
     const now = Date.now();
     if (now - last < minMs) return;
+    this._dynExitLastAt.set(tradeId, now);
 
     // Need a live price + candles for ATR trail
     const token = Number(trade.instrument_token);
@@ -4037,8 +4086,13 @@ class TradeManager {
       }
     }
 
+    const peakFromTick = Number(this._dynPeakLtpByTrade.get(tradeId) || NaN);
+    const tradeForPlan = Number.isFinite(peakFromTick)
+      ? { ...trade, peakLtp: peakFromTick }
+      : trade;
+
     const plan = computeDynamicExitPlan({
-      trade,
+      trade: tradeForPlan,
       ltp,
       candles,
       nowTs: now,
@@ -4080,9 +4134,22 @@ class TradeManager {
       return;
     }
 
+    let peakPatch = null;
+    if (Number.isFinite(peakFromTick)) {
+      const dbPeak = Number(trade?.peakLtp || NaN);
+      const side = String(trade?.side || "").toUpperCase();
+      const isBetter =
+        side === "BUY"
+          ? !Number.isFinite(dbPeak) || peakFromTick > dbPeak
+          : side === "SELL"
+            ? !Number.isFinite(dbPeak) || peakFromTick < dbPeak
+            : false;
+      if (isBetter) peakPatch = { peakLtp: peakFromTick };
+    }
+
     if (plan?.tradePatch && Object.keys(plan.tradePatch).length) {
       try {
-        const patch = { ...plan.tradePatch };
+        const patch = { ...plan.tradePatch, ...(peakPatch || {}) };
         if (patch.beLocked && !trade.beLocked) {
           Object.assign(
             patch,
@@ -4106,6 +4173,10 @@ class TradeManager {
         }
         await updateTrade(tradeId, patch);
       } catch {}
+    } else if (peakPatch) {
+      try {
+        await updateTrade(tradeId, peakPatch);
+      } catch {}
     }
 
     let did = false;
@@ -4120,17 +4191,19 @@ class TradeManager {
       const slStatus = String(sl?.status || "").toUpperCase();
       const slType = String(sl?.order_type || "").toUpperCase();
 
-      // Only modify while it's pending/open.
-      if (slStatus === "TRIGGER PENDING" || slStatus === "OPEN") {
+      // Only modify while it's pending (OPEN means it likely triggered already).
+      if (slStatus === "TRIGGER PENDING") {
         const slSide = trade.side === "BUY" ? "SELL" : "BUY";
 
         const patch = { trigger_price: plan.sl.stopLoss };
+        let nextLimitPrice = null;
         if (slType === "SL") {
-          patch.price = this._buildStopLossLimitPrice({
+          nextLimitPrice = this._buildStopLossLimitPrice({
             triggerPrice: plan.sl.stopLoss,
             exitSide: slSide,
             instrument: trade.instrument,
           });
+          patch.price = nextLimitPrice;
         }
 
         try {
@@ -4143,6 +4216,7 @@ class TradeManager {
           await updateTrade(tradeId, {
             stopLoss: plan.sl.stopLoss,
             slTrigger: plan.sl.stopLoss,
+            ...(nextLimitPrice != null ? { slLimitPrice: nextLimitPrice } : {}),
             ...this._eventPatch("SL_TRAILED", {
               tradeId,
               stopLoss: plan.sl.stopLoss,
@@ -4161,11 +4235,131 @@ class TradeManager {
             tradeId,
             stopLoss: plan.sl.stopLoss,
           }).catch(() => {});
+          this._dynExitFailCount.set(tradeId, 0);
         } catch (e) {
-          logger.warn(
-            { tradeId, e: e.message, stopLoss: plan.sl.stopLoss },
-            "[dyn_exit] SL modify failed",
+          const message = String(e?.message || "");
+          const retryable = /trigger|invalid|rejected|range|price/i.test(
+            message,
           );
+          let retryDone = false;
+          if (retryable) {
+            try {
+              const freshLtp = await this._getLtp(token, trade.instrument);
+              const tickSize = Number(trade.instrument?.tick_size || 0.05);
+              const bufferTicks = Number(
+                env.DYN_SL_RETRY_BUFFER_TICKS || 2,
+              );
+              const buffer =
+                Math.max(1, Number.isFinite(bufferTicks) ? bufferTicks : 2) *
+                tickSize;
+              const side = String(trade.side || "").toUpperCase();
+              const curSl =
+                Number(trade.stopLoss || sl?.trigger_price || 0) || 0;
+              let nextStop = plan.sl.stopLoss;
+              if (Number.isFinite(freshLtp) && freshLtp > 0) {
+                if (side === "BUY") {
+                  const cap = freshLtp - buffer;
+                  nextStop = Math.min(nextStop, cap);
+                  if (Number.isFinite(curSl) && nextStop < curSl) {
+                    nextStop = null;
+                  }
+                } else if (side === "SELL") {
+                  const cap = freshLtp + buffer;
+                  nextStop = Math.max(nextStop, cap);
+                  if (Number.isFinite(curSl) && nextStop > curSl) {
+                    nextStop = null;
+                  }
+                } else {
+                  nextStop = null;
+                }
+              } else {
+                nextStop = null;
+              }
+
+              if (Number.isFinite(nextStop) && nextStop > 0) {
+                const rounded = roundToTick(
+                  nextStop,
+                  tickSize,
+                  side === "BUY" ? "down" : "up",
+                );
+                const retryPatch = { trigger_price: rounded };
+                let retryLimit = null;
+                if (slType === "SL") {
+                  retryLimit = this._buildStopLossLimitPrice({
+                    triggerPrice: rounded,
+                    exitSide: slSide,
+                    instrument: trade.instrument,
+                  });
+                  retryPatch.price = retryLimit;
+                }
+                await this._safeModifyOrder(
+                  env.DEFAULT_ORDER_VARIETY,
+                  trade.slOrderId,
+                  retryPatch,
+                  { purpose: "DYN_TRAIL_SL_RETRY", tradeId },
+                );
+                await updateTrade(tradeId, {
+                  stopLoss: rounded,
+                  slTrigger: rounded,
+                  ...(retryLimit != null ? { slLimitPrice: retryLimit } : {}),
+                  ...this._eventPatch("SL_TRAILED_RETRY", {
+                    tradeId,
+                    stopLoss: rounded,
+                    trailSl: plan?.tradePatch?.trailSl ?? trade?.trailSl,
+                  }),
+                });
+                try {
+                  this._updateSlWatchTrigger(tradeId, rounded);
+                } catch {}
+                did = true;
+                retryDone = true;
+                this._dynExitFailCount.set(tradeId, 0);
+                logger.info(
+                  { tradeId, stopLoss: rounded },
+                  "[dyn_exit] SL trailed (retry)",
+                );
+                alert("info", "🧭 SL trailed (retry)", {
+                  tradeId,
+                  stopLoss: rounded,
+                }).catch(() => {});
+              }
+            } catch (retryError) {
+              logger.warn(
+                { tradeId, e: retryError?.message || String(retryError) },
+                "[dyn_exit] SL retry failed",
+              );
+            }
+          }
+
+          if (!retryDone) {
+            const fails = Number(this._dynExitFailCount.get(tradeId) || 0) + 1;
+            this._dynExitFailCount.set(tradeId, fails);
+            if (fails >= 3) {
+              this._dynExitDisabled.add(tradeId);
+              try {
+                await updateTrade(tradeId, {
+                  dynExitDisabled: true,
+                  dynExitDisabledAt: new Date(),
+                  ...this._eventPatch("TRAILING_DISABLED", {
+                    tradeId,
+                    failCount: fails,
+                  }),
+                });
+              } catch {}
+              alert("error", "🛑 Trailing disabled after modify failures", {
+                tradeId,
+                failCount: fails,
+              }).catch(() => {});
+              logger.error(
+                { tradeId, failCount: fails },
+                "[dyn_exit] trailing disabled after failures",
+              );
+            }
+            logger.warn(
+              { tradeId, e: e.message, stopLoss: plan.sl.stopLoss },
+              "[dyn_exit] SL modify failed",
+            );
+          }
         }
       }
     }
@@ -4219,7 +4413,6 @@ class TradeManager {
       }
     }
 
-    if (did) this._dynExitLastAt.set(tradeId, now);
   }
 
   async _watchEntryUntilDone(tradeId, entryOrderId) {
@@ -9363,6 +9556,12 @@ class TradeManager {
 
     this.activeTradeId = null;
     this.recoveredPosition = null;
+    this._activeTradeToken = null;
+    this._activeTradeSide = null;
+    this._dynExitLastAt.delete(tradeId);
+    this._dynExitFailCount.delete(tradeId);
+    this._dynExitDisabled.delete(tradeId);
+    this._dynPeakLtpByTrade.delete(tradeId);
     this._clearVirtualTarget(tradeId);
     this.risk.markTradeClosed(Number(instrument_token));
   }

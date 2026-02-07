@@ -235,7 +235,21 @@ function applyMinGreenExitRules({
   }
 
   const trailGap = Number(env.TRAIL_GAP_PREMIUM_POINTS || 0);
-  if (Number.isFinite(trailGap) && trailGap > 0 && Number.isFinite(ltp)) {
+  const trailAfterBe =
+    String(env.DYN_TRAIL_START_AFTER_BE_LOCK || "true") === "true";
+  const trailStartInr = Number(env.DYN_TRAIL_START_PROFIT_INR || 0);
+  const allowTrail =
+    (!trailAfterBe || trade?.beLocked) ||
+    (Number.isFinite(trailStartInr) && trailStartInr > 0
+      ? pnlInr >= trailStartInr
+      : false);
+
+  if (
+    allowTrail &&
+    Number.isFinite(trailGap) &&
+    trailGap > 0 &&
+    Number.isFinite(ltp)
+  ) {
     const prevPeak = Number(trade?.peakLtp || NaN);
     let peakLtp = prevPeak;
     if (side === "BUY") {
@@ -291,6 +305,9 @@ function applyMinGreenExitRules({
       minGreenPts,
       beLockAt,
       trailGap,
+      trailAfterBe,
+      trailStartInr: Number.isFinite(trailStartInr) ? trailStartInr : null,
+      allowTrail,
     },
   };
 }
