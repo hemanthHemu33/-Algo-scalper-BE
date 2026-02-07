@@ -11,17 +11,24 @@ function enabledIntervals() {
     .filter((n) => Number.isFinite(n) && n > 0);
 }
 
-async function evaluateOnCandleClose({ instrument_token, intervalMin }) {
+async function evaluateOnCandleClose({
+  instrument_token,
+  intervalMin,
+  candles,
+}) {
   const allow = enabledIntervals();
   if (!allow.includes(Number(intervalMin))) return null;
 
   // We keep a generous limit so strategies have enough context.
-  const candles = await getRecentCandles(instrument_token, intervalMin, 400);
-  if (!candles || candles.length < 50) return null;
+  let series = candles;
+  if (!series) {
+    series = await getRecentCandles(instrument_token, intervalMin, 400);
+  }
+  if (!series || series.length < 50) return null;
 
-  const last = candles[candles.length - 1];
+  const last = series[series.length - 1];
   return evaluateFromCandles({
-    candles,
+    candles: series,
     last,
     instrument_token,
     intervalMin,
@@ -33,21 +40,25 @@ async function evaluateOnCandleTick({
   instrument_token,
   intervalMin,
   liveCandle,
+  candles,
 }) {
   const allow = enabledIntervals();
   if (!allow.includes(Number(intervalMin))) return null;
 
-  const candles = await getRecentCandles(instrument_token, intervalMin, 400);
-  if (!candles || candles.length < 50) return null;
+  let series = candles;
+  if (!series) {
+    series = await getRecentCandles(instrument_token, intervalMin, 400);
+  }
+  if (!series || series.length < 50) return null;
 
   const live = liveCandle || null;
   if (!live || !live.ts) return null;
 
-  const last = candles[candles.length - 1];
+  const last = series[series.length - 1];
   const lastTs = last?.ts ? new Date(last.ts).getTime() : null;
   const liveTs = new Date(live.ts).getTime();
 
-  let merged = candles.slice();
+  let merged = series.slice();
   if (lastTs != null && liveTs === lastTs) {
     merged[merged.length - 1] = live;
   } else {
