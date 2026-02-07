@@ -167,3 +167,21 @@ Tier-3 (avoid for scalping unless you keep strict gates + only trade when condit
 ALOKINDS, BELRISE, EASEMYTRIP, IFCI, JMFINANCIL, JPPOWER, NETWORK18, RPOWER, RTNINDIA, RTNPOWER, SAGILITY, SAMMAANCAP, VMM, WELSPUNLIV
 
 KITE LOGIN API href="https://kite.zerodha.com/connect/login?v=3&api_key=9c2asbtjjrdrwn2z
+
+<!-- prettier-ignore-start -->
+Price ^
+      |
+  210 |                          /\ 
+      |                         /  \
+  200 |                        /    \      Exit happens here
+      |               Peak -> *      \____ (Trail SL hit)
+  192 |------------------------|--------------------  Trailing SL (= 200 - 8)
+      |                      /|
+  188 |----------- BE lock --|-|--------------------  (when profit hits threshold, SL jumps to BE+buffer)
+      |                    / |
+  180 |---- Entry --------*  |
+      |                  |   |
+  170 |---- Initial SL ---|---|---------------------  (risk-based SL)
+      |
+      +--------------------------------------------------> Time
+<!-- prettier-ignore-end -->
