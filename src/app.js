@@ -84,6 +84,17 @@ function buildAdminAuth() {
   };
 }
 
+function parseBoolInput(value, defaultValue = false) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
+  }
+  return defaultValue;
+}
+
 function buildApp() {
   const app = express();
   app.use(express.json({ limit: "512kb" }));
@@ -292,7 +303,7 @@ function buildApp() {
       });
     }
 
-    const enabled = String(raw) === "true";
+    const enabled = parseBoolInput(raw, false);
     try {
       const status = setTradingEnabled(enabled);
       await recordAudit({
@@ -698,7 +709,7 @@ function buildApp() {
 
       const keepSet = new Set([...keepEnv, ...keepBody]);
 
-      const dryRun = Boolean(req.body?.dryRun);
+      const dryRun = parseBoolInput(req.body?.dryRun, false);
 
       const db = getDb();
       const collections = await db
@@ -750,7 +761,7 @@ function buildApp() {
   });
 
   app.post("/admin/kill", requirePerm("trade"), async (req, res) => {
-    const enabled = !!(req.body && req.body.enabled);
+    const enabled = parseBoolInput(req.body?.enabled, false);
     try {
       const pipeline = getPipelineSafe();
       if (!pipeline) {
