@@ -218,6 +218,14 @@ function buildApp() {
     }
   }
 
+  function getPipelineSafe() {
+    try {
+      return getPipeline();
+    } catch {
+      return null;
+    }
+  }
+
   // Optional: FE can exchange request_token (if your Kite redirect_url points to FE).
   // In production, this endpoint is protected by ADMIN_API_KEY (same as other /admin routes).
   app.post("/admin/kite/session", requirePerm("admin"), async (req, res) => {
@@ -744,7 +752,13 @@ function buildApp() {
   app.post("/admin/kill", requirePerm("trade"), async (req, res) => {
     const enabled = !!(req.body && req.body.enabled);
     try {
-      await getPipeline().setKillSwitch(enabled, "ADMIN");
+      const pipeline = getPipelineSafe();
+      if (!pipeline) {
+        return res
+          .status(503)
+          .json({ ok: false, error: "pipeline_not_ready" });
+      }
+      await pipeline.setKillSwitch(enabled, "ADMIN");
       await recordAudit({
         actor: actorFromReq(req),
         action: "kill_switch",
