@@ -4406,6 +4406,39 @@ class TradeManager {
               }
             } catch {}
 
+            // Treat rate-limit / transient broker errors as soft-failures.
+            // Pro behavior: backoff but keep trailing alive (do NOT permanently disable).
+            const msg = String(e?.message || e || "");
+            const low = msg.toLowerCase();
+            const isRateLimit =
+              low.includes("rate limit") ||
+              low.includes("too many requests") ||
+              low.includes("429");
+            const isTransientNet =
+              low.includes("etimedout") ||
+              low.includes("econnreset") ||
+              low.includes("econnrefused") ||
+              low.includes("network") ||
+              low.includes("socket hang up") ||
+              low.includes("gateway") ||
+              low.includes("timeout");
+            if (isRateLimit || isTransientNet) {
+              const softBaseMs = Number(env.DYN_EXIT_FAIL_BACKOFF_MS || 2000);
+              const softMaxMs = Number(
+                env.DYN_EXIT_FAIL_BACKOFF_MAX_MS || 15000,
+              );
+              // Single backoff window for soft-fails.
+              this._dynExitFailBackoffUntil.set(
+                tradeId,
+                Date.now() + Math.min(Math.max(500, softBaseMs), softMaxMs),
+              );
+              logger.warn(
+                { tradeId, e: msg, stopLoss: plan.sl.stopLoss, soft: true },
+                "[dyn_exit] SL modify soft-failed (rate-limit/transient); backing off",
+              );
+              return;
+            }
+
             const fails = Number(this._dynExitFailCount.get(tradeId) || 0) + 1;
             this._dynExitFailCount.set(tradeId, fails);
             const baseBackoff = Number(env.DYN_EXIT_FAIL_BACKOFF_MS || 2000);
