@@ -86,8 +86,18 @@ function assertAdminKey(socket) {
 }
 
 async function buildStatusSnapshot() {
-  const pipeline = getPipeline();
-  const s = await pipeline.status();
+  let pipeline = null;
+  let s = null;
+  try {
+    pipeline = getPipeline();
+    if (pipeline?.status) s = await pipeline.status();
+  } catch (e) {
+    logger.warn(
+      { err: e?.message || String(e) },
+      "[socket] pipeline status unavailable",
+    );
+  }
+  const status = s && typeof s === "object" ? s : {};
   const ticker = getTickerStatus();
   const halted = isHalted();
   const normalizedTicker = {
@@ -97,13 +107,13 @@ async function buildStatusSnapshot() {
     ...(ticker || {}),
   };
   const dailyPnL =
-    s?.dailyRisk?.lastTotal ??
-    s?.dailyRisk?.lastRealizedPnl ??
-    s?.dailyRisk?.realizedPnl ??
+    status?.dailyRisk?.lastTotal ??
+    status?.dailyRisk?.lastRealizedPnl ??
+    status?.dailyRisk?.realizedPnl ??
     null;
-  const state = s?.dailyRiskState ?? s?.dailyRisk?.state ?? "RUNNING";
-  const activeTrade = normalizeActiveTrade(s?.activeTrade);
-  const activeTradeId = s?.activeTradeId ?? null;
+  const state = status?.dailyRiskState ?? status?.dailyRisk?.state ?? "RUNNING";
+  const activeTrade = normalizeActiveTrade(status?.activeTrade);
+  const activeTradeId = status?.activeTradeId ?? null;
   const targetMode =
     activeTrade?.optTargetMode ||
     (activeTrade?.targetVirtual ? "VIRTUAL" : null) ||
@@ -129,25 +139,26 @@ async function buildStatusSnapshot() {
     activeTrade,
   };
   const systemHealth = {
-    lastSocketEvent: s?.lastSocketEvent || null,
+    lastSocketEvent: status?.lastSocketEvent || null,
     lastDisconnect: normalizedTicker.lastDisconnect || null,
     rejectedTrades:
-      s?.rejectedTrades ??
-      s?.dailyRisk?.rejectedTrades ??
-      s?.dailyRisk?.rejections ??
+      status?.rejectedTrades ??
+      status?.dailyRisk?.rejectedTrades ??
+      status?.dailyRisk?.rejections ??
       null,
   };
   return {
-    ok: true,
-    ...s,
-    tradingEnabled: s?.tradingEnabled ?? getTradingEnabled(),
-    killSwitch: s?.killSwitch ?? false,
+    ok: status?.ok ?? !!pipeline,
+    pipelineReady: !!pipeline,
+    ...status,
+    tradingEnabled: status?.tradingEnabled ?? getTradingEnabled(),
+    killSwitch: status?.killSwitch ?? false,
     halted,
     haltInfo: getHaltInfo(),
     ticker: normalizedTicker,
     now: new Date().toISOString(),
-    tradesToday: s?.tradesToday ?? 0,
-    ordersPlacedToday: s?.ordersPlacedToday ?? 0,
+    tradesToday: status?.tradesToday ?? 0,
+    ordersPlacedToday: status?.ordersPlacedToday ?? 0,
     dailyPnL,
     state,
     activeTradeId,
