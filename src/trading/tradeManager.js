@@ -189,12 +189,15 @@ class TradeManager {
     this.ordersPlacedToday = 0;
 
     // Dynamic exit adjustments (trail SL / adjust target)
-    this._dynExitLastAt = new Map(); // tradeId -> last eval ts
+    this._dynExitLastAt = new Map(); // tradeId -> last modify ts
+    this._dynExitLastEvalAt = new Map(); // tradeId -> last eval ts
     this._lastOrdersById = new Map(); // last broker order map (reconcile)
     this._exitLoopTimer = null;
     this._exitLoopInFlight = false;
     this._dynExitFailCount = new Map(); // tradeId -> failure count
     this._dynExitDisabled = new Set(); // tradeId -> disable trailing
+    this._dynExitInFlight = new Set(); // tradeId -> lock for dynamic exit
+    this._dynExitFailBackoffUntil = new Map(); // tradeId -> ts backoff
     this._dynPeakLtpByTrade = new Map(); // tradeId -> peak ltp (tick-driven)
     this._activeTradeToken = null;
     this._activeTradeSide = null;
@@ -846,6 +849,7 @@ class TradeManager {
         (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0),
       )[0];
       this.activeTradeId = latest.tradeId;
+      this._syncActiveTradeState(latest);
       logger.warn(
         { tradeId: latest.tradeId, status: latest.status },
         "[reconcile] found active trade in DB",
@@ -2886,44 +2890,124 @@ class TradeManager {
     }
   }
 
-  async _safeModifyOrder(variety, orderId, patch, { purpose, tradeId } = {}) {
+  async _safeModifyOrder(
+    variety,
+    orderId,
+    patch,
+    { purpose, tradeId, retry } = {},
+  ) {
     const oid = String(orderId || "");
     if (!oid) throw new Error("modifyOrder missing orderId");
 
-    const rate = this.orderLimiter.check({ count: 1 });
-    if (!rate.ok) {
-      throw new Error(
-        `Order rate limit hit (${rate.reason}). Refusing to modify order.`,
-      );
-    }
-    const brokerRate = this.brokerOrderLimiter.check({ count: 1 });
-    if (!brokerRate.ok) {
-      throw new Error(
-        `Broker rate limit hit (${brokerRate.reason}). Refusing to modify order.`,
-      );
-    }
+    const attemptModify = async (nextPatch, label) => {
+      const rate = this.orderLimiter.check({ count: 1 });
+      if (!rate.ok) {
+        throw new Error(
+          `Order rate limit hit (${rate.reason}). Refusing to modify order.`,
+        );
+      }
+      const brokerRate = this.brokerOrderLimiter.check({ count: 1 });
+      if (!brokerRate.ok) {
+        throw new Error(
+          `Broker rate limit hit (${brokerRate.reason}). Refusing to modify order.`,
+        );
+      }
 
-    // ✅ enforce daily limit for modify as well
-    if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY || 3000)) {
-      this.risk.setKillSwitch(true);
-      await upsertDailyRisk(todayKey(), {
-        kill: true,
-        reason: "MAX_ORDERS_PER_DAY_REACHED",
-      });
-      throw new Error("MAX_ORDERS_PER_DAY reached; kill-switch enabled.");
-    }
+      // ✅ enforce daily limit for modify as well
+      if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY || 3000)) {
+        this.risk.setKillSwitch(true);
+        await upsertDailyRisk(todayKey(), {
+          kill: true,
+          reason: "MAX_ORDERS_PER_DAY_REACHED",
+        });
+        throw new Error("MAX_ORDERS_PER_DAY reached; kill-switch enabled.");
+      }
 
-    try {
-      const resp = await this.kite.modifyOrder(variety, oid, patch);
+      const resp = await this.kite.modifyOrder(variety, oid, nextPatch);
+      if (retry && !retry.appliedPatch) {
+        retry.appliedPatch = nextPatch;
+      }
       this.orderLimiter.record({ count: 1 });
       this.brokerOrderLimiter.record({ count: 1 });
       await this._recordOrdersPlaced(1);
       logger.info(
-        { tradeId, purpose, orderId: oid, patch },
+        { tradeId, purpose: label || purpose, orderId: oid, patch: nextPatch },
         "[orders] modified",
       );
       return resp;
+    };
+
+    try {
+      return await attemptModify(patch);
     } catch (e) {
+      const message = String(e?.message || "");
+      const retryable = /trigger|invalid|rejected|range|cross/i.test(message);
+      if (
+        retryable &&
+        retry?.type === "DYN_SL" &&
+        !retry?.attempted &&
+        Number.isFinite(Number(patch?.trigger_price))
+      ) {
+        try {
+          const token = Number(retry?.token || 0);
+          const instrument = retry?.instrument || null;
+          const side = String(retry?.side || "").toUpperCase();
+          const slType = String(retry?.slType || "").toUpperCase();
+          const exitSide =
+            String(retry?.exitSide || "").toUpperCase() ||
+            (side === "BUY" ? "SELL" : "BUY");
+          const currentStopLoss = Number(retry?.currentStopLoss || 0);
+
+          const freshLtp = await this._getLtp(token, instrument);
+          const tickSize = Number(instrument?.tick_size || 0.05);
+          const bufferTicks = Number(env.DYN_SL_RETRY_BUFFER_TICKS || 2);
+          const buffer =
+            Math.max(1, Number.isFinite(bufferTicks) ? bufferTicks : 2) *
+            tickSize;
+
+          let nextStop = Number(patch.trigger_price || 0);
+          if (Number.isFinite(freshLtp) && freshLtp > 0) {
+            if (side === "BUY") {
+              const cap = freshLtp - buffer;
+              nextStop = Math.min(nextStop, cap);
+              if (Number.isFinite(currentStopLoss) && nextStop < currentStopLoss)
+                nextStop = NaN;
+            } else if (side === "SELL") {
+              const cap = freshLtp + buffer;
+              nextStop = Math.max(nextStop, cap);
+              if (Number.isFinite(currentStopLoss) && nextStop > currentStopLoss)
+                nextStop = NaN;
+            } else {
+              nextStop = NaN;
+            }
+          } else {
+            nextStop = NaN;
+          }
+
+          if (Number.isFinite(nextStop) && nextStop > 0) {
+            const rounded = roundToTick(
+              nextStop,
+              tickSize,
+              side === "BUY" ? "down" : "up",
+            );
+            const retryPatch = { trigger_price: rounded };
+            if (slType === "SL") {
+              retryPatch.price = this._buildStopLossLimitPrice({
+                triggerPrice: rounded,
+                exitSide,
+                instrument,
+              });
+            }
+            return await attemptModify(retryPatch, "DYN_SL_RETRY");
+          }
+        } catch (retryError) {
+          logger.warn(
+            { tradeId, purpose, orderId: oid, e: retryError?.message },
+            "[orders] modify retry failed",
+          );
+        }
+      }
+
       logger.error(
         { tradeId, purpose, orderId: oid, e: e.message },
         "[orders] modify failed",
@@ -4044,296 +4128,235 @@ class TradeManager {
     }
 
     const minMs = Number(env.DYNAMIC_EXIT_MIN_INTERVAL_MS || 5000);
-    const last = Number(this._dynExitLastAt.get(tradeId) || 0);
     const now = Date.now();
-    if (now - last < minMs) return;
-    this._dynExitLastAt.set(tradeId, now);
+    const lastEval = Number(this._dynExitLastEvalAt.get(tradeId) || 0);
+    if (now - lastEval < minMs) return;
 
-    // Need a live price + candles for ATR trail
-    const token = Number(trade.instrument_token);
-    const ltp = await this._getLtp(token, trade.instrument);
-    if (!Number.isFinite(ltp) || ltp <= 0) return;
+    const backoffUntil = Number(this._dynExitFailBackoffUntil.get(tradeId) || 0);
+    if (Number.isFinite(backoffUntil) && now < backoffUntil) return;
 
-    const intervalMin = Number(
-      trade.intervalMin || trade.candle?.interval_min || 1,
-    );
-    let candles = [];
+    if (this._dynExitInFlight.has(tradeId)) return;
+    this._dynExitInFlight.add(tradeId);
+
     try {
-      candles = await getRecentCandles(token, intervalMin, 260);
-    } catch {
-      candles = [];
-    }
-    // For OPT trades we may not have full candle history immediately; exit model can fall back.
-    let underlyingLtp = null;
-    const uTok = Number(trade.underlying_token || 0);
-    if (Number.isFinite(uTok) && uTok > 0 && uTok !== token) {
-      const cachedU = this.lastPriceByToken.get(uTok);
-      if (Number.isFinite(cachedU)) underlyingLtp = cachedU;
+      // Need a live price + candles for ATR trail
+      const token = Number(trade.instrument_token);
+      const ltp = await this._getLtp(token, trade.instrument);
+      if (!Number.isFinite(ltp) || ltp <= 0) return;
 
-      const allowFetch =
-        String(env.OPT_DYN_EXIT_ALLOW_UNDERLYING_LTP_FETCH || "false") ===
-        "true";
-      if (!Number.isFinite(underlyingLtp) && allowFetch) {
-        const lastFetch = Number(this._lastLtpFetchAtByToken.get(uTok) || 0);
-        if (now - lastFetch >= 2500) {
-          this._lastLtpFetchAtByToken.set(uTok, now);
-          try {
-            const instU = await ensureInstrument(this.kite, uTok);
-            const ul = await this._getLtp(uTok, instU);
-            if (Number.isFinite(ul)) underlyingLtp = ul;
-          } catch {}
+      const intervalMin = Number(
+        trade.intervalMin || trade.candle?.interval_min || 1,
+      );
+      let candles = [];
+      try {
+        candles = await getRecentCandles(token, intervalMin, 260);
+      } catch {
+        candles = [];
+      }
+      // For OPT trades we may not have full candle history immediately; exit model can fall back.
+      let underlyingLtp = null;
+      const uTok = Number(trade.underlying_token || 0);
+      if (Number.isFinite(uTok) && uTok > 0 && uTok !== token) {
+        const cachedU = this.lastPriceByToken.get(uTok);
+        if (Number.isFinite(cachedU)) underlyingLtp = cachedU;
+
+        const allowFetch =
+          String(env.OPT_DYN_EXIT_ALLOW_UNDERLYING_LTP_FETCH || "false") ===
+          "true";
+        if (!Number.isFinite(underlyingLtp) && allowFetch) {
+          const lastFetch = Number(this._lastLtpFetchAtByToken.get(uTok) || 0);
+          if (now - lastFetch >= 2500) {
+            this._lastLtpFetchAtByToken.set(uTok, now);
+            try {
+              const instU = await ensureInstrument(this.kite, uTok);
+              const ul = await this._getLtp(uTok, instU);
+              if (Number.isFinite(ul)) underlyingLtp = ul;
+            } catch {}
+          }
         }
       }
-    }
 
-    const peakFromTick = Number(this._dynPeakLtpByTrade.get(tradeId) || NaN);
-    const tradeForPlan = Number.isFinite(peakFromTick)
-      ? { ...trade, peakLtp: peakFromTick }
-      : trade;
+      const peakFromTick = Number(this._dynPeakLtpByTrade.get(tradeId) || NaN);
+      const tradeForPlan = Number.isFinite(peakFromTick)
+        ? { ...trade, peakLtp: peakFromTick }
+        : trade;
 
-    const plan = computeDynamicExitPlan({
-      trade: tradeForPlan,
-      ltp,
-      candles,
-      nowTs: now,
-      env,
-      underlyingLtp: Number.isFinite(underlyingLtp) ? underlyingLtp : null,
-    });
-    if (!plan?.ok) return;
+      const plan = computeDynamicExitPlan({
+        trade: tradeForPlan,
+        ltp,
+        candles,
+        nowTs: now,
+        env,
+        underlyingLtp: Number.isFinite(underlyingLtp) ? underlyingLtp : null,
+      });
+      if (!plan?.ok) return;
 
-    if (plan?.action?.exitNow) {
-      if (plan?.tradePatch && Object.keys(plan.tradePatch).length) {
-        const patch = { ...plan.tradePatch };
-        if (plan.action.reason === "TIME_STOP") {
-          Object.assign(
-            patch,
-            this._eventPatch("TIME_STOP_TRIGGERED", {
+      if (plan?.action?.exitNow) {
+        if (plan?.tradePatch && Object.keys(plan.tradePatch).length) {
+          const patch = { ...plan.tradePatch };
+          if (plan.action.reason === "TIME_STOP") {
+            Object.assign(
+              patch,
+              this._eventPatch("TIME_STOP_TRIGGERED", {
+                tradeId,
+                timeStopAtMs: plan?.meta?.timeStopAtMs,
+                pnlInr: plan?.meta?.pnlInr,
+                minGreenInr: plan?.meta?.minGreenInr,
+              }),
+            );
+            alert("warn", "⏱️ Time stop triggered -> exit", {
               tradeId,
               timeStopAtMs: plan?.meta?.timeStopAtMs,
               pnlInr: plan?.meta?.pnlInr,
               minGreenInr: plan?.meta?.minGreenInr,
-            }),
-          );
-          alert("warn", "⏱️ Time stop triggered -> exit", {
-            tradeId,
-            timeStopAtMs: plan?.meta?.timeStopAtMs,
-            pnlInr: plan?.meta?.pnlInr,
-            minGreenInr: plan?.meta?.minGreenInr,
-          }).catch(() => {});
-          logger.warn(
-            { tradeId, meta: plan?.meta || null },
-            "[dyn_exit] time stop triggered",
-          );
+            }).catch(() => {});
+            logger.warn(
+              { tradeId, meta: plan?.meta || null },
+              "[dyn_exit] time stop triggered",
+            );
+          }
+          try {
+            await updateTrade(tradeId, patch);
+          } catch {}
         }
-        try {
-          await updateTrade(tradeId, patch);
-        } catch {}
+        await this._panicExit(trade, plan.action.reason || "DYN_EXIT_ACTION");
+        return;
       }
-      await this._panicExit(trade, plan.action.reason || "DYN_EXIT_ACTION");
-      this._dynExitLastAt.set(tradeId, now);
-      return;
-    }
 
-    let peakPatch = null;
-    if (Number.isFinite(peakFromTick)) {
-      const dbPeak = Number(trade?.peakLtp || NaN);
-      const side = String(trade?.side || "").toUpperCase();
-      const isBetter =
-        side === "BUY"
-          ? !Number.isFinite(dbPeak) || peakFromTick > dbPeak
-          : side === "SELL"
-            ? !Number.isFinite(dbPeak) || peakFromTick < dbPeak
-            : false;
-      if (isBetter) peakPatch = { peakLtp: peakFromTick };
-    }
+      let peakPatch = null;
+      if (Number.isFinite(peakFromTick)) {
+        const dbPeak = Number(trade?.peakLtp || NaN);
+        const side = String(trade?.side || "").toUpperCase();
+        const isBetter =
+          side === "BUY"
+            ? !Number.isFinite(dbPeak) || peakFromTick > dbPeak
+            : side === "SELL"
+              ? !Number.isFinite(dbPeak) || peakFromTick < dbPeak
+              : false;
+        if (isBetter) peakPatch = { peakLtp: peakFromTick };
+      }
 
-    if (plan?.tradePatch && Object.keys(plan.tradePatch).length) {
-      try {
-        const patch = { ...plan.tradePatch, ...(peakPatch || {}) };
-        if (patch.beLocked && !trade.beLocked) {
-          Object.assign(
-            patch,
-            this._eventPatch("BE_LOCK_ACTIVE", {
+      if (plan?.tradePatch && Object.keys(plan.tradePatch).length) {
+        try {
+          const patch = { ...plan.tradePatch, ...(peakPatch || {}) };
+          if (patch.beLocked && !trade.beLocked) {
+            Object.assign(
+              patch,
+              this._eventPatch("BE_LOCK_ACTIVE", {
+                tradeId,
+                beLockedAtPrice: patch.beLockedAtPrice,
+                minGreenPts: trade?.minGreenPts,
+                minGreenInr: trade?.minGreenInr,
+              }),
+            );
+            alert("info", "🔒 BE lock active", {
               tradeId,
               beLockedAtPrice: patch.beLockedAtPrice,
               minGreenPts: trade?.minGreenPts,
               minGreenInr: trade?.minGreenInr,
-            }),
-          );
-          alert("info", "🔒 BE lock active", {
-            tradeId,
-            beLockedAtPrice: patch.beLockedAtPrice,
-            minGreenPts: trade?.minGreenPts,
-            minGreenInr: trade?.minGreenInr,
-          }).catch(() => {});
-          logger.info(
-            { tradeId, beLockedAtPrice: patch.beLockedAtPrice },
-            "[dyn_exit] BE lock active",
-          );
-        }
-        await updateTrade(tradeId, patch);
-      } catch {}
-    } else if (peakPatch) {
-      try {
-        await updateTrade(tradeId, peakPatch);
-      } catch {}
-    }
-
-    let did = false;
-
-    // ---- SL trail (SL / SL-M) ----
-    if (plan.sl?.stopLoss && trade.slOrderId) {
-      let sl = byId?.get(String(trade.slOrderId));
-      if (!sl) {
-        const statusInfo = await this._getOrderStatus(trade.slOrderId);
-        sl = statusInfo?.order || null;
-      }
-      const slStatus = String(sl?.status || "").toUpperCase();
-      const slType = String(sl?.order_type || "").toUpperCase();
-
-      // Only modify while it's pending (OPEN means it likely triggered already).
-      if (slStatus === "TRIGGER PENDING") {
-        const slSide = trade.side === "BUY" ? "SELL" : "BUY";
-
-        const patch = { trigger_price: plan.sl.stopLoss };
-        let nextLimitPrice = null;
-        if (slType === "SL") {
-          nextLimitPrice = this._buildStopLossLimitPrice({
-            triggerPrice: plan.sl.stopLoss,
-            exitSide: slSide,
-            instrument: trade.instrument,
-          });
-          patch.price = nextLimitPrice;
-        }
-
+            }).catch(() => {});
+            logger.info(
+              { tradeId, beLockedAtPrice: patch.beLockedAtPrice },
+              "[dyn_exit] BE lock active",
+            );
+          }
+          await updateTrade(tradeId, patch);
+        } catch {}
+      } else if (peakPatch) {
         try {
-          await this._safeModifyOrder(
-            env.DEFAULT_ORDER_VARIETY,
-            trade.slOrderId,
-            patch,
-            { purpose: "DYN_TRAIL_SL", tradeId },
-          );
-          await updateTrade(tradeId, {
-            stopLoss: plan.sl.stopLoss,
-            slTrigger: plan.sl.stopLoss,
-            ...(nextLimitPrice != null ? { slLimitPrice: nextLimitPrice } : {}),
-            ...this._eventPatch("SL_TRAILED", {
-              tradeId,
-              stopLoss: plan.sl.stopLoss,
-              trailSl: plan?.tradePatch?.trailSl ?? trade?.trailSl,
-            }),
-          });
-          try {
-            this._updateSlWatchTrigger(tradeId, plan.sl.stopLoss);
-          } catch {}
-          did = true;
-          logger.info(
-            { tradeId, stopLoss: plan.sl.stopLoss, meta: plan.meta },
-            "[dyn_exit] SL trailed",
-          );
-          alert("info", "🧭 SL trailed", {
-            tradeId,
-            stopLoss: plan.sl.stopLoss,
-          }).catch(() => {});
-          this._dynExitFailCount.set(tradeId, 0);
-        } catch (e) {
-          const message = String(e?.message || "");
-          const retryable = /trigger|invalid|rejected|range|price/i.test(
-            message,
-          );
-          let retryDone = false;
-          if (retryable) {
-            try {
-              const freshLtp = await this._getLtp(token, trade.instrument);
-              const tickSize = Number(trade.instrument?.tick_size || 0.05);
-              const bufferTicks = Number(
-                env.DYN_SL_RETRY_BUFFER_TICKS || 2,
-              );
-              const buffer =
-                Math.max(1, Number.isFinite(bufferTicks) ? bufferTicks : 2) *
-                tickSize;
-              const side = String(trade.side || "").toUpperCase();
-              const curSl =
-                Number(trade.stopLoss || sl?.trigger_price || 0) || 0;
-              let nextStop = plan.sl.stopLoss;
-              if (Number.isFinite(freshLtp) && freshLtp > 0) {
-                if (side === "BUY") {
-                  const cap = freshLtp - buffer;
-                  nextStop = Math.min(nextStop, cap);
-                  if (Number.isFinite(curSl) && nextStop < curSl) {
-                    nextStop = null;
-                  }
-                } else if (side === "SELL") {
-                  const cap = freshLtp + buffer;
-                  nextStop = Math.max(nextStop, cap);
-                  if (Number.isFinite(curSl) && nextStop > curSl) {
-                    nextStop = null;
-                  }
-                } else {
-                  nextStop = null;
-                }
-              } else {
-                nextStop = null;
-              }
+          await updateTrade(tradeId, peakPatch);
+        } catch {}
+      }
 
-              if (Number.isFinite(nextStop) && nextStop > 0) {
-                const rounded = roundToTick(
-                  nextStop,
-                  tickSize,
-                  side === "BUY" ? "down" : "up",
-                );
-                const retryPatch = { trigger_price: rounded };
-                let retryLimit = null;
-                if (slType === "SL") {
-                  retryLimit = this._buildStopLossLimitPrice({
-                    triggerPrice: rounded,
-                    exitSide: slSide,
-                    instrument: trade.instrument,
-                  });
-                  retryPatch.price = retryLimit;
-                }
-                await this._safeModifyOrder(
-                  env.DEFAULT_ORDER_VARIETY,
-                  trade.slOrderId,
-                  retryPatch,
-                  { purpose: "DYN_TRAIL_SL_RETRY", tradeId },
-                );
-                await updateTrade(tradeId, {
-                  stopLoss: rounded,
-                  slTrigger: rounded,
-                  ...(retryLimit != null ? { slLimitPrice: retryLimit } : {}),
-                  ...this._eventPatch("SL_TRAILED_RETRY", {
-                    tradeId,
-                    stopLoss: rounded,
-                    trailSl: plan?.tradePatch?.trailSl ?? trade?.trailSl,
-                  }),
-                });
-                try {
-                  this._updateSlWatchTrigger(tradeId, rounded);
-                } catch {}
-                did = true;
-                retryDone = true;
-                this._dynExitFailCount.set(tradeId, 0);
-                logger.info(
-                  { tradeId, stopLoss: rounded },
-                  "[dyn_exit] SL trailed (retry)",
-                );
-                alert("info", "🧭 SL trailed (retry)", {
-                  tradeId,
-                  stopLoss: rounded,
-                }).catch(() => {});
-              }
-            } catch (retryError) {
-              logger.warn(
-                { tradeId, e: retryError?.message || String(retryError) },
-                "[dyn_exit] SL retry failed",
-              );
-            }
+      let did = false;
+
+      // ---- SL trail (SL / SL-M) ----
+      if (plan.sl?.stopLoss && trade.slOrderId) {
+        let sl = byId?.get(String(trade.slOrderId));
+        if (!sl) {
+          const statusInfo = await this._getOrderStatus(trade.slOrderId);
+          sl = statusInfo?.order || null;
+        }
+        const slStatus = String(sl?.status || "").toUpperCase();
+        const slType = String(sl?.order_type || "").toUpperCase();
+
+        // Only modify while it's pending (OPEN means it likely triggered already).
+        if (slStatus === "TRIGGER PENDING") {
+          const slSide = trade.side === "BUY" ? "SELL" : "BUY";
+
+          const patch = { trigger_price: plan.sl.stopLoss };
+          let nextLimitPrice = null;
+          if (slType === "SL") {
+            nextLimitPrice = this._buildStopLossLimitPrice({
+              triggerPrice: plan.sl.stopLoss,
+              exitSide: slSide,
+              instrument: trade.instrument,
+            });
+            patch.price = nextLimitPrice;
           }
 
-          if (!retryDone) {
+          const retryMeta = {
+            type: "DYN_SL",
+            token,
+            instrument: trade.instrument,
+            side: trade.side,
+            slType,
+            exitSide: slSide,
+            currentStopLoss:
+              Number(trade.stopLoss || sl?.trigger_price || 0) || 0,
+          };
+
+          try {
+            await this._safeModifyOrder(
+              env.DEFAULT_ORDER_VARIETY,
+              trade.slOrderId,
+              patch,
+              {
+                purpose: "DYN_TRAIL_SL",
+                tradeId,
+                retry: retryMeta,
+              },
+            );
+            const appliedTrigger = Number(
+              retryMeta?.appliedPatch?.trigger_price ?? plan.sl.stopLoss,
+            );
+            const appliedLimit =
+              retryMeta?.appliedPatch?.price ?? nextLimitPrice;
+            await updateTrade(tradeId, {
+              stopLoss: appliedTrigger,
+              slTrigger: appliedTrigger,
+              ...(appliedLimit != null ? { slLimitPrice: appliedLimit } : {}),
+              ...this._eventPatch("SL_TRAILED", {
+                tradeId,
+                stopLoss: appliedTrigger,
+                trailSl: plan?.tradePatch?.trailSl ?? trade?.trailSl,
+              }),
+            });
+            try {
+              this._updateSlWatchTrigger(tradeId, appliedTrigger);
+            } catch {}
+            did = true;
+            logger.info(
+              { tradeId, stopLoss: appliedTrigger, meta: plan.meta },
+              "[dyn_exit] SL trailed",
+            );
+            alert("info", "🧭 SL trailed", {
+              tradeId,
+              stopLoss: appliedTrigger,
+            }).catch(() => {});
+            this._dynExitFailCount.set(tradeId, 0);
+            this._dynExitFailBackoffUntil.delete(tradeId);
+          } catch (e) {
             const fails = Number(this._dynExitFailCount.get(tradeId) || 0) + 1;
             this._dynExitFailCount.set(tradeId, fails);
+            const baseBackoff = Number(env.DYN_EXIT_FAIL_BACKOFF_MS || 2000);
+            const maxBackoff = Number(env.DYN_EXIT_FAIL_BACKOFF_MAX_MS || 15000);
+            const nextBackoff =
+              Math.max(500, baseBackoff) * Math.max(1, fails);
+            this._dynExitFailBackoffUntil.set(
+              tradeId,
+              Date.now() + Math.min(nextBackoff, maxBackoff),
+            );
             if (fails >= 3) {
               this._dynExitDisabled.add(tradeId);
               try {
@@ -4362,57 +4385,63 @@ class TradeManager {
           }
         }
       }
-    }
 
-    // ---- TARGET adjust (LIMIT) ----
-    if (!keepTp2Resting && plan.target?.targetPrice && trade.targetOrderId) {
-      let tgt = byId?.get(String(trade.targetOrderId));
-      if (!tgt) {
-        const statusInfo = await this._getOrderStatus(trade.targetOrderId);
-        tgt = statusInfo?.order || null;
-      }
-      const tgtStatus = String(tgt?.status || "").toUpperCase();
-      const tgtType = String(tgt?.order_type || "").toUpperCase();
-      // Only modify an open LIMIT target (market targets can't be modified meaningfully)
-      if (tgtStatus === "OPEN" && (tgtType === "LIMIT" || tgtType === "LM")) {
-        try {
-          await this._safeModifyOrder(
-            env.DEFAULT_ORDER_VARIETY,
-            trade.targetOrderId,
-            { price: plan.target.targetPrice },
-            { purpose: "DYN_ADJUST_TARGET", tradeId },
-          );
-          await updateTrade(tradeId, {
-            targetPrice: plan.target.targetPrice,
-            ...this._eventPatch("TARGET_ADJUSTED", {
+      // ---- TARGET adjust (LIMIT) ----
+      if (!keepTp2Resting && plan.target?.targetPrice && trade.targetOrderId) {
+        let tgt = byId?.get(String(trade.targetOrderId));
+        if (!tgt) {
+          const statusInfo = await this._getOrderStatus(trade.targetOrderId);
+          tgt = statusInfo?.order || null;
+        }
+        const tgtStatus = String(tgt?.status || "").toUpperCase();
+        const tgtType = String(tgt?.order_type || "").toUpperCase();
+        // Only modify an open LIMIT target (market targets can't be modified meaningfully)
+        if (tgtStatus === "OPEN" && (tgtType === "LIMIT" || tgtType === "LM")) {
+          try {
+            await this._safeModifyOrder(
+              env.DEFAULT_ORDER_VARIETY,
+              trade.targetOrderId,
+              { price: plan.target.targetPrice },
+              { purpose: "DYN_ADJUST_TARGET", tradeId },
+            );
+            await updateTrade(tradeId, {
+              targetPrice: plan.target.targetPrice,
+              ...this._eventPatch("TARGET_ADJUSTED", {
+                tradeId,
+                targetPrice: plan.target.targetPrice,
+              }),
+            });
+            try {
+              this._refreshTargetWatchAfterAdjust(
+                { ...trade, targetPrice: plan.target.targetPrice },
+                plan.target.targetPrice,
+              );
+            } catch {}
+            did = true;
+            logger.info(
+              { tradeId, targetPrice: plan.target.targetPrice, meta: plan.meta },
+              "[dyn_exit] TARGET adjusted",
+            );
+            alert("info", "🎯 TARGET adjusted", {
               tradeId,
               targetPrice: plan.target.targetPrice,
-            }),
-          });
-          try {
-            this._refreshTargetWatchAfterAdjust(
-              { ...trade, targetPrice: plan.target.targetPrice },
-              plan.target.targetPrice,
+            }).catch(() => {});
+          } catch (e) {
+            logger.warn(
+              { tradeId, e: e.message, targetPrice: plan.target.targetPrice },
+              "[dyn_exit] TARGET modify failed",
             );
-          } catch {}
-          did = true;
-          logger.info(
-            { tradeId, targetPrice: plan.target.targetPrice, meta: plan.meta },
-            "[dyn_exit] TARGET adjusted",
-          );
-          alert("info", "🎯 TARGET adjusted", {
-            tradeId,
-            targetPrice: plan.target.targetPrice,
-          }).catch(() => {});
-        } catch (e) {
-          logger.warn(
-            { tradeId, e: e.message, targetPrice: plan.target.targetPrice },
-            "[dyn_exit] TARGET modify failed",
-          );
+          }
         }
       }
-    }
 
+      if (did) {
+        this._dynExitLastAt.set(tradeId, Date.now());
+      }
+    } finally {
+      this._dynExitInFlight.delete(tradeId);
+      this._dynExitLastEvalAt.set(tradeId, Date.now());
+    }
   }
 
   async _watchEntryUntilDone(tradeId, entryOrderId) {
@@ -6835,6 +6864,8 @@ class TradeManager {
     await this._replayOrphanUpdates(entryOrderId);
 
     this.activeTradeId = tradeId;
+    this._activeTradeToken = token;
+    this._activeTradeSide = side;
     this.risk.markTradeOpened(token, { tradeId, side: side, qty });
 
     // watchdog fallback (in case order_update is missing)
@@ -9559,8 +9590,11 @@ class TradeManager {
     this._activeTradeToken = null;
     this._activeTradeSide = null;
     this._dynExitLastAt.delete(tradeId);
+    this._dynExitLastEvalAt.delete(tradeId);
     this._dynExitFailCount.delete(tradeId);
     this._dynExitDisabled.delete(tradeId);
+    this._dynExitInFlight.delete(tradeId);
+    this._dynExitFailBackoffUntil.delete(tradeId);
     this._dynPeakLtpByTrade.delete(tradeId);
     this._clearVirtualTarget(tradeId);
     this.risk.markTradeClosed(Number(instrument_token));

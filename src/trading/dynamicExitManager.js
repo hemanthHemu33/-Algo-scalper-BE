@@ -239,10 +239,11 @@ function applyMinGreenExitRules({
     String(env.DYN_TRAIL_START_AFTER_BE_LOCK || "true") === "true";
   const trailStartInr = Number(env.DYN_TRAIL_START_PROFIT_INR || 0);
   const allowTrail =
-    (!trailAfterBe || trade?.beLocked) ||
+    (trailAfterBe ? trade?.beLocked : false) ||
     (Number.isFinite(trailStartInr) && trailStartInr > 0
       ? pnlInr >= trailStartInr
-      : false);
+      : false) ||
+    trade?.tp1Done;
 
   if (
     allowTrail &&
