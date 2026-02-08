@@ -393,7 +393,9 @@ class TradeManager {
   _computeRiskStopLoss({ entryPrice, side, instrument, qty, riskInr }) {
     const entry = Number(entryPrice);
     const baseRisk = Number(riskInr || env.RISK_PER_TRADE_INR || 0);
-    const riskQty = Number(qty || instrument?.lot_size || instrument?.lotSize || 1);
+    const riskQty = Number(
+      qty || instrument?.lot_size || instrument?.lotSize || 1,
+    );
     const safeQty = Number.isFinite(riskQty) && riskQty > 0 ? riskQty : 1;
     const riskPts = safeQty > 0 ? baseRisk / safeQty : 0;
     const tick = Number(instrument?.tick_size || 0.05);
@@ -435,7 +437,9 @@ class TradeManager {
       s.includes("insufficient margin") ||
       s.includes("margin exceeds") ||
       s.includes("rms:margin") ||
-      (s.includes("required") && s.includes("margin") && s.includes("available"))
+      (s.includes("required") &&
+        s.includes("margin") &&
+        s.includes("available"))
     );
   }
 
@@ -466,7 +470,9 @@ class TradeManager {
 
   _isOptTargetModeVirtual(trade) {
     const optTargetMode = String(env.OPT_TARGET_MODE || "BROKER").toUpperCase();
-    return optTargetMode === "VIRTUAL" && this._isOptionInstrument(trade?.instrument);
+    return (
+      optTargetMode === "VIRTUAL" && this._isOptionInstrument(trade?.instrument)
+    );
   }
 
   async _enforceOptVirtualTargetMode(trade, source = "opt_mode") {
@@ -482,7 +488,9 @@ class TradeManager {
       const targetOrderId = trade?.targetOrderId
         ? String(trade.targetOrderId)
         : null;
-      const targetOrderType = String(trade?.targetOrderType || "").toUpperCase();
+      const targetOrderType = String(
+        trade?.targetOrderType || "",
+      ).toUpperCase();
       const targetIsVirtualMarket =
         trade?.targetVirtual && targetOrderId && targetOrderType === "MARKET";
 
@@ -575,9 +583,12 @@ class TradeManager {
     const everyMs = Number(env.EXIT_LOOP_MS || 0);
     if (!Number.isFinite(everyMs) || everyMs <= 0) return;
 
-    this._exitLoopTimer = setInterval(() => {
-      this._exitLoopTick().catch(() => {});
-    }, Math.max(250, everyMs));
+    this._exitLoopTimer = setInterval(
+      () => {
+        this._exitLoopTick().catch(() => {});
+      },
+      Math.max(250, everyMs),
+    );
   }
 
   async _exitLoopTick() {
@@ -1379,10 +1390,14 @@ class TradeManager {
 
         try {
           this.expectedCancelOrderIds.add(String(targetOrderId));
-          await this._safeCancelOrder(env.DEFAULT_ORDER_VARIETY, targetOrderId, {
-            purpose: "TARGET_WATCHDOG_CANCEL",
-            tradeId: id,
-          });
+          await this._safeCancelOrder(
+            env.DEFAULT_ORDER_VARIETY,
+            targetOrderId,
+            {
+              purpose: "TARGET_WATCHDOG_CANCEL",
+              tradeId: id,
+            },
+          );
         } catch {}
 
         const after = await this._getOrderStatus(targetOrderId);
@@ -1555,10 +1570,7 @@ class TradeManager {
       st.firedAtMs = Number(nowMs || Date.now());
       this._virtualTargetWatch.set(tradeId, st);
       this._fireVirtualTarget(tradeId, st, ltp).catch((e) => {
-        logger.error(
-          { tradeId, e: e.message },
-          "[virtual_target] fire failed",
-        );
+        logger.error({ tradeId, e: e.message }, "[virtual_target] fire failed");
       });
     }
   }
@@ -1830,11 +1842,21 @@ class TradeManager {
     this._panicExitTimers.delete(id);
   }
 
-  _schedulePanicExitWatch({ tradeId, orderId, instrument, exitSide, qty, reason }) {
+  _schedulePanicExitWatch({
+    tradeId,
+    orderId,
+    instrument,
+    exitSide,
+    qty,
+    reason,
+  }) {
     const id = String(tradeId || "");
     if (!id) return;
 
-    const timeoutMs = Math.max(0, Number(env.PANIC_EXIT_FILL_TIMEOUT_MS || 2500));
+    const timeoutMs = Math.max(
+      0,
+      Number(env.PANIC_EXIT_FILL_TIMEOUT_MS || 2500),
+    );
     if (timeoutMs <= 0) return;
 
     this._clearPanicExitWatch(id);
@@ -1874,7 +1896,10 @@ class TradeManager {
     const status = String(latest?.status || "").toUpperCase();
 
     if (!status) {
-      logger.warn({ tradeId: id, orderId: oid }, "[panic] timeout check: no status");
+      logger.warn(
+        { tradeId: id, orderId: oid },
+        "[panic] timeout check: no status",
+      );
       return;
     }
 
@@ -1895,7 +1920,11 @@ class TradeManager {
       return;
     }
 
-    if (status === "OPEN" || status === "PARTIAL" || status === "TRIGGER PENDING") {
+    if (
+      status === "OPEN" ||
+      status === "PARTIAL" ||
+      status === "TRIGGER PENDING"
+    ) {
       logger.warn(
         { tradeId: id, orderId: oid, status, reason },
         "[panic] timeout reached; cancel + replace",
@@ -1918,7 +1947,11 @@ class TradeManager {
         return;
       }
 
-      if (!isDead(afterStatus) && afterStatus !== "CANCELLED" && afterStatus !== "CANCELED") {
+      if (
+        !isDead(afterStatus) &&
+        afterStatus !== "CANCELLED" &&
+        afterStatus !== "CANCELED"
+      ) {
         logger.warn(
           { tradeId: id, orderId: oid, status: afterStatus },
           "[panic] timeout check: cancel not confirmed; skipping replace",
@@ -1939,9 +1972,7 @@ class TradeManager {
 
       const fresh = (await getTrade(id)) || {};
       const inst = instrument || fresh.instrument;
-      const side =
-        exitSide ||
-        (Number(fresh.qty || 0) >= 0 ? "SELL" : "BUY");
+      const side = exitSide || (Number(fresh.qty || 0) >= 0 ? "SELL" : "BUY");
 
       const fb = await this._panicExitFallbackLimit({
         tradeId: id,
@@ -2342,14 +2373,10 @@ class TradeManager {
   }
 
   _scheduleReconcile(reason = "order_update") {
-    const enabled =
-      String(env.RECONCILE_ON_ORDER_UPDATE || "true") === "true";
+    const enabled = String(env.RECONCILE_ON_ORDER_UPDATE || "true") === "true";
     if (!enabled) return;
 
-    const debounceMs = Math.max(
-      250,
-      Number(env.RECONCILE_DEBOUNCE_MS || 1500),
-    );
+    const debounceMs = Math.max(250, Number(env.RECONCILE_DEBOUNCE_MS || 1500));
 
     if (this._reconcileTimer) return;
 
@@ -2402,10 +2429,7 @@ class TradeManager {
   }
 
   async _monitorPortfolioRisk(reason = "tick") {
-    const everyMs = Math.max(
-      1000,
-      Number(env.PORTFOLIO_RISK_CHECK_MS || 5000),
-    );
+    const everyMs = Math.max(1000, Number(env.PORTFOLIO_RISK_CHECK_MS || 5000));
     if (Date.now() - this._lastPortfolioRiskCheckAt < everyMs) return;
     this._lastPortfolioRiskCheckAt = Date.now();
 
@@ -2763,7 +2787,12 @@ class TradeManager {
       } catch (e) {
         const msg = String(e?.message || e);
         const retryable = isRetryablePlaceError(e);
-        this._handlePlaceOrderError({ e, params: baseParams, tradeId, purpose });
+        this._handlePlaceOrderError({
+          e,
+          params: baseParams,
+          tradeId,
+          purpose,
+        });
 
         // If retryable, attempt dedupe by tag before retrying
         if (retryable && attempt < maxAttempts) {
@@ -2949,6 +2978,7 @@ class TradeManager {
         Number.isFinite(Number(patch?.trigger_price))
       ) {
         try {
+          retry.attempted = true;
           const token = Number(retry?.token || 0);
           const instrument = retry?.instrument || null;
           const side = String(retry?.side || "").toUpperCase();
@@ -2970,12 +3000,18 @@ class TradeManager {
             if (side === "BUY") {
               const cap = freshLtp - buffer;
               nextStop = Math.min(nextStop, cap);
-              if (Number.isFinite(currentStopLoss) && nextStop < currentStopLoss)
+              if (
+                Number.isFinite(currentStopLoss) &&
+                nextStop < currentStopLoss
+              )
                 nextStop = NaN;
             } else if (side === "SELL") {
               const cap = freshLtp + buffer;
               nextStop = Math.max(nextStop, cap);
-              if (Number.isFinite(currentStopLoss) && nextStop > currentStopLoss)
+              if (
+                Number.isFinite(currentStopLoss) &&
+                nextStop > currentStopLoss
+              )
                 nextStop = NaN;
             } else {
               nextStop = NaN;
@@ -3053,10 +3089,7 @@ class TradeManager {
       1,
       Number(env.ORPHAN_REPLAY_MAX_ATTEMPTS || 4),
     );
-    const delayMs = Math.max(
-      0,
-      Number(env.ORPHAN_REPLAY_DELAY_MS || 250),
-    );
+    const delayMs = Math.max(0, Number(env.ORPHAN_REPLAY_DELAY_MS || 250));
 
     try {
       const linkCheck = await findTradeByOrder(oid);
@@ -3682,13 +3715,13 @@ class TradeManager {
           STATUS.CLOSED,
         ].includes(trade.status);
 
-    // SL watchdog heartbeat (handles restarts / tick gaps): if SL-L triggered but not filled -> flatten.
-    try {
-      this._slWatchdogHeartbeat(trade, netQty, source);
-    } catch {}
-    try {
-      this._targetWatchdogHeartbeat(trade, netQty, source);
-    } catch {}
+        // SL watchdog heartbeat (handles restarts / tick gaps): if SL-L triggered but not filled -> flatten.
+        try {
+          this._slWatchdogHeartbeat(trade, netQty, source);
+        } catch {}
+        try {
+          this._targetWatchdogHeartbeat(trade, netQty, source);
+        } catch {}
 
         if (netQty === 0) {
           // cancel any remaining exits ASAP (reduces accidental re-entry via dangling SL/TGT)
@@ -4096,7 +4129,10 @@ class TradeManager {
       }
 
       // If exits missing (rare), place them
-      if (!trade.slOrderId || (this._isTargetRequired() && !trade.targetOrderId)) {
+      if (
+        !trade.slOrderId ||
+        (this._isTargetRequired() && !trade.targetOrderId)
+      ) {
         await this._placeExitsIfMissing(trade);
       }
 
@@ -4132,7 +4168,9 @@ class TradeManager {
     const lastEval = Number(this._dynExitLastEvalAt.get(tradeId) || 0);
     if (now - lastEval < minMs) return;
 
-    const backoffUntil = Number(this._dynExitFailBackoffUntil.get(tradeId) || 0);
+    const backoffUntil = Number(
+      this._dynExitFailBackoffUntil.get(tradeId) || 0,
+    );
     if (Number.isFinite(backoffUntil) && now < backoffUntil) return;
 
     if (this._dynExitInFlight.has(tradeId)) return;
@@ -4347,12 +4385,34 @@ class TradeManager {
             this._dynExitFailCount.set(tradeId, 0);
             this._dynExitFailBackoffUntil.delete(tradeId);
           } catch (e) {
+            // If SL triggered/cancelled between status check and modify, modify will fail.
+            // Treat that as a normal race condition (don't penalize/disable trailing).
+            try {
+              const stNow = await this._getOrderStatus(trade.slOrderId);
+              const sttNow = String(stNow?.status || "").toUpperCase();
+              if (sttNow && sttNow !== "TRIGGER PENDING") {
+                logger.warn(
+                  {
+                    tradeId,
+                    slOrderId: trade.slOrderId,
+                    slStatus: sttNow,
+                    e: e.message,
+                  },
+                  "[dyn_exit] SL modify failed but SL not pending (race) -> ignore",
+                );
+                this._dynExitFailCount.set(tradeId, 0);
+                this._dynExitFailBackoffUntil.delete(tradeId);
+                return;
+              }
+            } catch {}
+
             const fails = Number(this._dynExitFailCount.get(tradeId) || 0) + 1;
             this._dynExitFailCount.set(tradeId, fails);
             const baseBackoff = Number(env.DYN_EXIT_FAIL_BACKOFF_MS || 2000);
-            const maxBackoff = Number(env.DYN_EXIT_FAIL_BACKOFF_MAX_MS || 15000);
-            const nextBackoff =
-              Math.max(500, baseBackoff) * Math.max(1, fails);
+            const maxBackoff = Number(
+              env.DYN_EXIT_FAIL_BACKOFF_MAX_MS || 15000,
+            );
+            const nextBackoff = Math.max(500, baseBackoff) * Math.max(1, fails);
             this._dynExitFailBackoffUntil.set(
               tradeId,
               Date.now() + Math.min(nextBackoff, maxBackoff),
@@ -4419,7 +4479,11 @@ class TradeManager {
             } catch {}
             did = true;
             logger.info(
-              { tradeId, targetPrice: plan.target.targetPrice, meta: plan.meta },
+              {
+                tradeId,
+                targetPrice: plan.target.targetPrice,
+                meta: plan.meta,
+              },
               "[dyn_exit] TARGET adjusted",
             );
             alert("info", "🎯 TARGET adjusted", {
@@ -5705,7 +5769,7 @@ class TradeManager {
           reason: "OPT_SELECTED_CONTRACT",
           // For options, candle history is important for exits; default: backfill enabled.
           backfill:
-            String(env.OPT_RUNTIME_SUBSCRIBE_BACKFILL || "true") === "true",
+            String(env.OPT_RUNTIME_SUBSCRIBE_BACKFILL || "false") === "true",
           // Prefer a slightly deeper backfill for options (per-token override supported by pipeline).
           daysOverride: Number(env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS_OPT || 2),
         });
@@ -5797,7 +5861,10 @@ class TradeManager {
       return;
     }
 
-    if (this._slippageCooldownUntil && Date.now() < this._slippageCooldownUntil) {
+    if (
+      this._slippageCooldownUntil &&
+      Date.now() < this._slippageCooldownUntil
+    ) {
       logger.warn(
         { token, until: this._slippageCooldownUntil },
         "[trade] blocked (slippage cooldown)",
@@ -6703,8 +6770,7 @@ class TradeManager {
       return;
     }
 
-    const minGreenEnabled =
-      String(env.MIN_GREEN_ENABLED || "true") === "true";
+    const minGreenEnabled = String(env.MIN_GREEN_ENABLED || "true") === "true";
     const minGreen = minGreenEnabled
       ? estimateMinGreen({
           entryPrice: expectedEntryPrice,
@@ -9675,7 +9741,8 @@ function optionStopLossFromUnderlyingATR({
         : Number(env.OPT_DELTA_ATM || 0.5);
 
   const deltaRaw = Math.abs(Number(optionMeta?.delta));
-  const delta = Number.isFinite(deltaRaw) && deltaRaw > 0 ? deltaRaw : fallbackDelta;
+  const delta =
+    Number.isFinite(deltaRaw) && deltaRaw > 0 ? deltaRaw : fallbackDelta;
 
   const gammaRaw = Math.abs(Number(optionMeta?.gamma));
   const gamma = Number.isFinite(gammaRaw) ? gammaRaw : 0;

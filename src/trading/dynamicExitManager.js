@@ -91,11 +91,7 @@ function profitPct({ side, entry, ltp }) {
 }
 
 function unrealizedPnlInr({ side, entry, ltp, qty }) {
-  if (
-    !Number.isFinite(entry) ||
-    !Number.isFinite(ltp) ||
-    !Number.isFinite(qty)
-  )
+  if (!Number.isFinite(entry) || !Number.isFinite(ltp) || !Number.isFinite(qty))
     return 0;
   if (side === "BUY") return (ltp - entry) * qty;
   return (entry - ltp) * qty;
@@ -223,8 +219,7 @@ function applyMinGreenExitRules({
     pnlInr >= beLockAt &&
     minGreenPts > 0
   ) {
-    const desired =
-      side === "BUY" ? entry + minGreenPts : entry - minGreenPts;
+    const desired = side === "BUY" ? entry + minGreenPts : entry - minGreenPts;
     if (side === "BUY") newSL = Math.max(newSL, desired);
     else newSL = Math.min(newSL, desired);
     if (!trade?.beLocked) {
@@ -238,8 +233,12 @@ function applyMinGreenExitRules({
   const trailAfterBe =
     String(env.DYN_TRAIL_START_AFTER_BE_LOCK || "true") === "true";
   const trailStartInr = Number(env.DYN_TRAIL_START_PROFIT_INR || 0);
+
+  // If BE lock activates in *this* evaluation, it lives in tradePatch (trade.beLocked may still be false).
+  const beLockedNow = Boolean(tradePatch.beLocked || trade?.beLocked);
+
   const allowTrail =
-    (trailAfterBe ? trade?.beLocked : false) ||
+    (trailAfterBe ? beLockedNow : false) ||
     (Number.isFinite(trailStartInr) && trailStartInr > 0
       ? pnlInr >= trailStartInr
       : false) ||
@@ -262,7 +261,10 @@ function applyMinGreenExitRules({
     if (!Number.isFinite(prevPeak) || peakLtp !== prevPeak) {
       tradePatch.peakLtp = peakLtp;
     }
-    if (!Number.isFinite(Number(trade?.trailSl)) || trailSl !== trade?.trailSl) {
+    if (
+      !Number.isFinite(Number(trade?.trailSl)) ||
+      trailSl !== trade?.trailSl
+    ) {
       tradePatch.trailSl = trailSl;
     }
 
