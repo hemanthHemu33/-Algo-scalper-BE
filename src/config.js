@@ -833,7 +833,7 @@ const schema = z.object({
   // Start ATR trailing only after trade is meaningfully in profit (reduces noise stopouts)
   DYN_TRAIL_START_R: z.coerce.number().default(1.0),
 
-  DYN_TRAIL_STEP_TICKS: z.coerce.number().default(2),
+  DYN_TRAIL_STEP_TICKS: z.coerce.number().default(20),
 
   // STATIC | FOLLOW_RR | TIGHTEN_VWAP
   DYN_TARGET_MODE: z.string().default("STATIC"),

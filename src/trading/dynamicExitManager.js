@@ -291,7 +291,7 @@ function applyMinGreenExitRules({
 
   newSL = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
 
-  const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 2);
+  const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 20);
   const step = stepTicks * tick;
   const slMove = side === "BUY" ? newSL - curSL : curSL - newSL;
   const shouldMoveSL = Number.isFinite(slMove) && slMove >= step;
@@ -541,7 +541,7 @@ function optionExitFallback({
   else newSL = Math.min(newSL, floorSL);
 
   // ===== Decide whether to send modifications =====
-  const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 2);
+  const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 20);
   const step = stepTicks * tick;
 
   const slMove = Number.isFinite(curSL)
@@ -668,7 +668,7 @@ function computeDynamicExitPlan({
     // Move SL to "true breakeven" after Y R in profit
     const beAtR = Number(env.DYN_MOVE_SL_TO_BE_AT_R || 0.8);
 
-    const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 2); // minimum move before modifying
+    const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 20); // minimum move before modifying
     const step = stepTicks * tick;
 
     // candles since entry
