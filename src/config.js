@@ -370,6 +370,12 @@ const schema = z.object({
   SIGNAL_TICK_CONFIRM_SUPPRESS_CLOSE: z.string().default("true"),
   MARKET_OPEN: z.string().default("09:15"),
   MARKET_CLOSE: z.string().default("15:30"),
+  MARKET_GATE_POLL_MS: z.coerce.number().default(5000),
+  MARKET_GATE_CONTROL_TRADING: z.string().default("true"),
+  TICK_WATCHDOG_ENABLED: z.string().default("true"),
+  TICK_WATCHDOG_INTERVAL_MS: z.coerce.number().default(5000),
+  TICK_WATCHDOG_MAX_AGE_MS: z.coerce.number().default(15000),
+  TICK_TAP_LOG: z.string().default("false"),
 
   // Market holiday calendar (optional) — blocks trading on holidays / weekends and supports special sessions.
   HOLIDAY_CALENDAR_ENABLED: z.string().default("false"),
@@ -414,6 +420,7 @@ const schema = z.object({
   CANDLE_WRITE_FLUSH_MS: z.coerce.number().default(250),
   CANDLE_WRITE_MAX_BATCH: z.coerce.number().default(500),
   CANDLE_WRITE_MAX_BUFFER: z.coerce.number().default(15000),
+  CANDLE_WRITE_LOG: z.string().default("false"),
   // Persist candles for non-signal tokens (e.g., option instruments) if enabled.
   CANDLE_PERSIST_NON_SIGNAL_TOKENS: z.string().default("false"),
   DAILY_LOSS_CHECK_MS: z.coerce.number().default(2000),

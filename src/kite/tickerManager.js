@@ -7,9 +7,12 @@ const { buildFnoUniverse, getLastFnoUniverse } = require("../fno/fnoUniverse");
 const { logger } = require("../logger");
 const { alert } = require("../alerts/alertService");
 const { isHalted } = require("../runtime/halt");
+const { setTradingEnabled } = require("../runtime/tradingEnabled");
 const { createTicker, createKiteConnect } = require("./kiteClients");
 const { buildPipeline } = require("../pipeline");
 const { updateFromTicks } = require("../market/ltpStream");
+const { MarketGate } = require("../market/marketGate");
+const { isMarketOpenNow } = require("../market/isMarketOpenNow");
 
 let kite = null;
 let ticker = null;
@@ -25,6 +28,11 @@ let draining = false;
 
 let reconcileTimer = null;
 let ocoReconcileTimer = null;
+let marketGate = null;
+let tickWatchdogTimer = null;
+let tickTapTimer = null;
+let tickTapCount = 0;
+let lastTickAt = 0;
 
 // Track ALL subscribed tokens (base universe + runtime position tokens)
 let subscribedTokens = new Set();
@@ -75,6 +83,85 @@ function _modeStrSafe(v, def = "full") {
   if (m === "ltp") return "ltp";
   if (m === "quote") return "quote";
   return "full";
+}
+
+function _shouldControlTrading() {
+  return _bool(env.MARKET_GATE_CONTROL_TRADING, true);
+}
+
+function _marketGatePollMs() {
+  return _num(env.MARKET_GATE_POLL_MS, 5000);
+}
+
+function _tickWatchdogEnabled() {
+  return _bool(env.TICK_WATCHDOG_ENABLED, true);
+}
+
+function _tickWatchdogIntervalMs() {
+  return _num(env.TICK_WATCHDOG_INTERVAL_MS, 5000);
+}
+
+function _tickWatchdogMaxAgeMs() {
+  return _num(env.TICK_WATCHDOG_MAX_AGE_MS, 15000);
+}
+
+function _tickTapEnabled() {
+  return _bool(env.TICK_TAP_LOG, false);
+}
+
+function startMarketGate() {
+  if (marketGate) return marketGate;
+  marketGate = new MarketGate({
+    isOpenFn: isMarketOpenNow,
+    pollMs: _marketGatePollMs(),
+  });
+
+  marketGate.on("open", () => {
+    logger.info("[market] OPEN -> enabling signals/trading");
+    if (_shouldControlTrading()) {
+      setTradingEnabled(null);
+    }
+  });
+
+  marketGate.on("close", () => {
+    logger.info("[market] CLOSE -> disabling new entries");
+    if (_shouldControlTrading()) {
+      setTradingEnabled(false);
+    }
+  });
+
+  marketGate.start();
+  return marketGate;
+}
+
+function startTickWatchdog() {
+  if (tickWatchdogTimer || !_tickWatchdogEnabled()) return;
+  const intervalMs = _tickWatchdogIntervalMs();
+  const maxAgeMs = _tickWatchdogMaxAgeMs();
+  tickWatchdogTimer = setInterval(() => {
+    if (!ticker || !tickerConnected) return;
+    if (!marketGate?.isOpen?.()) return;
+    if (!subscribedTokens.size) return;
+    if (!lastTickAt) return;
+    const age = Date.now() - lastTickAt;
+    if (age <= maxAgeMs) return;
+    const tokens = Array.from(subscribedTokens);
+    logger.warn({ age, tokens: tokens.length }, "[ticks] no ticks -> resubscribing");
+    try {
+      ticker.subscribe(tokens);
+      _applyModesFromCache(tokens);
+    } catch (e) {
+      logger.warn({ e: e?.message || String(e) }, "[ticks] resubscribe failed");
+    }
+  }, Math.max(1000, intervalMs));
+}
+
+function startTickTapLogger() {
+  if (tickTapTimer || !_tickTapEnabled()) return;
+  tickTapTimer = setInterval(() => {
+    logger.info({ ticks10s: tickTapCount }, "[ticktap]");
+    tickTapCount = 0;
+  }, 10000);
 }
 
 function _modeConst(modeStr) {
@@ -394,9 +481,11 @@ async function setSession(accessToken) {
 
   kite = createKiteConnect({ apiKey: env.KITE_API_KEY, accessToken });
   ticker = createTicker({ apiKey: env.KITE_API_KEY, accessToken });
+  const gate = startMarketGate();
   pipeline = buildPipeline({
     kite,
     tickerCtrl: { subscribe: _subscribeTokens },
+    marketGate: gate,
   });
 
   subscribedTokens = new Set();
@@ -406,6 +495,9 @@ async function setSession(accessToken) {
 
   wireEvents();
   ticker.connect();
+
+  startTickWatchdog();
+  startTickTapLogger();
 
   currentToken = accessToken;
 }
@@ -509,6 +601,11 @@ function wireEvents() {
   ticker.on("ticks", (ticks) => {
     try {
       if (!pipeline) return;
+
+      lastTickAt = Date.now();
+      if (tickTapTimer) {
+        tickTapCount += Array.isArray(ticks) ? ticks.length : 0;
+      }
 
       updateFromTicks(ticks || []);
 
