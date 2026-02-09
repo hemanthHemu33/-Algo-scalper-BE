@@ -1057,6 +1057,34 @@ class TradeManager {
     return l >= t * (1 + factor);
   }
 
+  _armSlWatchTriggered(tradeId, nowMs, source = "tick") {
+    try {
+      if (!this._isSlWatchdogEnabled()) return;
+      const id = String(tradeId || "");
+      if (!id) return;
+      const st = this._slWatch.get(id);
+      if (!st || st.triggeredAtMs) return;
+
+      st.triggeredAtMs = Number(nowMs || Date.now());
+      st.triggeredBy = String(source || "tick");
+      this._slWatch.set(id, st);
+      try {
+        updateTrade(id, {
+          slTriggeredAt: new Date(st.triggeredAtMs),
+          slTriggeredSource: st.triggeredBy,
+        }).catch(() => {});
+      } catch {}
+
+      const openSec = Number(env.SL_WATCHDOG_OPEN_SEC || 8);
+      const ms = Math.max(1000, openSec * 1000);
+      if (st.timer) clearTimeout(st.timer);
+      st.timer = setTimeout(() => {
+        this._slWatchdogFire(id, "timeout").catch(() => {});
+      }, ms);
+      this._slWatch.set(id, st);
+    } catch {}
+  }
+
   _maybeTriggerSlWatchFromTick(token, ltp, nowMs) {
     if (!this._isSlWatchdogEnabled()) return;
     if (!this.activeTradeId) return;
@@ -1080,22 +1108,7 @@ class TradeManager {
 
     // Mark triggered and arm timer once
     if (!st.triggeredAtMs) {
-      st.triggeredAtMs = Number(nowMs || Date.now());
-      this._slWatch.set(tradeId, st);
-      try {
-        updateTrade(tradeId, {
-          slTriggeredAt: new Date(st.triggeredAtMs),
-        }).catch(() => {});
-      } catch {}
-
-      const openSec = Number(env.SL_WATCHDOG_OPEN_SEC || 8);
-      const ms = Math.max(1000, openSec * 1000);
-
-      if (st.timer) clearTimeout(st.timer);
-      st.timer = setTimeout(() => {
-        this._slWatchdogFire(tradeId, "timeout").catch(() => {});
-      }, ms);
-      this._slWatch.set(tradeId, st);
+      this._armSlWatchTriggered(tradeId, nowMs, "tick");
     }
   }
 
@@ -1764,6 +1777,15 @@ class TradeManager {
 
       const openSec = Number(env.SL_WATCHDOG_OPEN_SEC || 8);
       const nowMs = Date.now();
+      const slStatus = String(trade?.slOrderStatus || "").toUpperCase();
+
+      if (
+        !st.triggeredAtMs &&
+        (slStatus === "OPEN" || slStatus === "TRIGGERED")
+      ) {
+        this._armSlWatchTriggered(tradeId, nowMs, `heartbeat_${source}_status`);
+        return;
+      }
 
       // If already triggered and overdue, fire immediately (handles restarts / missed timers)
       if (st.triggeredAtMs && !st.firedAtMs) {
@@ -7720,6 +7742,24 @@ class TradeManager {
     }
 
     if (link.role === "SL") {
+      try {
+        await updateTrade(trade.tradeId, {
+          slOrderStatus: status || null,
+          slOrderStatusUpdatedAt: new Date(),
+        });
+      } catch {}
+
+      const orderType = String(order.order_type || trade.slOrderType || "")
+        .toUpperCase()
+        .trim();
+      if (
+        (status === "OPEN" || status === "TRIGGERED") &&
+        (!orderType || orderType === "SL")
+      ) {
+        this._registerSlWatchFromTrade(trade);
+        this._armSlWatchTriggered(trade.tradeId, Date.now(), "order_update");
+      }
+
       // Partial SL fills are dangerous (can leave remainder exposed or cause over-exit).
       const filledNow = Number(order.filled_quantity || 0);
       const qtyNow = Number(order.quantity || trade.qty || 0);
