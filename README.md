@@ -1,135 +1,485 @@
-# Kite Scalper Engine (v0.6)
+# Kite Scalper Engine (Algo Scalper BE)
 
-This engine:
+A production-ready, Zerodha Kite Connect–powered **scalping engine** that:
 
-- Subscribes to live ticks via Zerodha KiteTicker
-- Builds aligned candles (1m/3m etc.)
-- Runs multiple scalping strategies
-- Places ENTRY + SL + TARGET (OCO) with restart-safe reconciliation
+- Streams live ticks over WebSocket (KiteTicker)
+- Builds aligned candles for multiple intervals
+- Runs multiple strategies in parallel with regime + quality gates
+- Sizes positions with risk- and margin-aware logic
+- Places entry + SL + target orders (including options/F&O support)
+- Handles restart-safe reconciliation, kill switch, and runtime halts
+- Emits telemetry, optimizer feedback, audit logs, and alerting
 
-## Subscribe by symbols (recommended)
+> **This is a live-trading system**. Read the risk, safety, and configuration sections carefully before enabling trading.
 
-In `.env`:
+---
 
-```env
-SUBSCRIBE_SYMBOLS=RELIANCE
-# or:
-# SUBSCRIBE_SYMBOLS=NSE:RELIANCE,NSE:TCS
+## Table of contents
+
+- [Key capabilities](#key-capabilities)
+- [Architecture overview](#architecture-overview)
+- [Quick start](#quick-start)
+- [Environment configuration](#environment-configuration)
+- [Kite login & token flow](#kite-login--token-flow)
+- [Market data & subscriptions](#market-data--subscriptions)
+- [Strategies](#strategies)
+- [Signal quality & regime gates](#signal-quality--regime-gates)
+- [Risk management](#risk-management)
+- [Order management & execution](#order-management--execution)
+- [Options & F&O mode](#options--fo-mode)
+- [Dynamic exits & scale-out](#dynamic-exits--scale-out)
+- [Optimizer](#optimizer)
+- [Telemetry & analytics](#telemetry--analytics)
+- [Alerts & notifications](#alerts--notifications)
+- [Sockets / live dashboard stream](#sockets--live-dashboard-stream)
+- [API endpoints](#api-endpoints)
+- [Scripts](#scripts)
+- [Deployment (Render)](#deployment-render)
+- [Operations & runbook](#operations--runbook)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Key capabilities
+
+- **Live market data:** Uses KiteTicker for tick-level data; supports quote/ltp/full tick modes per token class.
+- **Candle building:** 1m/3m/etc aligned candles with DB persistence and optional retention TTL.
+- **Multi-strategy engine:** EMA pullback, VWAP reclaim, ORB, BB squeeze, breakout, volume spike, fakeout, RSI fade, wick reversal.
+- **Signal confirmation and gating:** Multi-timeframe filters, ATR/volatility gates, range filters, confidence thresholds, cost/edge gates.
+- **Risk controls:** Daily loss caps, kill switch, trade count limits, max exposure, SL/target gating, and trading windows.
+- **Options/F&O support:** Index futures or options, selection logic for ATM/ITM/OTM, spread/IV/gamma filters, premium bands.
+- **Dynamic exit management:** True breakeven, ATR-based trails, TP tightening controls, optional scale-out.
+- **Telemetry & optimizer:** Signal telemetry, trade telemetry, fee-multiple scoring, adaptive optimizer with blocklists and RR tuning.
+- **Admin & ops:** Secure admin APIs, health checks, audits, alerts, and market calendar support.
+
+---
+
+## Architecture overview
+
+**Core runtime flow**
+1. **Boot**: Loads env config, connects MongoDB, ensures retention indexes, starts telemetry + optimizer, watches token storage.
+2. **Token watcher**: Fetches latest Kite access token from MongoDB; halts trading if missing or invalid.
+3. **Ticker**: Connects to KiteTicker and streams ticks into the pipeline.
+4. **Pipeline**: Builds candles, computes indicators, evaluates strategies and gates, and emits validated signals.
+5. **Trader**: Calculates sizing, constructs order plans (entry/SL/target), places orders, and reconciles execution states.
+6. **Telemetry**: Aggregates signal decisions, trade outcomes, and optimizer signals for performance tuning.
+
+**Supporting services**
+- **Market calendar**: Blocks trades on holidays and supports special sessions.
+- **Risk & kill switch**: Runtime controls that can stop trading immediately.
+- **Alerts + audit**: Notifications and compliance-style logs for admin actions.
+
+---
+
+## Quick start
+
+```bash
+npm i
+npm run sync:instruments     # optional but recommended for SUBSCRIBE_SYMBOLS
+npm run dev
 ```
 
-Legacy token mode still works:
+**Health checks**
+- `GET http://localhost:4001/health` – liveness
+- `GET http://localhost:4001/ready` – ready only if ticker connected + not halted
+
+---
+
+## Environment configuration
+
+The engine is fully configurable via environment variables. Below are **core settings** plus feature-specific groups. Use `.env` locally or set these in your host runtime (Render/PM2/Docker/K8s).
+
+### Minimum required
 
 ```env
+# MongoDB
+MONGO_URI=mongodb+srv://<user>:<pass>@cluster.mongodb.net
+MONGO_DB=algo_scalper
+
+# Kite
+KITE_API_KEY=your_key
+KITE_API_SECRET=your_secret
+
+# Token storage
+TOKENS_COLLECTION=broker_tokens
+
+# Trading on/off (start false)
+TRADING_ENABLED=false
+```
+
+### Admin + security
+
+```env
+ADMIN_API_KEY=super-secret
+RBAC_ENABLED=false
+RBAC_HEADER=x-role
+RBAC_DEFAULT_ROLE=admin
+```
+
+- **Production behavior:** If `NODE_ENV=production` and `ADMIN_API_KEY` is missing, all `/admin/*` endpoints return 503.
+
+### Subscription
+
+```env
+# Use symbols (recommended)
+SUBSCRIBE_SYMBOLS=NSE:RELIANCE,NSE:TCS
+
+# Or tokens (legacy)
 SUBSCRIBE_TOKENS=738561
+
+# Strict resolution (optional)
+STRICT_SUBSCRIBE_SYMBOLS=false
 ```
 
-If both are set, the engine subscribes to the union.
+### Candles + market hours
 
-## Included strategies
+```env
+CANDLE_INTERVALS=1,3
+CANDLE_TZ=Asia/Kolkata
+MARKET_OPEN=09:15
+MARKET_CLOSE=15:30
 
-You control which strategies run using:
+HOLIDAY_CALENDAR_ENABLED=false
+HOLIDAY_CALENDAR_FILE=config/market_calendar.json
+SPECIAL_SESSIONS_ENABLED=false
+```
+
+### Strategy selection
 
 ```env
 STRATEGIES=ema_pullback,vwap_reclaim,orb,bb_squeeze,breakout,volume_spike,fakeout,rsi_fade,wick_reversal
 SIGNAL_INTERVALS=1
 ```
 
-### Strategy list
-
-- `ema_pullback` (trend continuation)
-- `vwap_reclaim` (trend continuation / reclaim)
-- `orb` (opening range breakout)
-- `bb_squeeze` (bollinger squeeze breakout)
-- `breakout` (range breakout)
-- `volume_spike` (momentum)
-- `fakeout` (failed breakout reversal)
-- `rsi_fade` (mean reversion)
-- `wick_reversal` (exhaustion wick reversal)
-
-## Run
-
-```bash
-npm i
-npm run sync:instruments   # optional but recommended when using SUBSCRIBE_SYMBOLS
-npm run dev
-```
-
-Useful endpoints:
-
-- http://localhost:4001/health
-- http://localhost:4001/admin/status
-- http://localhost:4001/admin/config
-
-## Pro tuning: beating charges (fee-multiple)
-
-This engine has two layers to help you **beat charges**:
-
-1. **Entry-time gate** (planned fee-multiple):
-
-- Computes `plannedProfit @ RR target / estimatedCosts`
-- Optional hard gate using `FEE_MULTIPLE_PLANNED_MIN` (0 = disabled)
-
-2. **Post-trade telemetry** (realized fee-multiple):
-
-- On every closed trade, stores:
-  - `pnlGrossInr`
-  - `estCostsInr`
-  - `pnlNetAfterEstCostsInr`
-  - `feeMultiple` (= gross / estCosts)
-- Aggregates daily stats under `telemetry_trades_daily`
-
-Recommended dynamic-exit safety:
-
-- Don't tighten targets early (kills avg winner size).
-- Use **true breakeven**: move SL to entry ± estimated per-share costs (so BE exits aren't fee-negative).
-
-### Key env vars
+### Risk / limits
 
 ```env
-# True breakeven / trailing (dynamic exits)
-DYN_BE_COST_MULT=1.0
-DYN_BE_BUFFER_TICKS=1
-DYN_TRAIL_START_R=1.0
-DYN_ALLOW_TARGET_TIGHTEN=false
-DYN_TARGET_TIGHTEN_AFTER_R=1.5
-
-# Planned fee-multiple gate (0 disables)
-FEE_MULTIPLE_PLANNED_MIN=0
-
-# Trade telemetry
-TELEMETRY_TRADES_ENABLED=true
-TELEMETRY_TRADES_DAILY_COLLECTION=telemetry_trades_daily
+RISK_PER_TRADE_INR=300
+MAX_TRADES_PER_DAY=8
+MAX_OPEN_POSITIONS=1
+MAX_CONSECUTIVE_FAILURES=3
+DAILY_MAX_LOSS=1000
+AUTO_EXIT_ON_DAILY_LOSS=true
+STOP_NEW_ENTRIES_AFTER=15:00
+FORCE_FLATTEN_AT=15:15
 ```
 
-### Trade telemetry endpoints
+### Telemetry + optimizer
 
-- `/admin/trade-telemetry/snapshot`
-- `/admin/trade-telemetry/flush`
-- `/admin/trade-telemetry/daily?dayKey=YYYY-MM-DD`
+```env
+TELEMETRY_ENABLED=true
+TELEMETRY_FLUSH_SEC=60
+TELEMETRY_TRADES_ENABLED=true
 
-## Adaptive optimizer (pro step)
+OPTIMIZER_ENABLED=true
+OPT_LOOKBACK_N=60
+OPT_MIN_SAMPLES=20
+OPT_BLOCK_FEE_MULTIPLE_AVG_MIN=3
+OPT_BLOCK_TTL_MIN=120
+```
 
-This build adds an **adaptive optimizer** that:
+> **Tip:** The full config surface is defined in `src/config.js`. Use it as the canonical list and reference for defaults.
 
-- Tracks **feeMultiple = grossPnL / estimated costs** per **symbol × strategy × time-bucket (OPEN/MID/CLOSE)** using the last `OPT_LOOKBACK_N` closed trades.
-- **Auto-blocks** a key (symbol×strategy×bucket) when the rolling **avg feeMultiple** falls below `OPT_BLOCK_FEE_MULTIPLE_AVG_MIN` after at least `OPT_MIN_SAMPLES` samples (block lasts `OPT_BLOCK_TTL_MIN` minutes).
-- Dynamically **adjusts RR** based on volatility regime using **ATR%**:
-  - `atrPct < VOL_ATR_PCT_LOW` → RR_VOL_LOW
-  - `VOL_ATR_PCT_LOW..VOL_ATR_PCT_HIGH` → RR_VOL_MED
-  - `atrPct > VOL_ATR_PCT_HIGH` → RR_VOL_HIGH
-  - Clamped to `RR_MIN..RR_MAX`
+---
 
-### Admin endpoints
+## Kite login & token flow
 
-All `/admin/*` routes are protected by `ADMIN_API_KEY` in production.
+The engine **never stores** the access token in code. It expects the latest token in MongoDB and continuously watches for updates.
 
-- `GET /admin/optimizer/snapshot` → current optimizer stats + blocked keys
-- `POST /admin/optimizer/reload` → reload stats from DB (bootstrap from latest closed trades)
-- `POST /admin/optimizer/reset` → clear in-memory optimizer stats
+### Option A: Server redirect flow
 
-### Key env vars
+1. Set your Kite app `redirect_url` to:
+   ```
+   https://<host>/kite-redirect
+   ```
+2. Login to Kite → your browser gets redirected to `/kite-redirect?request_token=...`
+3. Server exchanges the request token and stores the access token.
 
-See `.env.example` for defaults.
+### Option B: Frontend-driven flow
+
+If your FE handles the login redirect:
+
+```http
+POST /admin/kite/session
+{ "request_token": "..." }
+```
+
+The server exchanges and stores the token. All `/admin/*` routes require `ADMIN_API_KEY` in production.
+
+---
+
+## Market data & subscriptions
+
+**Two subscription modes**
+- **Symbols (recommended):** `SUBSCRIBE_SYMBOLS=NSE:RELIANCE,NSE:TCS`
+- **Tokens (legacy):** `SUBSCRIBE_TOKENS=738561`
+
+If both are provided, the engine subscribes to the **union**.
+
+**Instrument sync** (recommended)
+- `npm run sync:instruments` downloads the instrument dump and caches token data for the requested symbols.
+
+**Tick modes** (performance tuning)
+- `TICK_MODE_DEFAULT`: default for most tokens (`quote` or `full`)
+- `TICK_MODE_TRADE`: tokens actively traded
+- `TICK_MODE_UNDERLYING`: underlying instruments for options
+
+---
+
+## Strategies
+
+The default strategy set includes:
+
+- `ema_pullback` – trend continuation pullbacks
+- `vwap_reclaim` – reclaim of VWAP after deviation
+- `orb` – opening range breakout
+- `bb_squeeze` – Bollinger band squeeze breakout
+- `breakout` – range breakout
+- `volume_spike` – high volume momentum
+- `fakeout` – failed breakout reversal
+- `rsi_fade` – RSI mean reversion
+- `wick_reversal` – long-wick exhaustion reversal
+
+**Per-strategy tuning** is available via env variables in `src/config.js` (look for `EMA_*`, `RSI_*`, `BB_*`, `FAKEOUT_*`, etc.).
+
+---
+
+## Signal quality & regime gates
+
+Signals can be filtered by:
+
+- **Multi-timeframe trend confirmation**
+- **ATR/volatility thresholds**
+- **Relative volume filters**
+- **Spread filters**
+- **Regime alignment** (trend vs range vs open)
+- **Minimum confidence** thresholds
+- **Cost/edge gates** (expected move vs estimated costs)
+
+These gates reduce overtrading and block low-quality setups.
+
+---
+
+## Risk management
+
+The engine includes layered risk controls:
+
+- **Daily loss caps** and auto-exit
+- **Max trades per day / open positions / consecutive failures**
+- **Symbol cooldown windows**
+- **Risk-per-trade sizing with margin validation**
+- **Kill switch** (`/admin/kill`)
+- **Runtime halt** (set automatically on fatal errors)
+- **Trading window enforcement** (stop new entries after a cutoff; flatten positions before close)
+
+---
+
+## Order management & execution
+
+- Entry order type can be **MARKET** or **LIMIT**
+- Stop-loss orders are placed with optional buffer rules
+- Target orders can be broker-managed or virtual (for options)
+- **Reconciliation** ensures safety on restart and session recovery
+
+---
+
+## Options & F&O mode
+
+Enable F&O trading with:
+
+```env
+FNO_ENABLED=true
+FNO_MODE=FUT  # or OPT
+```
+
+### Futures
+- Contracts are selected based on underlying, expiry, lot sizes, and policy.
+- Enforces minimum days to expiry and expiry-day cutoffs.
+
+### Options
+- Supports **ATM/ITM/OTM** strike selection and strike scan around ATM.
+- Filters by **premium bands**, **spread**, **depth**, **delta**, **gamma**, **IV**, and **OI walls**.
+- Handles **premium-aware SL/target planning** and **dynamic exit logic**.
+
+---
+
+## Dynamic exits & scale-out
+
+Dynamic exits are optional and can be enabled to:
+
+- Move SL to true breakeven after reaching a profit threshold
+- Trail SL based on ATR or option premium volatility
+- Tighten targets after profit is achieved (can be disabled for pro-style)
+- Scale out via TP1 + runner mode
+
+---
+
+## Optimizer
+
+The adaptive optimizer:
+
+- Tracks **feeMultiple = grossPnL / estimated costs** by symbol × strategy × bucket
+- Auto-blocks combinations that underperform (rolling average below threshold)
+- Adjusts RR based on volatility regime
+- Persists state to MongoDB for fast restarts
+
+Admin controls:
+- `GET /admin/optimizer/snapshot`
+- `POST /admin/optimizer/flush`
+- `POST /admin/optimizer/reload`
+- `POST /admin/optimizer/reset`
+
+---
+
+## Telemetry & analytics
+
+Two major telemetry layers are provided:
+
+1. **Signal telemetry** (candidates, accepted, blocked, rejection reasons)
+2. **Trade telemetry** (PnL, estimated costs, fee-multiple per trade)
+
+This data is available in memory and persisted daily to MongoDB.
+
+---
+
+## Alerts & notifications
+
+Alerting supports:
+
+- Startup/shutdown
+- Token updates and session failures
+- Order placement/fills
+- Halts, kill switch, rejection events
+
+**Telegram** is supported out of the box. Configure:
+
+```env
+TELEGRAM_ENABLED=true
+TELEGRAM_BOT_TOKEN=<token>
+TELEGRAM_CHAT_ID=<chat_id>
+TELEGRAM_MIN_LEVEL=info
+```
+
+---
+
+## Sockets / live dashboard stream
+
+The engine exposes live websocket streams (Socket.IO) for:
+
+- Status updates
+- Subscriptions
+- Trade events
+- Chart/candle streaming
+
+Configure via:
+
+```env
+SOCKET_ENABLED=true
+SOCKET_PATH=/socket.io
+WS_STATUS_INTERVAL_MS=2000
+WS_TRADES_INTERVAL_MS=2000
+WS_CHART_INTERVAL_MS=1000
+```
+
+---
+
+## API endpoints
+
+A **complete API reference with sample payloads** is available at:
+
+- [`api-endpoints.md`](./api-endpoints.md)
+
+Key endpoints:
+
+- Public
+  - `GET /health`
+  - `GET /ready`
+
+- Admin (requires API key in production)
+  - `GET /admin/status`
+  - `POST /admin/trading?enabled=true|false`
+  - `POST /admin/kill`
+  - `POST /admin/halt/reset`
+  - `GET /admin/optimizer/snapshot`
+  - `GET /admin/telemetry/snapshot`
+  - `GET /admin/trade-telemetry/snapshot`
+
+---
+
+## Scripts
+
+Useful CLI utilities:
+
+- **Download and cache instruments**
+  ```bash
+  npm run sync:instruments
+  ```
+- **Replay signals** (backtest-style replay in dev)
+  ```bash
+  npm run replay:signals
+  ```
+- **Critical health check** (used for monitoring)
+  ```bash
+  npm run health:critical
+  ```
+
+---
+
+## Deployment (Render)
+
+See [`RENDER_DEPLOY.md`](./RENDER_DEPLOY.md) for step-by-step Render setup, health checks, and Telegram alerts.
+
+---
+
+## Operations & runbook
+
+### Safe startup checklist
+
+1. Deploy with `TRADING_ENABLED=false`.
+2. Confirm:
+   - `/health` returns 200
+   - `/ready` returns 200 after ticker connects
+   - Alerts (Telegram) are working
+3. Enable trading during market hours only.
+4. Start with a **single symbol** and conservative risk.
+
+### Runtime controls
+
+- **Enable/disable trading**
+  ```bash
+  curl -X POST -H "x-api-key: $ADMIN_API_KEY" \
+    "http://localhost:4001/admin/trading?enabled=false"
+  ```
+
+- **Kill switch** (emergency stop)
+  ```bash
+  curl -X POST -H "x-api-key: $ADMIN_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"enabled": true}' \
+    "http://localhost:4001/admin/kill"
+  ```
+
+---
+
+## Troubleshooting
+
+### Token issues
+- If `kite` access token is missing or invalid, the engine halts trading and keeps polling.
+- Use `/kite-redirect` or `/admin/kite/session` to refresh the token.
+
+### Not ready
+- `/ready` returns 503 if ticker is disconnected or a halt is active.
+- Check `/admin/status` and `/admin/health/critical` for detailed diagnostics.
+
+### Trading halted
+- Check `/admin/status` for `haltInfo`
+- Use `/admin/halt/reset` after resolving the underlying issue.
+
+---
+
+## Reference lists (symbols)
+
+The repository includes curated lists for NIFTY 50, Bank NIFTY, and tiered stock groups in this README (below). Keep them updated to match your trading universe.
 
 <!-- NIFTY 50 COMPLETE LIST  -->
 
@@ -166,12 +516,14 @@ Tier-3 (avoid for scalping unless you keep strict gates + only trade when condit
 
 ALOKINDS, BELRISE, EASEMYTRIP, IFCI, JMFINANCIL, JPPOWER, NETWORK18, RPOWER, RTNINDIA, RTNPOWER, SAGILITY, SAMMAANCAP, VMM, WELSPUNLIV
 
-KITE LOGIN API href="https://kite.zerodha.com/connect/login?v=3&api_key=9c2asbtjjrdrwn2z
+Kite login URL template:
+
+`https://kite.zerodha.com/connect/login?v=3&api_key=<KITE_API_KEY>`
 
 <!-- prettier-ignore-start -->
 Price ^
       |
-  210 |                          /\ 
+  210 |                          /\
       |                         /  \
   200 |                        /    \      Exit happens here
       |               Peak -> *      \____ (Trail SL hit)
