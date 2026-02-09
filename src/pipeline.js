@@ -95,7 +95,14 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
             timezone: env.CANDLE_TZ,
           });
           candleCache.addCandles(candles);
-          logger.info({ token, intervalMin }, "[backfill] ok");
+          const count = Array.isArray(candles) ? candles.length : 0;
+          logger.info({ token, intervalMin, count }, "[backfill] ok");
+          if (count < 50) {
+            logger.warn(
+              { token, intervalMin, count },
+              "[backfill] insufficient candles for signal evaluation (need >= 50)",
+            );
+          }
         } catch (e) {
           logger.warn(
             { token, intervalMin, e: e.message },
