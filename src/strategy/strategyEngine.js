@@ -2,6 +2,7 @@ const { env } = require("../config");
 const { getRecentCandles } = require("../market/candleStore");
 const { enabledStrategyIds, runStrategy } = require("./registry");
 const { pickStrategies } = require("./selector");
+const { getMinCandlesForSignal } = require("./minCandles");
 const { telemetry } = require("../telemetry/signalTelemetry");
 
 function enabledIntervals() {
@@ -9,6 +10,21 @@ function enabledIntervals() {
     .split(",")
     .map((s) => Number(s.trim()))
     .filter((n) => Number.isFinite(n) && n > 0);
+}
+
+function mergeCandlesByTs(primary, secondary) {
+  const map = new Map();
+  for (const candle of primary || []) {
+    const ts = candle?.ts ? new Date(candle.ts).getTime() : null;
+    if (Number.isFinite(ts)) map.set(ts, candle);
+  }
+  for (const candle of secondary || []) {
+    const ts = candle?.ts ? new Date(candle.ts).getTime() : null;
+    if (Number.isFinite(ts)) map.set(ts, candle);
+  }
+  return Array.from(map.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map((entry) => entry[1]);
 }
 
 async function evaluateOnCandleClose({
@@ -20,11 +36,17 @@ async function evaluateOnCandleClose({
   if (!allow.includes(Number(intervalMin))) return null;
 
   // We keep a generous limit so strategies have enough context.
+  const minCandles = getMinCandlesForSignal(env, intervalMin);
   let series = candles;
-  if (!series) {
-    series = await getRecentCandles(instrument_token, intervalMin, 400);
+  if (!series || series.length < minCandles) {
+    const fetched = await getRecentCandles(instrument_token, intervalMin, 400);
+    if (series && series.length) {
+      series = mergeCandlesByTs(fetched, series);
+    } else {
+      series = fetched;
+    }
   }
-  if (!series || series.length < 50) return null;
+  if (!series || series.length < minCandles) return null;
 
   const last = series[series.length - 1];
   return evaluateFromCandles({
@@ -45,11 +67,17 @@ async function evaluateOnCandleTick({
   const allow = enabledIntervals();
   if (!allow.includes(Number(intervalMin))) return null;
 
+  const minCandles = getMinCandlesForSignal(env, intervalMin);
   let series = candles;
-  if (!series) {
-    series = await getRecentCandles(instrument_token, intervalMin, 400);
+  if (!series || series.length < minCandles) {
+    const fetched = await getRecentCandles(instrument_token, intervalMin, 400);
+    if (series && series.length) {
+      series = mergeCandlesByTs(fetched, series);
+    } else {
+      series = fetched;
+    }
   }
-  if (!series || series.length < 50) return null;
+  if (!series || series.length < minCandles) return null;
 
   const live = liveCandle || null;
   if (!live || !live.ts) return null;
