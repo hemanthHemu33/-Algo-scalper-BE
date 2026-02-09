@@ -1,4 +1,5 @@
 const { z } = require("zod");
+const { Settings } = require("luxon");
 const fs = require("fs");
 const path = require("path");
 
@@ -38,6 +39,12 @@ try {
     }
   }
 } catch {}
+
+const defaultTimezone = "Asia/Kolkata";
+const resolvedTimezone =
+  process.env.TZ || process.env.CANDLE_TZ || defaultTimezone;
+process.env.TZ = resolvedTimezone;
+Settings.defaultZone = resolvedTimezone;
 
 const schema = z.object({
   PORT: z.coerce.number().default(4001),
