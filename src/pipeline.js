@@ -19,7 +19,7 @@ const { TradeManager } = require("./trading/tradeManager");
 const { telemetry } = require("./telemetry/signalTelemetry");
 const { marketHealth } = require("./market/marketHealth");
 
-function buildPipeline({ kite, tickerCtrl }) {
+function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   const intervals = (env.CANDLE_INTERVALS || "1,3")
     .split(",")
     .map((s) => Number(s.trim()))
@@ -237,13 +237,6 @@ function buildPipeline({ kite, tickerCtrl }) {
 
   async function handleClosedCandles(closed) {
     for (const c of closed || []) {
-      // ---- Market session guard (PIPELINE-side) ----
-      // Stop generating signals (and persisting out-of-session bars) after market close.
-      // Gate using the candle's *close time* (bucket start + interval) rather than "now".
-      // This prevents post-close ticks from creating extra candles like 15:30–15:33, 15:33–15:36, etc.
-      if (!isCandleWithinMarketSession(c)) {
-        continue;
-      }
 
       const tok = Number(c.instrument_token);
       const isSignalTok =
@@ -284,6 +277,11 @@ function buildPipeline({ kite, tickerCtrl }) {
         }
       }
 
+      const allowSignals = allowSignalsNow() && isCandleWithinMarketSession(c);
+      if (!allowSignals) {
+        continue;
+      }
+
       const cached = candleCache.getCandles(
         c.instrument_token,
         c.interval_min,
@@ -322,6 +320,7 @@ function buildPipeline({ kite, tickerCtrl }) {
 
   async function handleTickSignals(candleTicks) {
     if (String(env.SIGNAL_TICK_CONFIRM_ENABLED || "false") !== "true") return;
+    if (!allowSignalsNow()) return;
 
     const throttleMs = Number(env.SIGNAL_TICK_CONFIRM_THROTTLE_MS || 1500);
     const nowMs = Date.now();
@@ -410,22 +409,9 @@ function buildPipeline({ kite, tickerCtrl }) {
     }
   }
 
-  function isWithinMarketHours(now = new Date()) {
-    const tz = env.CANDLE_TZ || "Asia/Kolkata";
-    const dt = DateTime.fromJSDate(now, { zone: tz });
-
-    const session = getSessionForDateTime(dt, {
-      marketOpen: env.MARKET_OPEN,
-      marketClose: env.MARKET_CLOSE,
-      stopNewEntriesAfter: env.STOP_NEW_ENTRIES_AFTER,
-    });
-
-    if (!session.allowTradingDay) return false;
-
-    const { open, close } = buildBoundsForToday(session, dt);
-
-    if (!open.isValid || !close.isValid) return true;
-    return dt >= open && dt <= close;
+  function allowSignalsNow() {
+    if (!marketGate || typeof marketGate.isOpen !== "function") return true;
+    return marketGate.isOpen();
   }
 
   function isCandleWithinMarketSession(candle) {
@@ -463,21 +449,8 @@ function buildPipeline({ kite, tickerCtrl }) {
       }
     }
 
-    // tick->candles
-    // IMPORTANT: still allow trader.onTick() for all ticks, but only build candles from in-session ticks.
-    // This prevents post-close ticks from producing after-hours candles and signals.
-    const candleTicks = (ticks || []).filter((t) => {
-      try {
-        const ts = t?.exchange_timestamp
-          ? new Date(t.exchange_timestamp)
-          : t?.last_trade_time
-            ? new Date(t.last_trade_time)
-            : new Date();
-        return isWithinMarketHours(ts);
-      } catch {
-        return false;
-      }
-    });
+    // tick->candles (always build candles; signal gating happens separately)
+    const candleTicks = ticks || [];
 
     const closed = candleBuilder.onTicks(candleTicks);
     await handleClosedCandles(closed);
@@ -522,7 +495,6 @@ function buildPipeline({ kite, tickerCtrl }) {
 
   async function candleFinalizerTick() {
     if (String(env.CANDLE_TIMER_FINALIZER_ENABLED || "true") !== "true") return;
-    if (!isWithinMarketHours(new Date())) return;
 
     const closed = candleBuilder.finalizeDue(new Date(), {
       graceMs: Number(env.CANDLE_FINALIZE_GRACE_MS || 1500),

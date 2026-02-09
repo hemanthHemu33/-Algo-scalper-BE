@@ -1,5 +1,6 @@
 const { env } = require("../config");
 const { getDb } = require("../db");
+const { logger } = require("../logger");
 
 function collectionName(intervalMin) {
   const prefix = env.CANDLE_COLLECTION_PREFIX || "candles_";
@@ -121,6 +122,14 @@ async function insertManyCandles(intervalMin, candles) {
     },
   }));
   await col.bulkWrite(ops, { ordered: false });
+  if (String(env.CANDLE_WRITE_LOG || "false") === "true") {
+    for (const c of candles) {
+      logger.info(
+        { token: c.instrument_token, intervalMin, t: c.ts },
+        "[candle] write",
+      );
+    }
+  }
 }
 
 async function getRecentCandles(instrument_token, intervalMin, limit = 250) {
