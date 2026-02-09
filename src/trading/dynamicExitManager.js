@@ -185,6 +185,7 @@ function applyMinGreenExitRules({
     tsFrom(trade?.entryFilledAt) ||
     tsFrom(trade?.createdAt || trade?.updatedAt) ||
     now;
+  const holdMin = Math.max(0, (now - entryTs) / (60 * 1000));
   const timeStopAtMs =
     Number.isFinite(timeStopMin) && timeStopMin > 0
       ? entryTs + timeStopMin * 60 * 1000
@@ -276,10 +277,36 @@ function applyMinGreenExitRules({
     }
   }
 
-  // Never loosen beyond initial SL
+  // Never loosen beyond initial SL (unless controlled early widen for options)
+  const allowWiden =
+    isOptionTrade(trade) &&
+    Number.isFinite(entry) &&
+    String(env.OPT_EXIT_ALLOW_WIDEN_SL || "true") === "true" &&
+    holdMin <= Number(env.OPT_EXIT_WIDEN_WINDOW_MIN || 2);
+
+  const baseRiskInr = Number(trade?.riskInr || env.RISK_PER_TRADE_INR || 0);
+  const widenMult = Number(env.OPT_EXIT_WIDEN_MAX_RISK_MULT || 1.3);
+  const maxRiskInr =
+    allowWiden && Number.isFinite(baseRiskInr) && baseRiskInr > 0
+      ? baseRiskInr * Math.max(1, widenMult)
+      : null;
+  const maxRiskPts =
+    Number.isFinite(maxRiskInr) && qty > 0 ? maxRiskInr / qty : null;
+
   if (Number.isFinite(sl0)) {
-    if (side === "BUY") newSL = Math.max(newSL, sl0);
-    else newSL = Math.min(newSL, sl0);
+    if (side === "BUY") {
+      const minAllowed =
+        allowWiden && Number.isFinite(maxRiskPts)
+          ? Math.min(sl0, entry - maxRiskPts)
+          : sl0;
+      newSL = Math.max(newSL, minAllowed);
+    } else {
+      const maxAllowed =
+        allowWiden && Number.isFinite(maxRiskPts)
+          ? Math.max(sl0, entry + maxRiskPts)
+          : sl0;
+      newSL = Math.min(newSL, maxAllowed);
+    }
   }
 
   // Broker-valid guard: SL should not be beyond market
@@ -311,6 +338,11 @@ function applyMinGreenExitRules({
       trailAfterBe,
       trailStartInr: Number.isFinite(trailStartInr) ? trailStartInr : null,
       allowTrail,
+      holdMin,
+      allowWiden,
+      widenMult: Number.isFinite(widenMult) ? widenMult : null,
+      maxRiskInr: Number.isFinite(maxRiskInr) ? maxRiskInr : null,
+      maxRiskPts: Number.isFinite(maxRiskPts) ? maxRiskPts : null,
     },
   };
 }
