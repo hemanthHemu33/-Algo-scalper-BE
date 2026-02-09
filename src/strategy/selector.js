@@ -1,6 +1,7 @@
 const { DateTime } = require("luxon");
 const { emaSeries } = require("./ema");
 const { atr, maxHigh, minLow, rollingVWAP } = require("./utils");
+const { getMinCandlesForRegime } = require("./minCandles");
 
 function parseList(s) {
   return String(s || "")
@@ -15,7 +16,8 @@ function uniq(arr) {
 
 function detectRegime({ candles, env, now = new Date() }) {
   const tz = env.CANDLE_TZ || "Asia/Kolkata";
-  if (!candles || candles.length < 50) {
+  const minCandles = getMinCandlesForRegime(env);
+  if (!candles || candles.length < minCandles) {
     return { regime: "UNKNOWN", meta: { reason: "INSUFFICIENT_CANDLES" } };
   }
 

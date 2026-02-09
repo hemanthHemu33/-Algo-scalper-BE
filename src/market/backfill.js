@@ -1,6 +1,7 @@
 const { DateTime } = require("luxon");
 const { env } = require("../config");
 const { insertManyCandles, ensureIndexes } = require("./candleStore");
+const { getMinCandlesForSignal } = require("../strategy/minCandles");
 
 async function backfillCandles({
   kite,
@@ -14,20 +15,27 @@ async function backfillCandles({
       ? Number(daysOverride)
       : Number(env.BACKFILL_DAYS || 3),
   );
+  const maxDays = Number(env.BACKFILL_MAX_DAYS || 10);
+  const minCandles = getMinCandlesForSignal(env, intervalMin);
 
   const to = DateTime.now().setZone(timezone);
-  const from = to.minus({ days });
-
   const intervalStr = intervalMin === 1 ? "minute" : `${intervalMin}minute`;
 
-  const candles = await kite.getHistoricalData(
-    String(instrument_token),
-    intervalStr,
-    from.toJSDate(),
-    to.toJSDate(),
-    false,
-    false,
-  );
+  let candles = [];
+  let backfillDays = days;
+  while (backfillDays <= maxDays) {
+    const from = to.minus({ days: backfillDays });
+    candles = await kite.getHistoricalData(
+      String(instrument_token),
+      intervalStr,
+      from.toJSDate(),
+      to.toJSDate(),
+      false,
+      false,
+    );
+    if ((candles || []).length >= minCandles) break;
+    backfillDays += 1;
+  }
 
   const mapped = (candles || []).map((x) => ({
     instrument_token: Number(instrument_token),

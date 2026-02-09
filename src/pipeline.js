@@ -14,6 +14,7 @@ const {
   evaluateOnCandleClose,
   evaluateOnCandleTick,
 } = require("./strategy/strategyEngine");
+const { getMinCandlesForSignal } = require("./strategy/minCandles");
 const { RiskEngine } = require("./risk/riskEngine");
 const { TradeManager } = require("./trading/tradeManager");
 const { telemetry } = require("./telemetry/signalTelemetry");
@@ -294,10 +295,11 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
         c.interval_min,
         Number(env.CANDLE_CACHE_LIMIT || 400),
       );
+      const minCandles = getMinCandlesForSignal(env, c.interval_min);
       const signal = await evaluateOnCandleClose({
         instrument_token: c.instrument_token,
         intervalMin: c.interval_min,
-        candles: cached.length ? cached : null,
+        candles: cached.length >= minCandles ? cached : null,
       });
 
       if (signal) {
