@@ -220,6 +220,7 @@ const schema = z.object({
   // Expiry safety (optional)
   OPT_MIN_DAYS_TO_EXPIRY: z.coerce.number().default(0),
   // Preferred DTE band for option expiry selection (pro weekly-first behavior)
+  OPT_ALLOW_ZERO_DTE: z.coerce.boolean().default(false),
   OPT_DTE_PREFER_MIN: z.coerce.number().default(1),
   OPT_DTE_PREFER_MAX: z.coerce.number().default(3),
   OPT_DTE_FALLBACK_MAX: z.coerce.number().default(7),
@@ -270,6 +271,7 @@ const schema = z.object({
   OPT_PICK_SCORE_WEIGHTS: z.string().optional(),
 
   // ---- Option-chain greeks / advanced filters ----
+  GREEKS_REQUIRED: z.coerce.boolean().default(false),
   OPT_RISK_FREE_RATE: z.coerce.number().default(0.06),
 
   // Delta band to avoid far OTM / low-reacting contracts (0..1)
@@ -1015,9 +1017,60 @@ function validateProfileCombos() {
       "[config] Unsafe combo: OPT_TP_ENABLED=false requires a positive TIME_STOP_MIN to avoid lingering positions.",
     );
   }
+
+  const dtePreferMin = Number(env.OPT_DTE_PREFER_MIN ?? 1);
+  const dtePreferMax = Number(env.OPT_DTE_PREFER_MAX ?? 3);
+  const dteFallbackMax = Number(env.OPT_DTE_FALLBACK_MAX ?? 7);
+  if (!Number.isFinite(dtePreferMin) || dtePreferMin < 0) {
+    failOrWarn("[config] OPT_DTE_PREFER_MIN must be >= 0");
+  }
+  if (!Number.isFinite(dtePreferMax) || dtePreferMax < dtePreferMin) {
+    failOrWarn("[config] OPT_DTE_PREFER_MAX must be >= OPT_DTE_PREFER_MIN");
+  }
+  if (!Number.isFinite(dteFallbackMax) || dteFallbackMax < dtePreferMax) {
+    failOrWarn("[config] OPT_DTE_FALLBACK_MAX must be >= OPT_DTE_PREFER_MAX");
+  }
+
+  const premiumMin = Number(env.OPT_MIN_PREMIUM ?? 0);
+  const premiumMax = Number(env.OPT_MAX_PREMIUM ?? 0);
+  if (Number.isFinite(premiumMin) && Number.isFinite(premiumMax) && premiumMin > premiumMax) {
+    failOrWarn("[config] OPT_MIN_PREMIUM must be <= OPT_MAX_PREMIUM");
+  }
+
+  const deltaMin = Number(env.OPT_DELTA_BAND_MIN ?? 0);
+  const deltaMax = Number(env.OPT_DELTA_BAND_MAX ?? 1);
+  if (deltaMin < 0 || deltaMax > 1 || deltaMin >= deltaMax) {
+    failOrWarn("[config] Delta band invalid. Expected 0 <= OPT_DELTA_BAND_MIN < OPT_DELTA_BAND_MAX <= 1");
+  }
 }
 
 validateProfileCombos();
+
+(function logConfigFingerprint() {
+  const crypto = require("crypto");
+  const safeConfig = {
+    tz: env.CANDLE_TZ,
+    fnoMode: env.FNO_MODE,
+    optExpiryPolicy: env.OPT_EXPIRY_POLICY,
+    optAllowZeroDte: env.OPT_ALLOW_ZERO_DTE,
+    optDtePreferMin: env.OPT_DTE_PREFER_MIN,
+    optDtePreferMax: env.OPT_DTE_PREFER_MAX,
+    optDteFallbackMax: env.OPT_DTE_FALLBACK_MAX,
+    premiumMin: env.OPT_MIN_PREMIUM,
+    premiumMax: env.OPT_MAX_PREMIUM,
+    deltaBandMin: env.OPT_DELTA_BAND_MIN,
+    deltaBandMax: env.OPT_DELTA_BAND_MAX,
+    minSignalConfidence: env.MIN_SIGNAL_CONFIDENCE,
+    riskPerTradeInr: env.RISK_PER_TRADE_INR,
+    stopTypeFo: env.STOPLOSS_ORDER_TYPE_FO,
+    slBufferBps: env.SL_LIMIT_BUFFER_BPS,
+    slSlaMs: env.SL_SAFETY_SLA_MS,
+  };
+  const payload = JSON.stringify(safeConfig);
+  const fp = crypto.createHash("sha1").update(payload).digest("hex").slice(0, 12);
+  // eslint-disable-next-line no-console
+  console.info(`[config] fingerprint=${fp} ${payload}`);
+})();
 
 // --- Trading window validation (PROD SAFETY) ---
 // We must NEVER trade with an invalid window configuration.

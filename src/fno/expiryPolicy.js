@@ -29,9 +29,11 @@ function isExpiryAllowed({ expiryISO, env, nowMs, minDaysToExpiry, avoidExpiryDa
   const dte = daysToExpiry(expiryISO, env, nowMs);
   if (dte == null) return { ok: false, reason: "INVALID_EXPIRY", dte: null };
 
-  const minDays = Number.isFinite(Number(minDaysToExpiry))
+  const configuredMin = Number.isFinite(Number(minDaysToExpiry))
     ? Number(minDaysToExpiry)
     : Number(env?.OPT_MIN_DAYS_TO_EXPIRY || 0);
+  const allowZeroDte = Boolean(env?.OPT_ALLOW_ZERO_DTE ?? false);
+  const minDays = allowZeroDte ? configuredMin : Math.max(1, configuredMin);
 
   if (Number.isFinite(minDays) && dte < minDays) {
     return { ok: false, reason: "MIN_DTE", dte };
