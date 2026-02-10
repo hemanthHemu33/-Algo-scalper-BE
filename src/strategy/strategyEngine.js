@@ -118,9 +118,17 @@ function evaluateFromCandles({
     if (sel?.strategyIds?.length) ids = sel.strategyIds;
   }
 
+  const recentForVolume = (candles || []).slice(-30);
+  const isVolumeUnavailable =
+    recentForVolume.length > 0 &&
+    recentForVolume.every((c) => Number(c?.volume || 0) <= 0);
+
   const signals = [];
   for (const id of ids) {
-    const res = runStrategy(id, candles, { intervalMin });
+    const res = runStrategy(id, candles, {
+      intervalMin,
+      disableVolumeStrategies: isVolumeUnavailable,
+    });
     if (res) {
       signals.push(res);
 

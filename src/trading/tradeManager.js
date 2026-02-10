@@ -18,7 +18,10 @@ const {
   preloadInstrumentsByToken,
 } = require("../instruments/instrumentRepo");
 const { getLastFnoUniverse, buildFnoUniverse } = require("../fno/fnoUniverse");
-const { pickOptionContractForSignal } = require("../fno/optionsRouter");
+const {
+  pickOptionContractForSignal,
+  buildOptionSubscriptionCandidates,
+} = require("../fno/optionsRouter");
 const { computePacingPolicy } = require("../policy/pacingPolicy");
 const { buildTradePlan } = require("./planBuilder");
 const { roundToTick } = require("./priceUtils");
@@ -316,6 +319,25 @@ class TradeManager {
 
   _isFnoEnabled() {
     return String(env.FNO_ENABLED || "false").toLowerCase() === "true";
+  }
+
+  _finalOptionSignalConfidence({ baseConfidence, pick, liqMeta }) {
+    const base = Number(baseConfidence);
+    const spreadBps = Number(liqMeta?.spreadBps ?? pick?.bps);
+    const health = Number(liqMeta?.healthScore ?? pick?.health_score);
+    const depth = Number(
+      (Number(liqMeta?.bidQty || 0) + Number(liqMeta?.askQty || 0)) / 2,
+    );
+
+    if (!Number.isFinite(base)) return baseConfidence;
+
+    let conf = base;
+    if (Number.isFinite(health)) conf += Math.max(-6, Math.min(12, (health - 55) / 4));
+    if (Number.isFinite(spreadBps)) conf -= Math.max(-4, Math.min(14, spreadBps / 20));
+    if (Number.isFinite(depth) && depth > 0)
+      conf += Math.max(0, Math.min(6, Math.log(depth + 1) - 2));
+
+    return Math.max(0, Math.min(100, Math.round(conf * 10) / 10));
   }
 
   _isOptMode() {
@@ -5671,6 +5693,7 @@ class TradeManager {
     signalRegime,
     policy,
     underlying,
+    isTradeToken,
   }) {
     if (String(env.REGIME_FILTERS_ENABLED) !== "true") return { ok: true };
 
@@ -5745,7 +5768,7 @@ class TradeManager {
     }
 
     // Relative volume (last vs avg of last N)
-    if (String(env.ENABLE_REL_VOLUME_FILTER) === "true") {
+    if (String(env.ENABLE_REL_VOLUME_FILTER) === "true" && isTradeToken) {
       const n = 20;
       if (candles.length < n + 2)
         return { ok: false, reason: "REL_VOLUME_INSUFFICIENT_DATA" };
@@ -5999,21 +6022,18 @@ class TradeManager {
       nowMs: Date.now(),
     });
 
-    // Early confidence gate: block before option routing/runtime backfill to save API calls and noise.
     const minConf = Number(policy?.minConf ?? env.MIN_SIGNAL_CONFIDENCE ?? 0);
     let conf = Number(signal?.confidence);
-    if (Number.isFinite(minConf) && minConf > 0 && Number.isFinite(conf) && conf < minConf) {
-      telemetry.recordDecision({
-        signal,
-        token: Number(signal?.instrument_token),
-        outcome: "IDEA_SIGNAL",
-        stage: "gate_early",
-        reason: "LOW_CONFIDENCE",
-        meta: { conf, minConf },
-      });
+    const baseInstrument = await ensureInstrument(
+      this.kite,
+      Number(signal?.instrument_token),
+    );
+    const isIndexUnderlying =
+      String(baseInstrument?.segment || "").toUpperCase() === "INDICES";
+    if (isIndexUnderlying && String(signal?.strategyId || "") === "volume_spike") {
       logger.info(
-        { token: signal?.instrument_token, conf, minConf },
-        "[trade] blocked (low confidence before routing)",
+        { token: signal?.instrument_token, strategyId: signal?.strategyId },
+        "[trade] blocked (volume_spike disabled for index underlyings)",
       );
       return;
     }
@@ -6022,7 +6042,8 @@ class TradeManager {
     // Route here so downstream logic (risk, orders, telemetry) is consistent on the executed instrument.
     let s = signal;
     const isOptMode = this._isOptMode();
-    if (isOptMode) {
+    const mustRouteUnderlyingToOption = isOptMode || isIndexUnderlying;
+    if (mustRouteUnderlyingToOption) {
       // QuoteGuard safety: if quotes are unstable (breaker open), pause new OPT entries.
       const blockOnQG =
         String(env.OPT_BLOCK_ON_QUOTE_GUARD_OPEN || "true") !== "false";
@@ -6049,6 +6070,14 @@ class TradeManager {
       }
       const underlyingToken = Number(s.instrument_token);
       const underlyingSide = String(s.side || "").toUpperCase();
+
+      if (!this._isFnoEnabled()) {
+        logger.warn(
+          { token: underlyingToken, segment: baseInstrument?.segment },
+          "[trade] blocked (index/underlying signal requires FNO routing)",
+        );
+        return;
+      }
 
       // Ensure we have a universe snapshot (built at ticker connect, but keep a safe fallback)
       let uni = getLastFnoUniverse();
@@ -6092,6 +6121,30 @@ class TradeManager {
         Number(s.candle?.close);
       const routeLtp =
         Number.isFinite(strikeRefLtp) && strikeRefLtp > 0 ? strikeRefLtp : underLtp;
+
+      if (typeof this.runtimeAddTokens === "function") {
+        try {
+          const candidates = await buildOptionSubscriptionCandidates({
+            kite: this.kite,
+            universe: uni,
+            underlyingToken,
+            underlyingTradingsymbol: underInstr?.tradingsymbol,
+            underlyingLtp: routeLtp,
+          });
+          if (candidates.length) {
+            await this.runtimeAddTokens(candidates, {
+              reason: "OPT_UNDERLYING_CANDIDATES",
+              backfill: false,
+              isOption: true,
+            });
+          }
+        } catch (e) {
+          logger.warn(
+            { e: e?.message || String(e), token: underlyingToken },
+            "[options] candidate runtime subscribe failed",
+          );
+        }
+      }
 
       const picked = await pickOptionContractForSignal({
         kite: this.kite,
@@ -6166,6 +6219,12 @@ class TradeManager {
         }
       }
 
+      const finalConfidence = this._finalOptionSignalConfidence({
+        baseConfidence: s.confidence,
+        pick: picked,
+        liqMeta: liq?.meta,
+      });
+
       // Ensure we subscribe the chosen option contract (so downstream OMS/risk gets ticks)
       let rt = null;
       if (typeof this.runtimeAddTokens === "function") {
@@ -6214,6 +6273,9 @@ class TradeManager {
         underlying_side: underlyingSide,
         underlying_ltp: underLtp,
         option_meta: picked,
+        confidence: Number.isFinite(finalConfidence)
+          ? finalConfidence
+          : Number(s.confidence),
         reason:
           `${s.reason || ""} | OPT ${picked.optType} ${picked.strike} ${picked.expiry}`.trim(),
       };
@@ -6299,13 +6361,13 @@ class TradeManager {
           signal: s,
           token,
           outcome: "IDEA_SIGNAL",
-          stage: "gate",
+          stage: s.option_meta ? "gate_post_route" : "gate",
           reason: "LOW_CONFIDENCE",
           meta: { conf, minConf },
         });
         logger.info(
-          { token: s.instrument_token, conf, minConf },
-          "[trade] blocked (low confidence)",
+          { token: s.instrument_token, conf, minConf, postRoute: !!s.option_meta },
+          "[trade] blocked (low confidence post-route)",
         );
         return;
       }
@@ -6421,6 +6483,7 @@ class TradeManager {
       signalRegime: s.regime,
       policy,
       underlying: s?.option_meta?.underlying,
+      isTradeToken: !!s.option_meta,
     });
     if (!reg.ok) {
       logger.info(

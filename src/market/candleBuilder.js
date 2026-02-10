@@ -1,6 +1,15 @@
 const { DateTime } = require("luxon");
 const { logger } = require("../logger");
 
+function isIndexTick(tick) {
+  const seg = String(tick?.segment || "").toUpperCase();
+  const it = String(tick?.instrument_type || "").toUpperCase();
+  if (seg === "INDICES" || it === "INDEX") return true;
+  // Kite index ticks are non-tradable and often have no depth ladder.
+  return tick?.tradable === false && !(tick?.depth?.buy?.length || tick?.depth?.sell?.length);
+}
+
+
 class CandleBuilder {
   constructor({ intervalsMinutes, timezone }) {
     this.intervals = intervalsMinutes;
@@ -50,7 +59,9 @@ class CandleBuilder {
       );
 
       // Pro-safety: if ticks have no volume fields (common in LTP mode), warn once per token.
-      if (ltq <= 0 && dayVol <= 0 && !this._noVolWarned.has(token)) {
+      // Index ticks are volume-less by design, so keep this warning index-safe.
+      const indexTick = isIndexTick(tick);
+      if (ltq <= 0 && dayVol <= 0 && !indexTick && !this._noVolWarned.has(token)) {
         this._noVolWarned.add(token);
         logger.warn(
           {

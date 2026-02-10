@@ -68,6 +68,18 @@ function strikeStepFallback(underlying) {
   return 50;
 }
 
+const INDEX_TO_CHAIN = {
+  "NIFTY 50": "NIFTY",
+  "NIFTY BANK": "BANKNIFTY",
+  "NIFTY FIN SERVICE": "FINNIFTY",
+  "NIFTY MID SELECT": "MIDCPNIFTY",
+};
+
+function chainRootFromSpot(tradingsymbol) {
+  const sym = String(tradingsymbol || "").toUpperCase().trim();
+  return INDEX_TO_CHAIN[sym] || sym;
+}
+
 function getPremiumBandForUnderlying(underlying) {
   const u = String(underlying || "").toUpperCase();
   if (u === "NIFTY") {
@@ -99,16 +111,79 @@ function resolveUnderlyingFromUniverse({ universe, token, tradingsymbol }) {
   const uni = universe?.universe;
   if (!uni?.contracts) return null;
   const t = Number(token);
+  const want = chainRootFromSpot(tradingsymbol);
   for (const [u, c] of Object.entries(uni.contracts)) {
     if (Number(c.instrument_token) === t) return u;
-    if (
-      tradingsymbol &&
-      String(c.tradingsymbol).toUpperCase() ===
-        String(tradingsymbol).toUpperCase()
-    )
+    const cSym = chainRootFromSpot(c?.tradingsymbol);
+    const cName = chainRootFromSpot(c?.name);
+    if (want && (cSym === want || cName === want || String(u).toUpperCase() === want))
       return u;
   }
   return null;
+}
+
+async function buildOptionSubscriptionCandidates({
+  kite,
+  universe,
+  underlyingToken,
+  underlyingTradingsymbol,
+  underlyingLtp,
+}) {
+  const u = resolveUnderlyingFromUniverse({
+    universe,
+    token: underlyingToken,
+    tradingsymbol: underlyingTradingsymbol,
+  });
+  const underlying = String(u || "").toUpperCase();
+  if (!underlying) return [];
+
+  const exchanges = uniq(parseCsvList(env.FNO_EXCHANGES || "NFO,BFO"));
+  const optionRows = [];
+  for (const ex of exchanges) {
+    const rows = await getInstrumentsDump(kite, ex);
+    for (const r of rows || []) {
+      const name = chainRootFromSpot(r.name);
+      const it = String(r.instrument_type || "").toUpperCase();
+      if (name !== underlying) continue;
+      if (it !== "CE" && it !== "PE") continue;
+      optionRows.push({ ...r, exchange: r.exchange || ex });
+    }
+  }
+  if (!optionRows.length) return [];
+
+  const expiryISO = pickBestExpiryISO({
+    expiries: optionRows
+      .map((r) => {
+        const exp = parseDate(r.expiry);
+        return exp ? exp.toISOString().slice(0, 10) : null;
+      })
+      .filter(Boolean),
+    env,
+    nowMs: Date.now(),
+  })?.expiryISO || pickNearestExpiryISO(optionRows);
+
+  const slice = optionRows.filter((r) => {
+    const exp = parseDate(r.expiry);
+    return exp ? exp.toISOString().slice(0, 10) === expiryISO : false;
+  });
+  if (!slice.length) return [];
+
+  const step = detectStrikeStepFromRows(slice, strikeStepFallback(underlying));
+  const atm = roundToStep(Number(underlyingLtp), step);
+  const radius = Math.max(0, Number(env.OPT_ATM_SCAN_STEPS || 2));
+  const picks = [];
+  for (const offset of buildCandidateOffsets(radius)) {
+    const strike = atm + offset * step;
+    for (const optType of ["CE", "PE"]) {
+      const row = slice.find(
+        (r) =>
+          String(r.instrument_type || "").toUpperCase() === optType &&
+          Number(r.strike) === Number(strike),
+      );
+      if (row?.instrument_token) picks.push(Number(row.instrument_token));
+    }
+  }
+  return Array.from(new Set(picks));
 }
 
 function detectStrikeStepFromRows(rows, fallbackStep) {
@@ -345,7 +420,7 @@ async function pickOptionContractForSignal({
     tradingsymbol: underlyingTradingsymbol,
   });
 
-  const underlying = String(u || "").toUpperCase();
+  const underlying = chainRootFromSpot(u);
   if (!underlying) {
     logger.warn(
       { underlyingToken, underlyingTradingsymbol },
@@ -392,7 +467,7 @@ async function pickOptionContractForSignal({
   for (const ex of exchanges) {
     const rows = await getInstrumentsDump(kite, ex);
     for (const r of rows || []) {
-      const name = String(r.name || "").toUpperCase();
+      const name = chainRootFromSpot(r.name);
       const it = String(r.instrument_type || "").toUpperCase();
       if (name !== underlying) continue;
       if (it !== optType) continue;
@@ -1082,5 +1157,8 @@ async function pickOptionContractForSignal({
 }
 
 module.exports = {
+  INDEX_TO_CHAIN,
+  chainRootFromSpot,
+  buildOptionSubscriptionCandidates,
   pickOptionContractForSignal,
 };

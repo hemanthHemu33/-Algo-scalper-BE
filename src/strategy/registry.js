@@ -145,6 +145,7 @@ function runStrategy(strategyId, candles, ctx = {}) {
       );
     }
     case "volume_spike": {
+      if (ctx.disableVolumeStrategies) return null;
       return attachMeta(
         "volume_spike",
         volumeSpikeStrategy({
