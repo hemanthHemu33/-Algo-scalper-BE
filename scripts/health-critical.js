@@ -9,13 +9,12 @@
  */
 
 const http = require("http");
-const { env } = require("../src/config");
 
 async function main() {
   const host = process.env.HEALTH_HOST || "localhost";
-  const port = Number(process.env.HEALTH_PORT || env.PORT || 4001);
+  const port = Number(process.env.HEALTH_PORT || process.env.PORT || 4001);
   const headers = {};
-  if (env.ADMIN_API_KEY) headers["x-api-key"] = env.ADMIN_API_KEY;
+  if (process.env.ADMIN_API_KEY) headers["x-api-key"] = process.env.ADMIN_API_KEY;
 
   const opts = {
     host,
