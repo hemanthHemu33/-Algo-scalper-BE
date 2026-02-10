@@ -70,7 +70,7 @@ async function watchLatestToken({ onToken }) {
       "[token] loaded/updated"
     );
     alert("info", "🔑 Kite token loaded/updated").catch(() => {});
-    await onToken(accessToken);
+    await onToken(accessToken, res?.doc || null, reason);
   };
 
   // Initial refresh should never crash the app now

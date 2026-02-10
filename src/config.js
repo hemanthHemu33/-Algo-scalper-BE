@@ -1014,8 +1014,10 @@ function validateProfileCombos() {
     .toUpperCase()
     .trim();
   if (fnoEnabled && stopTypeFo === "SL-M") {
-    failOrWarn(
-      "[config] Unsafe combo: STOPLOSS_ORDER_TYPE_FO=SL-M can be rejected in F&O. Use SL with buffers instead.",
+    env.STOPLOSS_ORDER_TYPE_FO = "SL";
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[config] Unsafe combo auto-fixed: STOPLOSS_ORDER_TYPE_FO=SL-M -> SL for F&O safety.",
     );
   }
 
