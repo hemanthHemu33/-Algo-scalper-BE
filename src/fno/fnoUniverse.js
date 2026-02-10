@@ -20,6 +20,34 @@ function parseDate(v) {
   }
 }
 
+function underlyingAliases(underlying) {
+  const u = String(underlying || "").toUpperCase().trim();
+  if (!u) return [];
+  const aliases = new Set([u]);
+  if (u === "NIFTY") {
+    aliases.add("NIFTY 50");
+    aliases.add("NIFTY50");
+  }
+  if (u === "BANKNIFTY") {
+    aliases.add("NIFTY BANK");
+    aliases.add("BANK NIFTY");
+  }
+  return Array.from(aliases);
+}
+
+function matchesUnderlying(row, underlying) {
+  const aliases = underlyingAliases(underlying);
+  if (!aliases.length) return false;
+
+  const name = String(row?.name || "").toUpperCase();
+  const ts = String(row?.tradingsymbol || "").toUpperCase();
+  if (aliases.some((a) => name === a || name.includes(a))) return true;
+
+  // Fallback for derivative dumps where `name` can be inconsistent/blank.
+  // For example: NIFTY26FEBFUT, BANKNIFTY26FEBFUT.
+  return aliases.some((a) => ts.startsWith(a.replace(/\s+/g, "")) || ts.startsWith(a));
+}
+
 function todayYMD() {
   const tz = env.CANDLE_TZ || "Asia/Kolkata";
   return DateTime.now().setZone(tz).toFormat("yyyy-MM-dd");
@@ -73,10 +101,10 @@ async function pickNearestFuture(kite, underlying, exchanges) {
   for (const ex of exList) {
     const rows = await getInstrumentsDump(kite, ex);
     const futs = (rows || []).filter((r) => {
-      const name = String(r.name || "").toUpperCase();
       const seg = String(r.segment || "").toUpperCase();
       const it = String(r.instrument_type || "").toUpperCase();
-      return name === u && (it === "FUT" || seg.endsWith("-FUT"));
+      const isFuture = it === "FUT" || it === "FUTIDX" || it === "FUTSTK" || seg.endsWith("-FUT");
+      return isFuture && matchesUnderlying(r, u);
     });
 
     const best = bestRowByNearestExpiry(futs);
