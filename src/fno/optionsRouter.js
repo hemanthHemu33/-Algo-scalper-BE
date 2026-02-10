@@ -558,6 +558,8 @@ async function pickOptionContractForSignal({
     : false;
 
   const spreadRiseBlockBps = Number(env.OPT_SPREAD_RISE_BLOCK_BPS ?? 8);
+  const flickerBlock = Number(env.OPT_BOOK_FLICKER_BLOCK ?? 4);
+  const minHealthScore = Number(env.OPT_HEALTH_SCORE_MIN ?? 45);
 
   const ivMaxPts = Number(env.OPT_IV_MAX_PTS ?? 80);
   const ivDropBlockPts = Number(env.OPT_IV_DROP_BLOCK_PTS ?? 2);
@@ -594,6 +596,10 @@ async function pickOptionContractForSignal({
       const spreadTrendOk = Number.isFinite(bpsCh)
         ? bpsCh <= spreadRiseBlockBps
         : true;
+      const flicker = Number(r.book_flicker || 0);
+      const flickerOk = flicker <= flickerBlock;
+      const health = Number(r.health_score);
+      const healthOk = Number.isFinite(health) ? health >= minHealthScore : true;
 
       const depthTopQty = Number(r.depth_qty_top || 0);
       const hasAnyDepth = Number.isFinite(depthTopQty) && depthTopQty > 0;
@@ -650,6 +656,8 @@ async function pickOptionContractForSignal({
       const hardOk =
         spreadOk &&
         spreadTrendOk &&
+        flickerOk &&
+        healthOk &&
         depthOk &&
         ivOk &&
         ivTrendOk &&
@@ -671,6 +679,8 @@ async function pickOptionContractForSignal({
         gammaOk,
         ivOk,
         ivTrendOk,
+        healthOk,
+        flickerOk,
         dist,
         distSteps,
         score,
@@ -680,6 +690,8 @@ async function pickOptionContractForSignal({
           ivPts: Number.isFinite(ivPts) ? ivPts : null,
           ivChangePts: Number.isFinite(ivCh) ? ivCh : null,
           spreadBpsChange: Number.isFinite(bpsCh) ? bpsCh : null,
+          healthScore: Number.isFinite(health) ? health : null,
+          bookFlicker: Number.isFinite(flicker) ? flicker : null,
           oiWall: oiWall
             ? { ...oiWall, medianOi: oiContext?.medianOi ?? null }
             : null,
@@ -778,6 +790,7 @@ async function pickOptionContractForSignal({
         debugTopN > 0
           ? scored.slice(0, debugTopN).map((x) => ({
               tradingsymbol: x.row.tradingsymbol,
+              instrument_token: Number(x.row.instrument_token),
               strike: Number(x.row.strike),
               ltp: Number(x.row.ltp),
               spread_bps: Number(x.row.spread_bps),
@@ -785,6 +798,8 @@ async function pickOptionContractForSignal({
               delta: Number(x.row.delta),
               gamma: Number(x.row.gamma),
               iv_pts: Number(x.row.iv_pts),
+              health_score: Number(x.row.health_score),
+              book_flicker: Number(x.row.book_flicker || 0),
               score: Number(x.score),
               ok: !!x.ok,
               hardOk: !!x.hardOk,
@@ -796,6 +811,8 @@ async function pickOptionContractForSignal({
               gammaOk: !!x.gammaOk,
               ivOk: !!x.ivOk,
               ivTrendOk: !!x.ivTrendOk,
+              healthOk: !!x.healthOk,
+              flickerOk: !!x.flickerOk,
             }))
           : undefined;
 
@@ -852,7 +869,7 @@ async function pickOptionContractForSignal({
         strikeStep: step,
         premiumBand: { minPrem, maxPrem, enforced: enforcePremBand },
         meta: {
-          micro: { maxBps, spreadRiseBlockBps, minDepth },
+          micro: { maxBps, spreadRiseBlockBps, minDepth, flickerBlock, minHealthScore },
           deltaBand: enforceDeltaBand
             ? { min: deltaMin, max: deltaMax, target: deltaTarget }
             : null,
@@ -878,6 +895,7 @@ async function pickOptionContractForSignal({
     debugTopN > 0
       ? poolForDebug.slice(0, debugTopN).map((x) => ({
           tradingsymbol: x.row.tradingsymbol,
+          instrument_token: Number(x.row.instrument_token),
           strike: Number(x.row.strike),
           ltp: Number(x.row.ltp),
           spread_bps: Number(x.row.spread_bps),
@@ -892,6 +910,9 @@ async function pickOptionContractForSignal({
           iv_change_pts: Number(x.row.iv_change_pts),
           vega_1pct: Number(x.row.vega_1pct),
           theta_per_day: Number(x.row.theta_per_day),
+          health_score: Number(x.row.health_score),
+          book_flicker: Number(x.row.book_flicker || 0),
+          impact_cost_bps: Number(x.row.impact_cost_bps),
           distSteps: Number(x.distSteps),
           score: Number(x.score),
           ok: !!x.ok,
@@ -962,7 +983,7 @@ async function pickOptionContractForSignal({
         dropBlockPts: ivDropBlockPts,
         neutralPts: ivNeutralPts,
       },
-      micro: { maxBps, spreadRiseBlockBps, minDepth },
+      micro: { maxBps, spreadRiseBlockBps, minDepth, flickerBlock, minHealthScore },
       oiContext,
       weights,
       fromCache: !!chain?.fromCache,

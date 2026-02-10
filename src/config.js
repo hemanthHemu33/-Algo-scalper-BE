@@ -288,6 +288,8 @@ const schema = z.object({
   // Spread trend gate (bps increase since previous snapshot)
   OPT_SPREAD_RISE_BLOCK_BPS: z.coerce.number().default(8),
   OPT_SPREAD_RISE_PENALTY_MULT: z.coerce.number().default(1.0),
+  OPT_BOOK_FLICKER_BLOCK: z.coerce.number().default(4),
+  OPT_HEALTH_SCORE_MIN: z.coerce.number().default(45),
 
   // Gamma gate near expiry
   OPT_GAMMA_MAX: z.coerce.number().default(0.004),
@@ -836,6 +838,11 @@ const schema = z.object({
   ENTRY_LIMIT_TIMEOUT_MS: z.coerce.number().default(2500),
   // Safety: do NOT auto-convert LIMIT -> MARKET. If you accept slippage, set ENTRY_ORDER_TYPE_OPT=MARKET explicitly.
   ENTRY_LIMIT_FALLBACK_TO_MARKET: z.coerce.boolean().default(false),
+  // Smart limit laddering (micro-improve fills without blind chasing)
+  ENTRY_LADDER_ENABLED: z.coerce.boolean().default(true),
+  ENTRY_LADDER_TICKS: z.coerce.number().default(2),
+  ENTRY_LADDER_STEP_DELAY_MS: z.coerce.number().default(350),
+  ENTRY_LADDER_MAX_CHASE_BPS: z.coerce.number().default(35),
 
   // Optional simple caps (highly recommended)
   MAX_QTY: z.coerce.number().optional(),
@@ -844,6 +851,18 @@ const schema = z.object({
   // Dynamic exit management (trail SL / adjust target)
   DYNAMIC_EXITS_ENABLED: z.string().default("false"),
   DYNAMIC_EXIT_MIN_INTERVAL_MS: z.coerce.number().default(5000),
+  DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS: z.coerce.number().default(1200),
+
+  // Executable vs idea signal split (keep logging ideas, route only executable)
+  EXECUTABLE_SIGNAL_GATE_ENABLED: z.coerce.boolean().default(true),
+
+  // Market-condition circuit breakers (rolling 5m window)
+  CIRCUIT_BREAKERS_ENABLED: z.coerce.boolean().default(true),
+  CB_MAX_REJECTS_5M: z.coerce.number().default(5),
+  CB_MAX_SPREAD_SPIKES_5M: z.coerce.number().default(8),
+  CB_MAX_STALE_TICKS_5M: z.coerce.number().default(12),
+  CB_MAX_QUOTE_GUARD_HITS_5M: z.coerce.number().default(4),
+  CB_COOLDOWN_SEC: z.coerce.number().default(180),
 
   DYN_ATR_PERIOD: z.coerce.number().default(14),
   DYN_TRAIL_ATR_MULT: z.coerce.number().default(1.2),
