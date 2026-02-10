@@ -213,10 +213,16 @@ const schema = z.object({
   // ===== Options (buy CE/PE) routing =====
   // Underlying source for signals in OPT mode: FUT or SPOT
   OPT_UNDERLYING_SOURCE: z.string().default("FUT"),
+  // Underlying source for strike/ATM reference in OPT mode: SPOT (pro) or UNDERLYING
+  OPT_STRIKE_REF_SOURCE: z.string().default("SPOT"),
   // Pick expiry: NEAREST (recommended)
   OPT_EXPIRY_POLICY: z.string().default("NEAREST"),
   // Expiry safety (optional)
   OPT_MIN_DAYS_TO_EXPIRY: z.coerce.number().default(0),
+  // Preferred DTE band for option expiry selection (pro weekly-first behavior)
+  OPT_DTE_PREFER_MIN: z.coerce.number().default(1),
+  OPT_DTE_PREFER_MAX: z.coerce.number().default(3),
+  OPT_DTE_FALLBACK_MAX: z.coerce.number().default(7),
   // e.g. "14:30" -> avoid expiry-day entries after this time; unset disables
   OPT_AVOID_EXPIRY_DAY_AFTER: z.string().optional(),
   // ATM / ITM / OTM selection behavior

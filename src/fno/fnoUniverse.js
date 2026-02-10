@@ -162,10 +162,26 @@ async function buildFnoUniverse({ kite }) {
       picked = await pickNearestFuture(kite, u, exchanges);
     } else if (mode === "OPT") {
       const src = String(env.OPT_UNDERLYING_SOURCE || "FUT").toUpperCase();
-      picked =
+      const strikeRefSrc = String(env.OPT_STRIKE_REF_SOURCE || "SPOT").toUpperCase();
+      const signalContract =
         src === "SPOT"
           ? await pickSpotIndexToken(kite, u)
           : await pickNearestFuture(kite, u, exchanges);
+
+      const spotRefContract = await pickSpotIndexToken(kite, u);
+      const strikeRefContract =
+        strikeRefSrc === "UNDERLYING" ? signalContract : spotRefContract || signalContract;
+
+      picked = signalContract
+        ? {
+            ...signalContract,
+            strike_ref_token: Number(strikeRefContract?.instrument_token || signalContract.instrument_token),
+            strike_ref_exchange:
+              strikeRefContract?.exchange || signalContract.exchange || null,
+            strike_ref_symbol:
+              strikeRefContract?.tradingsymbol || signalContract.tradingsymbol || null,
+          }
+        : null;
     } else {
       throw new Error(`[fno] unsupported FNO_MODE: ${mode}`);
     }
@@ -179,7 +195,17 @@ async function buildFnoUniverse({ kite }) {
     }
 
     contracts[u] = picked;
-    tokens.push(Number(picked.instrument_token));
+    if (!tokens.includes(Number(picked.instrument_token))) {
+      tokens.push(Number(picked.instrument_token));
+    }
+    if (
+      Number.isFinite(Number(picked.strike_ref_token)) &&
+      Number(picked.strike_ref_token) > 0
+    ) {
+      if (!tokens.includes(Number(picked.strike_ref_token))) {
+        tokens.push(Number(picked.strike_ref_token));
+      }
+    }
     symbols.push(`${picked.exchange}:${picked.tradingsymbol}`);
   }
 

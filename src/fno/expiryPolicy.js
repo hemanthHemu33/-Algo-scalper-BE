@@ -53,17 +53,48 @@ function isExpiryAllowed({ expiryISO, env, nowMs, minDaysToExpiry, avoidExpiryDa
 }
 
 function pickBestExpiryISO({ expiries, env, nowMs }) {
-  const list = Array.from(new Set((expiries || []).map((x) => String(x).slice(0, 10))))
+  const list = Array.from(
+    new Set((expiries || []).map((x) => String(x).slice(0, 10))),
+  )
     .filter((x) => /^\d{4}-\d{2}-\d{2}$/.test(x))
     .sort();
 
+  const allowed = [];
   for (const e of list) {
-    const ok = isExpiryAllowed({ expiryISO: e, env, nowMs });
-    if (ok.ok) return { expiryISO: e, policy: ok };
+    const policy = isExpiryAllowed({ expiryISO: e, env, nowMs });
+    if (policy.ok) allowed.push({ expiryISO: e, dte: Number(policy.dte), policy });
   }
 
-  // fallback: nearest even if policy blocks
-  return { expiryISO: list[0] || null, policy: { ok: false, reason: "FALLBACK", dte: list[0] ? daysToExpiry(list[0], env, nowMs) : null } };
+  if (!allowed.length) {
+    // fallback: nearest even if policy blocks
+    return {
+      expiryISO: list[0] || null,
+      policy: {
+        ok: false,
+        reason: "FALLBACK",
+        dte: list[0] ? daysToExpiry(list[0], env, nowMs) : null,
+      },
+    };
+  }
+
+  const preferMin = Number(env?.OPT_DTE_PREFER_MIN ?? 1);
+  const preferMax = Number(env?.OPT_DTE_PREFER_MAX ?? 3);
+  const fallbackMax = Number(env?.OPT_DTE_FALLBACK_MAX ?? 7);
+
+  const withinPrefer = allowed.find(
+    (x) => Number.isFinite(x.dte) && x.dte >= preferMin && x.dte <= preferMax,
+  );
+  if (withinPrefer) return { expiryISO: withinPrefer.expiryISO, policy: withinPrefer.policy };
+
+  const withinFallback = allowed.find(
+    (x) => Number.isFinite(x.dte) && x.dte <= fallbackMax,
+  );
+  if (withinFallback) {
+    return { expiryISO: withinFallback.expiryISO, policy: withinFallback.policy };
+  }
+
+  // fallback: earliest allowed expiry (sorted by date)
+  return { expiryISO: allowed[0].expiryISO, policy: allowed[0].policy };
 }
 
 module.exports = {
