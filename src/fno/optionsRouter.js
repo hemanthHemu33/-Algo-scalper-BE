@@ -564,8 +564,12 @@ async function pickOptionContractForSignal({
   const stage = Math.max(0, Number(gateStage || 0));
   const maxBps = stage >= 1 ? maxBpsRaw * 1.25 : maxBpsRaw;
   const premiumSlack = stage >= 2 ? 25 : 0;
-  const deltaGateEnabled = stage >= 3 ? false : Boolean(env.OPT_DELTA_BAND_ENFORCE ?? true);
+  const deltaGateEnabled =
+    stage >= 3 ? false : Boolean(env.OPT_DELTA_BAND_ENFORCE ?? true);
   const gammaGateEnabled = stage >= 4 ? false : true;
+  const greeksRequired = Boolean(
+    env.OPT_GREEKS_REQUIRED ?? env.GREEKS_REQUIRED ?? false,
+  );
 
   // New: greeks/microstructure safety
   const enforceDeltaBand = deltaGateEnabled;
@@ -631,18 +635,20 @@ async function pickOptionContractForSignal({
 
       const delta = finiteNumberOrNull(r.delta);
       const deltaAbs = Number.isFinite(delta) ? Math.abs(delta) : null;
-      const greeksRequired = Boolean(env.GREEKS_REQUIRED ?? false);
       const deltaOk = Number.isFinite(deltaAbs)
         ? deltaAbs >= deltaMin && deltaAbs <= deltaMax
         : !greeksRequired; // If greeks missing, do not hard-block unless strict mode.
 
-      const gamma = Number(r.gamma);
-      const gammaOk =
-        gammaGateEnabled && gammaGateActive && Number.isFinite(gamma) ? gamma <= gammaMax : true;
+      const gamma = finiteNumberOrNull(r.gamma);
+      const gammaOk = Number.isFinite(gamma)
+        ? gammaGateEnabled && gammaGateActive
+          ? gamma <= gammaMax
+          : true
+        : !greeksRequired;
 
-      const ivPts = Number(r.iv_pts);
+      const ivPts = finiteNumberOrNull(r.iv_pts);
       const ivCh = Number(r.iv_change_pts);
-      const ivOk = Number.isFinite(ivPts) ? ivPts <= ivMaxPts : true;
+      const ivOk = Number.isFinite(ivPts) ? ivPts <= ivMaxPts : !greeksRequired;
       const ivTrendOk = Number.isFinite(ivCh) ? ivCh >= -ivDropBlockPts : true;
 
       // OI wall context
@@ -867,6 +873,12 @@ async function pickOptionContractForSignal({
       const canRelax = stage < 4;
       if (nextExpiry || canRelax) {
         const nextStage = nextExpiry ? stage : stage + 1;
+        const relaxedByStage = {
+          1: ["maxSpreadBps"],
+          2: ["premiumBand"],
+          3: ["deltaBand"],
+          4: ["gammaGate"],
+        };
         const nextArgs = {
           kite,
           universe,
@@ -881,7 +893,19 @@ async function pickOptionContractForSignal({
           gateStage: nextStage,
           triedExpiries: Array.from(triedSet),
         };
-        logger.warn({ underlying, optType, expiry: expiryISO, stage, nextExpiry, nextStage }, "[options] fallback retry triggered");
+        logger.warn(
+          {
+            underlying,
+            optType,
+            expiry: expiryISO,
+            fallbackLevel: nextStage,
+            stage,
+            nextExpiry,
+            nextStage,
+            relaxed: nextExpiry ? ["nextExpiry"] : (relaxedByStage[nextStage] || []),
+          },
+          "[options] fallback retry triggered",
+        );
         return pickOptionContractForSignal(nextArgs);
       }
 
@@ -911,6 +935,7 @@ async function pickOptionContractForSignal({
             gateActive: gammaGateActive,
             gateDteDays: gammaGateDteDays,
           },
+          greeksRequired,
           oiContext,
           topCandidates: debugTop,
         },
@@ -1011,6 +1036,7 @@ async function pickOptionContractForSignal({
         dropBlockPts: ivDropBlockPts,
         neutralPts: ivNeutralPts,
       },
+      greeksRequired,
       micro: { maxBps, spreadRiseBlockBps, minDepth, flickerBlock, minHealthScore },
       oiContext,
       weights,
