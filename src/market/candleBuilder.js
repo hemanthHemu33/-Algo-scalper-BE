@@ -11,13 +11,25 @@ function isIndexTick(tick) {
 
 
 class CandleBuilder {
-  constructor({ intervalsMinutes, timezone }) {
+  constructor({ intervalsMinutes, timezone, indexTokens }) {
     this.intervals = intervalsMinutes;
     this.tz = timezone;
+    this.indexTokens = new Set(
+      (indexTokens || [])
+        .map((t) => Number(t))
+        .filter((t) => Number.isFinite(t) && t > 0),
+    );
     this.current = new Map();
     this.prevDayVolume = new Map();
     this.lastTickTs = new Map(); // key: token:interval -> last tick ts
     this._noVolWarned = new Set(); // token set
+  }
+
+  addIndexTokens(tokens) {
+    for (const t of tokens || []) {
+      const n = Number(t);
+      if (Number.isFinite(n) && n > 0) this.indexTokens.add(n);
+    }
   }
 
   _bucketStart(ts, intervalMin) {
@@ -60,13 +72,13 @@ class CandleBuilder {
 
       // Pro-safety: if ticks have no volume fields (common in LTP mode), warn once per token.
       // Index ticks are volume-less by design, so keep this warning index-safe.
-      const indexTick = isIndexTick(tick);
+      const indexTick = this.indexTokens.has(token) || isIndexTick(tick);
       if (ltq <= 0 && dayVol <= 0 && !indexTick && !this._noVolWarned.has(token)) {
         this._noVolWarned.add(token);
         logger.warn(
           {
             token,
-            hint: "Set TICK_MODE_UNDERLYING=quote/full to enable volume-based confidence",
+            hint: "Set TICK_MODE_UNDERLYING=quote/full to enable volume-based confidence (indices may still have no volume)",
           },
           "[candle] tick has no volume fields; candle volume will stay 0",
         );

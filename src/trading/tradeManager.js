@@ -6450,13 +6450,39 @@ class TradeManager {
       Number(quoteAtEntry?.ltp) ||
       Number(s.candle?.close);
 
-    // Stop-loss (cash: candle low/high; options: premium %)
+    // Stop-loss
+    // - Cash: candle low/high
+    // - Options: configurable (PCT / POINTS / UNDERLYING_ATR)
     let entryGuess = expectedEntryPrice;
     let stopLoss;
     if (s.option_meta) {
-      const slPct = Number(env.OPT_SL_PCT || 12);
-      const raw = Number(expectedEntryPrice) * (1 - slPct / 100);
-      stopLoss = roundToTick(raw, tick, "down");
+      // Backward-compatible stop mode:
+      // - OPT_SL_MODE is the "real" knob used by risk logic.
+      // - OPT_STOP_MODE/OPT_STOP_POINTS existed as a UI knob; if set, map it.
+      const stopModeRaw = String(
+        env.OPT_SL_MODE || env.OPT_STOP_MODE || "PREMIUM_PCT",
+      )
+        .toUpperCase()
+        .trim();
+      const stopMode = stopModeRaw === "PCT" ? "PREMIUM_PCT" : stopModeRaw;
+
+      if (stopMode === "POINTS" || stopMode === "PREMIUM_POINTS" || stopMode === "PRICE") {
+        const pts = Number(env.OPT_STOP_POINTS || env.OPT_SL_POINTS || 0);
+        if (Number.isFinite(pts) && pts > 0) {
+          const raw = Number(expectedEntryPrice) - pts;
+          stopLoss = roundToTick(raw, tick, "down");
+        } else {
+          // Fallback to pct if points not configured.
+          const slPct = Number(env.OPT_STOP_PCT || env.OPT_SL_PCT || 12);
+          const raw = Number(expectedEntryPrice) * (1 - slPct / 100);
+          stopLoss = roundToTick(raw, tick, "down");
+        }
+      } else {
+        // Default: premium percent stop
+        const slPct = Number(env.OPT_STOP_PCT || env.OPT_SL_PCT || 12);
+        const raw = Number(expectedEntryPrice) * (1 - slPct / 100);
+        stopLoss = roundToTick(raw, tick, "down");
+      }
     } else {
       const slFromCandle =
         s.side === "BUY" ? Number(s.candle?.low) : Number(s.candle?.high);
@@ -6494,7 +6520,7 @@ class TradeManager {
     }
 
     if (s.option_meta) {
-      const slMode = String(env.OPT_SL_MODE || "PREMIUM_PCT").toUpperCase();
+      const slMode = String(env.OPT_SL_MODE || env.OPT_STOP_MODE || "PREMIUM_PCT").toUpperCase();
       if (slMode === "UNDERLYING_ATR") {
         const fit = optionStopLossFromUnderlyingATR({
           side,

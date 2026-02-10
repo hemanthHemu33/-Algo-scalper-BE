@@ -1017,12 +1017,25 @@ function validateProfileCombos() {
   const stopTypeFo = String(env.STOPLOSS_ORDER_TYPE_FO || "")
     .toUpperCase()
     .trim();
+
+  // SL-M handling (F&O):
+  // - Many brokers (including Zerodha) allow SL-M for options, but rejections can still happen.
+  // - Our TradeManager already has SL-M -> SL fallback with buffers.
+  // - Therefore: allow SL-M in OPT mode (warn only), and keep the conservative auto-fix for non-OPT modes.
   if (fnoEnabled && stopTypeFo === "SL-M") {
-    env.STOPLOSS_ORDER_TYPE_FO = "SL";
-    // eslint-disable-next-line no-console
-    console.warn(
-      "[config] Unsafe combo auto-fixed: STOPLOSS_ORDER_TYPE_FO=SL-M -> SL for F&O safety.",
-    );
+    const fnoMode = String(env.FNO_MODE || "").toUpperCase().trim();
+    if (fnoMode && fnoMode !== "OPT") {
+      env.STOPLOSS_ORDER_TYPE_FO = "SL";
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[config] Unsafe combo auto-fixed: STOPLOSS_ORDER_TYPE_FO=SL-M -> SL for non-OPT F&O safety.",
+      );
+    } else {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[config] Note: STOPLOSS_ORDER_TYPE_FO=SL-M in OPT mode; engine will try SL-M then fallback to SL (buffer) if rejected.",
+      );
+    }
   }
 
   const forceLot =

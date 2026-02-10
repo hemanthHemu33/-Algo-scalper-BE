@@ -21,7 +21,9 @@ function parseDate(v) {
 }
 
 function underlyingAliases(underlying) {
-  const u = String(underlying || "").toUpperCase().trim();
+  const u = String(underlying || "")
+    .toUpperCase()
+    .trim();
   if (!u) return [];
   const aliases = new Set([u]);
   if (u === "NIFTY") {
@@ -45,7 +47,9 @@ function matchesUnderlying(row, underlying) {
 
   // Fallback for derivative dumps where `name` can be inconsistent/blank.
   // For example: NIFTY26FEBFUT, BANKNIFTY26FEBFUT.
-  return aliases.some((a) => ts.startsWith(a.replace(/\s+/g, "")) || ts.startsWith(a));
+  return aliases.some(
+    (a) => ts.startsWith(a.replace(/\s+/g, "")) || ts.startsWith(a),
+  );
 }
 
 function todayYMD() {
@@ -103,7 +107,11 @@ async function pickNearestFuture(kite, underlying, exchanges) {
     const futs = (rows || []).filter((r) => {
       const seg = String(r.segment || "").toUpperCase();
       const it = String(r.instrument_type || "").toUpperCase();
-      const isFuture = it === "FUT" || it === "FUTIDX" || it === "FUTSTK" || seg.endsWith("-FUT");
+      const isFuture =
+        it === "FUT" ||
+        it === "FUTIDX" ||
+        it === "FUTSTK" ||
+        seg.endsWith("-FUT");
       return isFuture && matchesUnderlying(r, u);
     });
 
@@ -125,28 +133,41 @@ async function pickNearestFuture(kite, underlying, exchanges) {
 }
 
 async function pickSpotIndexToken(kite, underlying) {
-  // Zerodha index tokens live in NSE instruments dump (instrument_type: INDEX)
-  // This is optional; OPT_UNDERLYING_SOURCE=FUT is the safest default.
   const u = String(underlying || "").toUpperCase();
   const rows = await getInstrumentsDump(kite, "NSE");
 
   const candidates = (rows || []).filter((r) => {
-    const it = String(r.instrument_type || "").toUpperCase();
-    if (it !== "INDEX") return false;
-
     const ts = String(r.tradingsymbol || "").toUpperCase();
     const name = String(r.name || "").toUpperCase();
 
-    // common Zerodha index symbols
-    if (u === "NIFTY") return ts.includes("NIFTY") && ts.includes("50");
-    if (u === "BANKNIFTY") return ts.includes("NIFTY") && ts.includes("BANK");
+    if (u === "NIFTY") {
+      return (
+        (ts.includes("NIFTY") && ts.includes("50")) ||
+        (name.includes("NIFTY") && name.includes("50"))
+      );
+    }
+    if (u === "BANKNIFTY") {
+      return (
+        (ts.includes("NIFTY") && ts.includes("BANK")) ||
+        (name.includes("NIFTY") && name.includes("BANK"))
+      );
+    }
     if (u === "SENSEX") return ts.includes("SENSEX") || name.includes("SENSEX");
 
     return ts.includes(u) || name.includes(u);
   });
 
-  const best = candidates[0] || null;
+  const best =
+    candidates.find((r) =>
+      String(r.segment || "")
+        .toUpperCase()
+        .includes("IND"),
+    ) ||
+    candidates[0] ||
+    null;
+
   if (!best) return null;
+
   return {
     underlying: u,
     instrument_token: Number(best.instrument_token),
@@ -190,7 +211,9 @@ async function buildFnoUniverse({ kite }) {
       picked = await pickNearestFuture(kite, u, exchanges);
     } else if (mode === "OPT") {
       const src = String(env.OPT_UNDERLYING_SOURCE || "FUT").toUpperCase();
-      const strikeRefSrc = String(env.OPT_STRIKE_REF_SOURCE || "SPOT").toUpperCase();
+      const strikeRefSrc = String(
+        env.OPT_STRIKE_REF_SOURCE || "SPOT",
+      ).toUpperCase();
       const signalContract =
         src === "SPOT"
           ? await pickSpotIndexToken(kite, u)
@@ -198,16 +221,23 @@ async function buildFnoUniverse({ kite }) {
 
       const spotRefContract = await pickSpotIndexToken(kite, u);
       const strikeRefContract =
-        strikeRefSrc === "UNDERLYING" ? signalContract : spotRefContract || signalContract;
+        strikeRefSrc === "UNDERLYING"
+          ? signalContract
+          : spotRefContract || signalContract;
 
       picked = signalContract
         ? {
             ...signalContract,
-            strike_ref_token: Number(strikeRefContract?.instrument_token || signalContract.instrument_token),
+            strike_ref_token: Number(
+              strikeRefContract?.instrument_token ||
+                signalContract.instrument_token,
+            ),
             strike_ref_exchange:
               strikeRefContract?.exchange || signalContract.exchange || null,
             strike_ref_symbol:
-              strikeRefContract?.tradingsymbol || signalContract.tradingsymbol || null,
+              strikeRefContract?.tradingsymbol ||
+              signalContract.tradingsymbol ||
+              null,
           }
         : null;
     } else {

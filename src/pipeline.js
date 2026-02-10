@@ -5,6 +5,7 @@ const {
   buildBoundsForToday,
 } = require("./market/marketCalendar");
 const { logger } = require("./logger");
+const { ensureInstrument } = require("./instruments/instrumentRepo");
 const { CandleBuilder } = require("./market/candleBuilder");
 const { CandleCache } = require("./market/candleCache");
 const { CandleWriteBuffer } = require("./market/candleWriteBuffer");
@@ -83,6 +84,27 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
     // Runtime-added tokens (options) should not generate strategy signals.
     signalTokensSet = new Set(tokensSet);
     await trader.init();
+
+    // Classify index tokens once so candle builder can suppress volume warnings
+    // (index ticks are volume-less by design, even in quote/full modes).
+    try {
+      const idx = [];
+      for (const t of tokensRef) {
+        const tok = Number(t);
+        if (!Number.isFinite(tok) || tok <= 0) continue;
+        try {
+          const inst = await ensureInstrument(kite, tok);
+          const seg = String(inst?.segment || "").toUpperCase();
+          const it = String(inst?.instrument_type || "").toUpperCase();
+          if (seg === "INDICES" || it === "INDEX") idx.push(tok);
+        } catch {
+          // ignore
+        }
+      }
+      if (idx.length) candleBuilder.addIndexTokens(idx);
+    } catch {
+      // ignore
+    }
 
     for (const intervalMin of intervals) await ensureIndexes(intervalMin);
 
