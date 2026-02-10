@@ -70,6 +70,16 @@ const STATUS = {
   ENTRY_CANCELLED: "ENTRY_CANCELLED",
   ENTRY_FILLED: "ENTRY_FILLED",
   LIVE: "LIVE",
+  SL_PLACED: "SL_PLACED",
+  SL_OPEN: "SL_OPEN",
+  SL_CONFIRMED: "SL_CONFIRMED",
+  EXIT_PLACED: "EXIT_PLACED",
+  EXIT_OPEN: "EXIT_OPEN",
+  EXIT_PARTIAL: "EXIT_PARTIAL",
+  EXIT_FILLED: "EXIT_FILLED",
+  PANIC_EXIT_PLACED: "PANIC_EXIT_PLACED",
+  PANIC_EXIT_CONFIRMED: "PANIC_EXIT_CONFIRMED",
+  RECOVERY_REHYDRATED: "RECOVERY_REHYDRATED",
   EXITED_TARGET: "EXITED_TARGET",
   EXITED_SL: "EXITED_SL",
   ENTRY_FAILED: "ENTRY_FAILED",
@@ -650,7 +660,7 @@ class TradeManager {
       if (!this.activeTradeId) return;
       const trade = await getTrade(this.activeTradeId);
       if (!trade) return;
-      if (![STATUS.ENTRY_FILLED, STATUS.LIVE].includes(trade.status)) return;
+      if (![STATUS.ENTRY_FILLED, STATUS.SL_PLACED, STATUS.SL_OPEN, STATUS.SL_CONFIRMED, STATUS.RECOVERY_REHYDRATED, STATUS.LIVE].includes(trade.status)) return;
       this._syncActiveTradeState(trade);
 
       await this._maybeDynamicAdjustExits(trade, this._lastOrdersById);
@@ -3523,7 +3533,7 @@ class TradeManager {
 
       if (exitOrderId) {
         await updateTrade(tradeId, {
-          status: STATUS.GUARD_FAILED,
+          status: STATUS.PANIC_EXIT_PLACED,
           panicExitOrderId: exitOrderId,
           panicExitPlacedAt: new Date(),
           closeReason: `PANIC_EXIT_PLACED | ${reason}`,
@@ -3785,7 +3795,7 @@ class TradeManager {
             initialStopLoss: stopLoss,
             slTrigger: stopLoss,
             rr: null,
-            status: STATUS.LIVE,
+            status: STATUS.RECOVERY_REHYDRATED,
             entryOrderId: null,
             slOrderId: null,
             targetOrderId: null,
@@ -5324,6 +5334,43 @@ class TradeManager {
     logger.warn({ tradeId, orderId: oid, role }, "[exit_watch] timeout");
   }
 
+  _armStopLossSla({ tradeId, slOrderId, instrumentToken }) {
+    const slaMs = Math.max(1000, Number(env.SL_SAFETY_SLA_MS || 3000));
+    if (!tradeId || !slOrderId) return;
+
+    setTimeout(async () => {
+      try {
+        const trade = await getTrade(tradeId);
+        if (!trade) return;
+        if ([STATUS.EXITED_TARGET, STATUS.EXITED_SL, STATUS.CLOSED].includes(String(trade.status || ""))) return;
+
+        let status = "";
+        if (typeof this.kite.getOrderHistory === "function") {
+          const hist = await this.kite.getOrderHistory(String(slOrderId));
+          const last = Array.isArray(hist) ? hist[hist.length - 1] : null;
+          status = String(last?.status || "").toUpperCase();
+        }
+
+        const confirmed = ["OPEN", "TRIGGER PENDING", "COMPLETE", "PARTIAL"].includes(status);
+        if (confirmed) {
+          await updateTrade(tradeId, { status: STATUS.SL_CONFIRMED, slConfirmedAt: new Date() });
+          return;
+        }
+
+        const token = Number(instrumentToken || trade.instrument_token);
+        const cooldownMin = Math.max(1, Number(env.SL_SLA_BREACH_COOLDOWN_MIN || 5));
+        if (Number.isFinite(token) && token > 0 && this.risk?.setCooldown) {
+          this.risk.setCooldown(token, cooldownMin * 60, "SL_SLA_BREACH");
+        }
+
+        logger.error({ tradeId, slOrderId, status, slaMs, token }, "[trade] SL guarantee SLA breached -> panic exit");
+        await this._panicExit(trade, "SL_SLA_BREACH", { allowWhenHalted: true });
+      } catch (e) {
+        logger.warn({ tradeId, slOrderId, e: e?.message || String(e) }, "[trade] SL SLA watchdog failed");
+      }
+    }, slaMs);
+  }
+
   _defaultNoTradeWindows() {
     // Recommended for scalping
     return "09:15-09:25,15:20-15:30";
@@ -5952,6 +5999,25 @@ class TradeManager {
       nowMs: Date.now(),
     });
 
+    // Early confidence gate: block before option routing/runtime backfill to save API calls and noise.
+    const minConf = Number(policy?.minConf ?? env.MIN_SIGNAL_CONFIDENCE ?? 0);
+    let conf = Number(signal?.confidence);
+    if (Number.isFinite(minConf) && minConf > 0 && Number.isFinite(conf) && conf < minConf) {
+      telemetry.recordDecision({
+        signal,
+        token: Number(signal?.instrument_token),
+        outcome: "IDEA_SIGNAL",
+        stage: "gate_early",
+        reason: "LOW_CONFIDENCE",
+        meta: { conf, minConf },
+      });
+      logger.info(
+        { token: signal?.instrument_token, conf, minConf },
+        "[trade] blocked (low confidence before routing)",
+      );
+      return;
+    }
+
     // In OPT mode, we generate signals on an underlying (FUT/SPOT) but execute on an option contract.
     // Route here so downstream logic (risk, orders, telemetry) is consistent on the executed instrument.
     let s = signal;
@@ -6226,8 +6292,7 @@ class TradeManager {
     }
 
     // Confidence gate (dynamic)
-    const minConf = Number(policy?.minConf ?? env.MIN_SIGNAL_CONFIDENCE ?? 0);
-    const conf = Number(s.confidence);
+    conf = Number(s.confidence);
     if (Number.isFinite(minConf) && minConf > 0 && Number.isFinite(conf)) {
       if (conf < minConf) {
         telemetry.recordDecision({
@@ -7386,6 +7451,7 @@ class TradeManager {
 
         await updateTrade(trade.tradeId, {
           status: STATUS.CLOSED,
+          panicExitState: STATUS.PANIC_EXIT_CONFIRMED,
           exitPrice: exitPrice > 0 ? exitPrice : trade.exitPrice,
           closeReason: (trade.closeReason || "PANIC_EXIT") + " | FILLED",
           exitReason: "PANIC_EXIT",
@@ -8163,6 +8229,7 @@ class TradeManager {
           );
           return;
         }
+        await updateTrade(trade.tradeId, { slState: STATUS.SL_CONFIRMED });
         return this._onSlFilled(trade.tradeId, trade, order);
       }
 
@@ -9367,6 +9434,7 @@ class TradeManager {
           }
         }
         await updateTrade(tradeId, {
+          status: STATUS.SL_PLACED,
           slOrderId,
           slOrderType: slOrderTypeUsed,
           slLimitPrice: slLimitPriceUsed,
@@ -9396,6 +9464,11 @@ class TradeManager {
 
         // Immediate verification for SL
         this._watchExitLeg(tradeId, slOrderId, "SL").catch(() => {});
+        this._armStopLossSla({
+          tradeId,
+          slOrderId,
+          instrumentToken: Number(fresh.instrument_token || token),
+        });
       }
 
       const tpEnabled = String(env.OPT_TP_ENABLED || "false") === "true";

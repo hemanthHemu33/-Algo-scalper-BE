@@ -272,6 +272,7 @@ const schema = z.object({
 
   // ---- Option-chain greeks / advanced filters ----
   GREEKS_REQUIRED: z.coerce.boolean().default(false),
+  OPT_GREEKS_REQUIRED: z.coerce.boolean().default(false),
   OPT_RISK_FREE_RATE: z.coerce.number().default(0.06),
 
   // Delta band to avoid far OTM / low-reacting contracts (0..1)
@@ -430,6 +431,7 @@ const schema = z.object({
   TICK_MODE_DEFAULT: z.string().default("full"),
   TICK_MODE_TRADE: z.string().default("full"),
   TICK_MODE_UNDERLYING: z.string().default("quote"),
+  TICK_MODE_OPTIONS: z.string().default("quote"),
 
   // Candle write buffer (avoid DB writes in the hot tick loop). Only used if market/candleWriteBuffer exists.
   CANDLE_WRITE_BUFFER_ENABLED: z.coerce.boolean().default(true),
@@ -501,6 +503,8 @@ const schema = z.object({
   PANIC_EXIT_LIMIT_FALLBACK_ENABLED: z.string().default("true"),
   PANIC_EXIT_LIMIT_BUFFER_TICKS: z.coerce.number().default(2),
   PANIC_EXIT_LIMIT_MAX_BPS: z.coerce.number().default(250),
+  SL_SAFETY_SLA_MS: z.coerce.number().default(3000),
+  SL_SLA_BREACH_COOLDOWN_MIN: z.coerce.number().default(5),
   // Panic-exit fill SLA: if PANIC_EXIT stays open, cancel + replace.
   PANIC_EXIT_FILL_TIMEOUT_MS: z.coerce.number().default(2500),
   PANIC_EXIT_MAX_RETRIES: z.coerce.number().default(1),

@@ -309,6 +309,7 @@ async function _subscribeTokens(tokens, opts = {}) {
 
   const underlyingMode = _modeStrSafe(env.TICK_MODE_UNDERLYING, "quote");
   const tradeMode = _modeStrSafe(env.TICK_MODE_TRADE, "full");
+  const optionMode = _modeStrSafe(env.TICK_MODE_OPTIONS, tradeMode);
 
   const role = String(opts?.role || "").toLowerCase();
   const reason = String(opts?.reason || "").toUpperCase();
@@ -333,7 +334,8 @@ async function _subscribeTokens(tokens, opts = {}) {
     if (under.length) _applyMode(under, underlyingMode);
     if (trade.length) _applyMode(trade, tradeMode);
   } else {
-    _applyMode(arr, hintedTrade ? tradeMode : underlyingMode);
+    const mode = opts?.isOption === true ? optionMode : hintedTrade ? tradeMode : underlyingMode;
+    _applyMode(arr, mode);
   }
 
   for (const t of arr) subscribedTokens.add(t);
