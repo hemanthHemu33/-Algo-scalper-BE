@@ -1311,6 +1311,100 @@ class TradeManager {
     }
   }
 
+  _parseQuoteTimeMs(q) {
+    const cands = [q?.timestamp, q?.last_trade_time, q?.exchange_timestamp];
+    for (const v of cands) {
+      if (!v) continue;
+      const ms = new Date(v).getTime();
+      if (Number.isFinite(ms) && ms > 0) return ms;
+    }
+    return null;
+  }
+
+  async _preEntryOptionLiquidityCheck(contract) {
+    const token = Number(contract?.instrument_token);
+    if (!(token > 0)) return { ok: false, reason: "INVALID_TOKEN" };
+    if (typeof this.kite.getQuote !== "function") {
+      return { ok: false, reason: "NO_GETQUOTE_FN" };
+    }
+
+    const ex = String(contract?.exchange || "NFO").toUpperCase();
+    const sym = String(contract?.tradingsymbol || "");
+    if (!sym) return { ok: false, reason: "INVALID_SYMBOL" };
+
+    const key = `${ex}:${sym.toUpperCase()}`;
+
+    try {
+      const resp = await this.kite.getQuote([key]);
+      const q = resp?.[key];
+      const bid = Number(q?.depth?.buy?.[0]?.price);
+      const ask = Number(q?.depth?.sell?.[0]?.price);
+      const bidQty = Number(q?.depth?.buy?.[0]?.quantity || 0);
+      const askQty = Number(q?.depth?.sell?.[0]?.quantity || 0);
+      const ltp = Number(q?.last_price);
+
+      if (!(Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask >= bid)) {
+        return { ok: false, reason: "NO_DEPTH", meta: { bid, ask, ltp } };
+      }
+
+      const mid = (bid + ask) / 2;
+      const spreadBps = mid > 0 ? ((ask - bid) / mid) * 10000 : Number.NaN;
+      const maxSpreadBps = Number(env.OPT_MAX_SPREAD_BPS ?? 35);
+      if (!(Number.isFinite(spreadBps) && spreadBps <= maxSpreadBps)) {
+        return {
+          ok: false,
+          reason: "SPREAD_TOO_WIDE",
+          meta: { spreadBps, maxSpreadBps, bid, ask, ltp },
+        };
+      }
+
+      const minDepthQty = Number(env.OPT_MIN_DEPTH_QTY || 0);
+      if (minDepthQty > 0) {
+        const topDepth = Math.min(
+          Number.isFinite(bidQty) ? bidQty : 0,
+          Number.isFinite(askQty) ? askQty : 0,
+        );
+        if (topDepth < minDepthQty) {
+          return {
+            ok: false,
+            reason: "DEPTH_TOO_LOW",
+            meta: { topDepth, minDepthQty, bidQty, askQty },
+          };
+        }
+      }
+
+      const quoteTsMs = this._parseQuoteTimeMs(q);
+      const freshnessMaxMs = Number(env.STALE_TICK_MS || 3000);
+      const ageMs = quoteTsMs ? Date.now() - quoteTsMs : Number.POSITIVE_INFINITY;
+      if (!Number.isFinite(ageMs) || ageMs > freshnessMaxMs) {
+        return {
+          ok: false,
+          reason: "STALE_QUOTE",
+          meta: { ageMs, freshnessMaxMs, quoteTsMs: quoteTsMs || null },
+        };
+      }
+
+      return {
+        ok: true,
+        meta: {
+          spreadBps,
+          bid,
+          ask,
+          ltp,
+          quoteTsMs,
+          bidQty,
+          askQty,
+        },
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        reason: "QUOTE_ERROR",
+        meta: { message: e?.message || String(e) },
+      };
+    }
+  }
+
   async _targetWatchdogFire(tradeId, cause = "timeout") {
     const id = String(tradeId || "");
     if (!id) return;
@@ -5772,11 +5866,35 @@ class TradeManager {
         }
       }
 
-      // Underlying LTP for ATM selection
+      // Signal source can stay FUT/SPOT, but ATM strike should use dedicated strike-ref token (pro style: SPOT).
       const underInstr = await ensureInstrument(this.kite, underlyingToken);
+      const contractByUnderlying = uni?.universe?.contracts || {};
+      const resolvedUnderlying = Object.entries(contractByUnderlying).find(
+        ([, c]) =>
+          Number(c?.instrument_token) === underlyingToken ||
+          String(c?.tradingsymbol || "").toUpperCase() ===
+            String(underInstr?.tradingsymbol || "").toUpperCase(),
+      )?.[0];
+      const strikeRefToken = Number(
+        resolvedUnderlying
+          ? contractByUnderlying?.[resolvedUnderlying]?.strike_ref_token
+          : NaN,
+      );
+
+      let strikeRefLtp = Number.NaN;
+      if (Number.isFinite(strikeRefToken) && strikeRefToken > 0) {
+        strikeRefLtp = Number(this.lastPriceByToken.get(strikeRefToken));
+        if (!(strikeRefLtp > 0)) {
+          const strikeRefInstr = await ensureInstrument(this.kite, strikeRefToken);
+          strikeRefLtp = Number(await this._getLtp(strikeRefToken, strikeRefInstr));
+        }
+      }
+
       const underLtp =
         (await this._getLtp(underlyingToken, underInstr)) ||
         Number(s.candle?.close);
+      const routeLtp =
+        Number.isFinite(strikeRefLtp) && strikeRefLtp > 0 ? strikeRefLtp : underLtp;
 
       const picked = await pickOptionContractForSignal({
         kite: this.kite,
@@ -5784,7 +5902,7 @@ class TradeManager {
         underlyingToken,
         underlyingTradingsymbol: underInstr?.tradingsymbol,
         side: underlyingSide,
-        underlyingLtp: underLtp,
+        underlyingLtp: routeLtp,
         maxSpreadBpsOverride: policy?.maxSpreadBpsOpt,
       });
 
@@ -5813,6 +5931,19 @@ class TradeManager {
             meta: picked?.meta,
           },
           "[options] no contract could be picked",
+        );
+        return;
+      }
+
+      const liq = await this._preEntryOptionLiquidityCheck(picked);
+      if (!liq.ok) {
+        logger.info(
+          {
+            token: picked.instrument_token,
+            reason: liq.reason,
+            meta: liq.meta,
+          },
+          "[trade] blocked (option liquidity recheck)",
         );
         return;
       }
