@@ -218,7 +218,7 @@ const schema = z.object({
   // Pick expiry: NEAREST (recommended)
   OPT_EXPIRY_POLICY: z.string().default("NEAREST"),
   // Expiry safety (optional)
-  OPT_MIN_DAYS_TO_EXPIRY: z.coerce.number().default(0),
+  OPT_MIN_DAYS_TO_EXPIRY: z.coerce.number().default(1),
   // Preferred DTE band for option expiry selection (pro weekly-first behavior)
   OPT_ALLOW_ZERO_DTE: z.coerce.boolean().default(false),
   OPT_DTE_PREFER_MIN: z.coerce.number().default(1),
@@ -298,7 +298,7 @@ const schema = z.object({
   // OI wall context filter (support/resistance)
   OPT_OI_WALL_MULT: z.coerce.number().default(2.5),
   OPT_OI_WALL_STRIKES: z.coerce.number().default(2),
-  OPT_OI_WALL_BLOCK: z.coerce.boolean().default(true),
+  OPT_OI_WALL_BLOCK: z.coerce.boolean().default(false),
   OPT_OI_WALL_REQUIRE_OI_CHANGE: z.coerce.boolean().default(true),
 
   // IV + theta edge gate (after plan) to avoid IV-crush traps
