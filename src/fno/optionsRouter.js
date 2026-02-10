@@ -963,9 +963,6 @@ async function pickOptionContractForSignal({
     oi: Number(best.row.oi || 0),
     oi_change: Number.isFinite(Number(best.row.oi_change)) ? Number(best.row.oi_change) : null,
     spread_bps_change: Number.isFinite(Number(best.row.spread_bps_change)) ? Number(best.row.spread_bps_change) : null,
-    health_score: Number.isFinite(Number(best.row.health_score)) ? Number(best.row.health_score) : null,
-    book_flicker: Number(best.row.book_flicker || 0),
-    impact_cost_bps: Number.isFinite(Number(best.row.impact_cost_bps)) ? Number(best.row.impact_cost_bps) : null,
 
     meta: {
       policy: picked?.policy || null,
