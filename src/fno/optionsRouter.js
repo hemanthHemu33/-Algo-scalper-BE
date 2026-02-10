@@ -54,6 +54,12 @@ function roundToStep(price, step) {
   return Math.round(Number(price) / s) * s;
 }
 
+function finiteNumberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 function strikeStepFallback(underlying) {
   const u = String(underlying || "").toUpperCase();
   if (u === "NIFTY") return Number(env.OPT_STRIKE_STEP_NIFTY || 50);
@@ -299,6 +305,23 @@ function computeOiWallContext({ rows, optType, desiredStrike, step }) {
 
   const wallExists = best.oi >= med * mult;
   return { medianOi: med, wall: wallExists ? best : null };
+}
+
+function isOiWallBlockedStrike({ rowStrike, optType, wallStrike }) {
+  if (
+    !Number.isFinite(Number(rowStrike)) ||
+    !Number.isFinite(Number(wallStrike))
+  ) {
+    return false;
+  }
+  const strike = Number(rowStrike);
+  const wall = Number(wallStrike);
+  const dir = String(optType || "").toUpperCase();
+  // CE longs are usually hurt by resistance above/at wall strike.
+  if (dir === "CE") return strike >= wall;
+  // PE longs are usually hurt by support below/at wall strike.
+  if (dir === "PE") return strike <= wall;
+  return false;
 }
 
 async function pickOptionContractForSignal({
@@ -606,7 +629,7 @@ async function pickOptionContractForSignal({
       const depthOk =
         Number(minDepth) > 0 ? depthTopQty >= Number(minDepth) : hasAnyDepth; // require depth even if minDepth not configured
 
-      const delta = Number(r.delta);
+      const delta = finiteNumberOrNull(r.delta);
       const deltaAbs = Number.isFinite(delta) ? Math.abs(delta) : null;
       const greeksRequired = Boolean(env.GREEKS_REQUIRED ?? false);
       const deltaOk = Number.isFinite(deltaAbs)
@@ -624,8 +647,13 @@ async function pickOptionContractForSignal({
 
       // OI wall context
       const oiWall = oiContext?.wall || null;
-      const oiWallOk = oiWallBlock ? !oiWall : true;
-      const oiWallPenalty = oiWall ? 60 : 0;
+      const oiWallBlocked = isOiWallBlockedStrike({
+        rowStrike: r.strike,
+        optType,
+        wallStrike: oiWall?.strike,
+      });
+      const oiWallOk = oiWallBlock ? !oiWallBlocked : true;
+      const oiWallPenalty = oiWallBlocked ? 60 : oiWall ? 10 : 0;
 
       const dist = Math.abs(Number(r.strike) - desiredStrike);
       const distSteps = step > 0 ? dist / step : dist;
@@ -769,7 +797,7 @@ async function pickOptionContractForSignal({
               ltp: Number(bestHard.row.ltp),
               bps: Number(bestHard.row.spread_bps),
               depth: Number(bestHard.row.depth_qty_top || 0),
-              delta: Number(bestHard.row.delta),
+              delta: finiteNumberOrNull(bestHard.row.delta),
               gamma: Number(bestHard.row.gamma),
             },
           },
@@ -795,7 +823,7 @@ async function pickOptionContractForSignal({
               ltp: Number(x.row.ltp),
               spread_bps: Number(x.row.spread_bps),
               depth_qty_top: Number(x.row.depth_qty_top || 0),
-              delta: Number(x.row.delta),
+              delta: finiteNumberOrNull(x.row.delta),
               gamma: Number(x.row.gamma),
               iv_pts: Number(x.row.iv_pts),
               health_score: Number(x.row.health_score),
@@ -904,7 +932,7 @@ async function pickOptionContractForSignal({
           volume: Number(x.row.volume || 0),
           oi: Number(x.row.oi || 0),
           oi_change: Number(x.row.oi_change),
-          delta: Number(x.row.delta),
+          delta: finiteNumberOrNull(x.row.delta),
           gamma: Number(x.row.gamma),
           iv_pts: Number(x.row.iv_pts),
           iv_change_pts: Number(x.row.iv_change_pts),
@@ -956,7 +984,7 @@ async function pickOptionContractForSignal({
     iv: Number.isFinite(Number(best.row.iv)) ? Number(best.row.iv) : null,
     iv_pts: Number.isFinite(Number(best.row.iv_pts)) ? Number(best.row.iv_pts) : null,
     iv_change_pts: Number.isFinite(Number(best.row.iv_change_pts)) ? Number(best.row.iv_change_pts) : null,
-    delta: Number.isFinite(Number(best.row.delta)) ? Number(best.row.delta) : null,
+    delta: finiteNumberOrNull(best.row.delta),
     gamma: Number.isFinite(Number(best.row.gamma)) ? Number(best.row.gamma) : null,
     vega_1pct: Number.isFinite(Number(best.row.vega_1pct)) ? Number(best.row.vega_1pct) : null,
     theta_per_day: Number.isFinite(Number(best.row.theta_per_day)) ? Number(best.row.theta_per_day) : null,
