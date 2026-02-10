@@ -270,6 +270,18 @@ const schema = z.object({
   // Candidate scoring weights (comma-separated k:v; keys: spread,dist,depth,volume,oi)
   OPT_PICK_SCORE_WEIGHTS: z.string().optional(),
 
+  // Liquidity gate (spread/depth/OI/volume pre-filter)
+  OPT_LIQ_GATE_ENABLED: z.coerce.boolean().default(true),
+  OPT_LIQ_GATE_MIN_SCORE: z.coerce.number().default(45),
+  OPT_LIQ_GATE_MAX_SPREAD_BPS: z.coerce.number().default(35),
+  OPT_LIQ_GATE_MIN_DEPTH_QTY: z.coerce.number().default(0),
+  OPT_LIQ_GATE_MIN_OI: z.coerce.number().default(0),
+  OPT_LIQ_GATE_MIN_VOLUME: z.coerce.number().default(0),
+  OPT_LIQ_GATE_TOP_N: z.coerce.number().default(0),
+
+  // Strike selection behavior: ATM_OFFSET (legacy) or DELTA_NEAREST (delta-ish)
+  OPT_STRIKE_SELECTION_MODE: z.string().default("DELTA_NEAREST"),
+
   // ---- Option-chain greeks / advanced filters ----
   GREEKS_REQUIRED: z.coerce.boolean().default(false),
   OPT_GREEKS_REQUIRED: z.coerce.boolean().default(false),
