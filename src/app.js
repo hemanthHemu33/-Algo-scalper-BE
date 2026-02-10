@@ -176,6 +176,32 @@ function buildApp() {
 
   app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
+  app.get("/metrics", async (req, res) => {
+    try {
+      const ticker = getTickerStatus?.() || {};
+      const mh = marketHealth.snapshot?.({}) || { totals: {} };
+      const sig = telemetry.snapshot ? telemetry.snapshot() : {};
+      const lines = [
+        "# TYPE engine_ticker_connected gauge",
+        `engine_ticker_connected ${ticker.connected ? 1 : 0}`,
+        "# TYPE engine_market_ticks_total counter",
+        `engine_market_ticks_total ${Number(mh?.totals?.ticks || 0)}`,
+        "# TYPE engine_market_gaps_total counter",
+        `engine_market_gaps_total ${Number(mh?.totals?.gaps || 0)}`,
+        "# TYPE engine_market_missing_timestamp_total counter",
+        `engine_market_missing_timestamp_total ${Number(mh?.totals?.missingTimestamp || 0)}`,
+        "# TYPE engine_signals_total counter",
+        `engine_signals_total ${Number(sig?.counts?.total || 0)}`,
+        "# TYPE engine_signals_accepted_total counter",
+        `engine_signals_accepted_total ${Number(sig?.counts?.accepted || 0)}`,
+      ];
+      res.set("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+      return res.send(lines.join("\n") + "\n");
+    } catch (e) {
+      return res.status(500).send(`# metrics_error ${JSON.stringify(e?.message || String(e))}\n`);
+    }
+  });
+
   // ---- Kite login redirect (request_token -> access_token) ----
   // Set your Kite app "redirect_url" to: http(s)://<host>:<port>/kite-redirect
   app.get("/kite-redirect", async (req, res) => {

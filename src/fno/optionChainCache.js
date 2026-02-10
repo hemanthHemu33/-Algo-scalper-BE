@@ -18,7 +18,7 @@ const _lastChainByUnderlying = new Map(); // underlying|optType -> last chain sn
 const _lastPickByUnderlying = new Map(); // underlying -> last pick object
 
 // For microstructure + greeks trend detection (spread bps / iv / oi change)
-const _lastRowBySymbol = new Map(); // qk -> { ts, spread_bps, iv, oi }
+const _lastRowBySymbol = new Map(); // qk -> { ts, spread_bps, iv, oi, bid, ask, volume }
 
 function _now() {
   return Date.now();
@@ -162,6 +162,23 @@ async function getOptionChainSnapshot({
       Number.isFinite(bps) && Number.isFinite(prev?.spread_bps)
         ? bps - prev.spread_bps
         : null;
+    const spreadTrendBad =
+      Number.isFinite(spreadBpsChange) && spreadBpsChange > 0 ? spreadBpsChange : 0;
+
+    const volVelocity =
+      Number.isFinite(volume) && Number.isFinite(prev?.volume) && now > Number(prev?.ts || 0)
+        ? Math.max(0, ((volume - prev.volume) / Math.max(1, now - prev.ts)) * 1000)
+        : null;
+
+    const bookFlicker =
+      Number.isFinite(prev?.bid) && Number.isFinite(prev?.ask) && Number.isFinite(buyP) && Number.isFinite(sellP)
+        ? (Math.abs(prev.bid - buyP) > 0 ? 1 : 0) + (Math.abs(prev.ask - sellP) > 0 ? 1 : 0)
+        : 0;
+
+    const impactCostBps =
+      Number.isFinite(mid) && mid > 0
+        ? (((Number.isFinite(sellP) ? sellP : mid) - mid) / mid) * 10000
+        : null;
 
     // greeks/IV (approx) from mid/ltp
     let greeks = null;
@@ -219,6 +236,9 @@ async function getOptionChainSnapshot({
       volume: Number.isFinite(volume) ? volume : 0,
       oi: Number.isFinite(oi) ? oi : 0,
       oi_change: Number.isFinite(oiChange) ? oiChange : null,
+      vol_velocity: Number.isFinite(volVelocity) ? volVelocity : null,
+      book_flicker: Number.isFinite(bookFlicker) ? bookFlicker : 0,
+      impact_cost_bps: Number.isFinite(impactCostBps) ? impactCostBps : null,
 
       // Greeks (may be null if inputs are insufficient)
       iv: Number.isFinite(iv) ? iv : null,
@@ -234,12 +254,22 @@ async function getOptionChainSnapshot({
         : null,
     };
 
+    const oiScore = Number.isFinite(oi) && oi > 0 ? Math.min(20, Math.log(oi + 1)) : 0;
+    const volScore = Number.isFinite(volVelocity) ? Math.min(20, volVelocity / 5) : 0;
+    const spreadPenalty = Number.isFinite(bps) ? Math.min(35, Math.max(0, bps / 2)) : 35;
+    const flickerPenalty = Math.min(20, Number(bookFlicker || 0) * 5 + Math.max(0, spreadTrendBad / 3));
+    const impactPenalty = Number.isFinite(impactCostBps) ? Math.min(15, Math.max(0, impactCostBps / 2)) : 10;
+    row.health_score = Math.max(0, Math.min(100, 55 + oiScore + volScore - spreadPenalty - flickerPenalty - impactPenalty));
+
     // Update trend cache (even if greeks missing, keep spread/oi)
     _lastRowBySymbol.set(qk, {
       ts: now,
       spread_bps: Number.isFinite(bps) ? bps : null,
       iv: Number.isFinite(iv) ? iv : null,
       oi: Number.isFinite(oi) ? oi : null,
+      bid: Number.isFinite(buyP) ? buyP : null,
+      ask: Number.isFinite(sellP) ? sellP : null,
+      volume: Number.isFinite(volume) ? volume : null,
     });
 
     return row;

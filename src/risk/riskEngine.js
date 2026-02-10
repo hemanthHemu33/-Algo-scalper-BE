@@ -205,14 +205,19 @@ class RiskEngine {
     this._emitStateChange();
   }
 
-  calcQty({ entryPrice, stopLoss, riskInr: riskInrOverride }) {
+  calcQty({ entryPrice, stopLoss, riskInr: riskInrOverride, lotSize, expectedSlippagePts, feePerLotInr }) {
     const riskInr = Number(
       Number.isFinite(Number(riskInrOverride))
         ? riskInrOverride
         : env.RISK_PER_TRADE_INR || 250,
     );
-    const perShareRisk = Math.max(0.05, Math.abs(entryPrice - stopLoss));
-    return Math.max(1, Math.floor(riskInr / perShareRisk));
+    const lot = Math.max(1, Number(lotSize || 1));
+    const slPts = Math.max(0.05, Math.abs(Number(entryPrice) - Number(stopLoss)));
+    const slipPts = Math.max(0, Number(expectedSlippagePts ?? env.EXPECTED_SLIPPAGE_POINTS ?? 0));
+    const feesPerLot = Math.max(0, Number(feePerLotInr ?? env.EXPECTED_FEES_PER_LOT_INR ?? 0));
+    const effRiskPerLot = (slPts + slipPts) * lot + feesPerLot;
+    const perLot = Math.max(0.05, effRiskPerLot);
+    return Math.max(1, Math.floor(riskInr / perLot) * lot);
   }
 }
 

@@ -312,6 +312,9 @@ async function pickOptionContractForSignal({
   maxSpreadBpsOverride,
   minPremiumOverride,
   maxPremiumOverride,
+  forceExpiryISO,
+  gateStage = 0,
+  triedExpiries = [],
 }) {
   const u = resolveUnderlyingFromUniverse({
     universe,
@@ -394,10 +397,11 @@ async function pickOptionContractForSignal({
     })
     .filter(Boolean);
 
-  let expiryISO = pickNearestExpiryISO(optionRows);
+  let expiryISO = forceExpiryISO || pickNearestExpiryISO(optionRows);
   // Apply roll rules (min DTE / avoid expiry-day after cutoff)
   const picked = pickBestExpiryISO({ expiries, env, nowMs: Date.now() });
-  if (picked?.expiryISO) expiryISO = picked.expiryISO;
+  if (!forceExpiryISO && picked?.expiryISO) expiryISO = picked.expiryISO;
+  const sortedExpiries = Array.from(new Set(expiries)).sort();
 
   if (!expiryISO) {
     logger.warn(
@@ -527,15 +531,21 @@ async function pickOptionContractForSignal({
   );
   const enforcePremBand = Boolean(band.enforce);
 
-  const maxBps = Number(
+  const maxBpsRaw = Number(
     Number.isFinite(Number(maxSpreadBpsOverride))
       ? maxSpreadBpsOverride
       : env.OPT_MAX_SPREAD_BPS || 35,
   );
   const minDepth = Number(env.OPT_MIN_DEPTH_QTY || 0);
 
+  const stage = Math.max(0, Number(gateStage || 0));
+  const maxBps = stage >= 1 ? maxBpsRaw * 1.25 : maxBpsRaw;
+  const premiumSlack = stage >= 2 ? 25 : 0;
+  const deltaGateEnabled = stage >= 3 ? false : Boolean(env.OPT_DELTA_BAND_ENFORCE ?? true);
+  const gammaGateEnabled = stage >= 4 ? false : true;
+
   // New: greeks/microstructure safety
-  const enforceDeltaBand = Boolean(env.OPT_DELTA_BAND_ENFORCE ?? true);
+  const enforceDeltaBand = deltaGateEnabled;
   const deltaMin = Number(env.OPT_DELTA_BAND_MIN ?? 0.35);
   const deltaMax = Number(env.OPT_DELTA_BAND_MAX ?? 0.65);
   const deltaTarget = Number(env.OPT_DELTA_TARGET ?? 0.5);
@@ -548,6 +558,8 @@ async function pickOptionContractForSignal({
     : false;
 
   const spreadRiseBlockBps = Number(env.OPT_SPREAD_RISE_BLOCK_BPS ?? 8);
+  const flickerBlock = Number(env.OPT_BOOK_FLICKER_BLOCK ?? 4);
+  const minHealthScore = Number(env.OPT_HEALTH_SCORE_MIN ?? 45);
 
   const ivMaxPts = Number(env.OPT_IV_MAX_PTS ?? 80);
   const ivDropBlockPts = Number(env.OPT_IV_DROP_BLOCK_PTS ?? 2);
@@ -578,12 +590,16 @@ async function pickOptionContractForSignal({
       const bpsCh = Number(r.spread_bps_change);
 
       const premOk = Number.isFinite(ltp)
-        ? ltp >= minPrem && ltp <= maxPrem
+        ? ltp >= (minPrem - premiumSlack) && ltp <= (maxPrem + premiumSlack)
         : true;
       const spreadOk = Number.isFinite(bps) ? bps <= maxBps : false; // fail-closed when spread is unknown
       const spreadTrendOk = Number.isFinite(bpsCh)
         ? bpsCh <= spreadRiseBlockBps
         : true;
+      const flicker = Number(r.book_flicker || 0);
+      const flickerOk = flicker <= flickerBlock;
+      const health = Number(r.health_score);
+      const healthOk = Number.isFinite(health) ? health >= minHealthScore : true;
 
       const depthTopQty = Number(r.depth_qty_top || 0);
       const hasAnyDepth = Number.isFinite(depthTopQty) && depthTopQty > 0;
@@ -592,13 +608,14 @@ async function pickOptionContractForSignal({
 
       const delta = Number(r.delta);
       const deltaAbs = Number.isFinite(delta) ? Math.abs(delta) : null;
+      const greeksRequired = Boolean(env.GREEKS_REQUIRED ?? false);
       const deltaOk = Number.isFinite(deltaAbs)
         ? deltaAbs >= deltaMin && deltaAbs <= deltaMax
-        : true; // If greeks missing, don't hard-block.
+        : !greeksRequired; // If greeks missing, do not hard-block unless strict mode.
 
       const gamma = Number(r.gamma);
       const gammaOk =
-        gammaGateActive && Number.isFinite(gamma) ? gamma <= gammaMax : true;
+        gammaGateEnabled && gammaGateActive && Number.isFinite(gamma) ? gamma <= gammaMax : true;
 
       const ivPts = Number(r.iv_pts);
       const ivCh = Number(r.iv_change_pts);
@@ -639,6 +656,8 @@ async function pickOptionContractForSignal({
       const hardOk =
         spreadOk &&
         spreadTrendOk &&
+        flickerOk &&
+        healthOk &&
         depthOk &&
         ivOk &&
         ivTrendOk &&
@@ -660,6 +679,8 @@ async function pickOptionContractForSignal({
         gammaOk,
         ivOk,
         ivTrendOk,
+        healthOk,
+        flickerOk,
         dist,
         distSteps,
         score,
@@ -669,6 +690,8 @@ async function pickOptionContractForSignal({
           ivPts: Number.isFinite(ivPts) ? ivPts : null,
           ivChangePts: Number.isFinite(ivCh) ? ivCh : null,
           spreadBpsChange: Number.isFinite(bpsCh) ? bpsCh : null,
+          healthScore: Number.isFinite(health) ? health : null,
+          bookFlicker: Number.isFinite(flicker) ? flicker : null,
           oiWall: oiWall
             ? { ...oiWall, medianOi: oiContext?.medianOi ?? null }
             : null,
@@ -767,6 +790,7 @@ async function pickOptionContractForSignal({
         debugTopN > 0
           ? scored.slice(0, debugTopN).map((x) => ({
               tradingsymbol: x.row.tradingsymbol,
+              instrument_token: Number(x.row.instrument_token),
               strike: Number(x.row.strike),
               ltp: Number(x.row.ltp),
               spread_bps: Number(x.row.spread_bps),
@@ -774,6 +798,8 @@ async function pickOptionContractForSignal({
               delta: Number(x.row.delta),
               gamma: Number(x.row.gamma),
               iv_pts: Number(x.row.iv_pts),
+              health_score: Number(x.row.health_score),
+              book_flicker: Number(x.row.book_flicker || 0),
               score: Number(x.score),
               ok: !!x.ok,
               hardOk: !!x.hardOk,
@@ -785,6 +811,8 @@ async function pickOptionContractForSignal({
               gammaOk: !!x.gammaOk,
               ivOk: !!x.ivOk,
               ivTrendOk: !!x.ivTrendOk,
+              healthOk: !!x.healthOk,
+              flickerOk: !!x.flickerOk,
             }))
           : undefined;
 
@@ -806,6 +834,29 @@ async function pickOptionContractForSignal({
         "[options] no eligible candidate",
       );
 
+      const triedSet = new Set([...(triedExpiries || []), expiryISO]);
+      const nextExpiry = sortedExpiries.find((e) => !triedSet.has(e));
+      const canRelax = stage < 4;
+      if (nextExpiry || canRelax) {
+        const nextStage = nextExpiry ? stage : stage + 1;
+        const nextArgs = {
+          kite,
+          universe,
+          underlyingToken,
+          underlyingTradingsymbol,
+          side,
+          underlyingLtp,
+          maxSpreadBpsOverride,
+          minPremiumOverride,
+          maxPremiumOverride,
+          forceExpiryISO: nextExpiry || expiryISO,
+          gateStage: nextStage,
+          triedExpiries: Array.from(triedSet),
+        };
+        logger.warn({ underlying, optType, expiry: expiryISO, stage, nextExpiry, nextStage }, "[options] fallback retry triggered");
+        return pickOptionContractForSignal(nextArgs);
+      }
+
       return {
         ok: false,
         reason: requireOk ? "NO_OK_CANDIDATE" : "NO_PREMIUM_BAND_CANDIDATE",
@@ -818,7 +869,7 @@ async function pickOptionContractForSignal({
         strikeStep: step,
         premiumBand: { minPrem, maxPrem, enforced: enforcePremBand },
         meta: {
-          micro: { maxBps, spreadRiseBlockBps, minDepth },
+          micro: { maxBps, spreadRiseBlockBps, minDepth, flickerBlock, minHealthScore },
           deltaBand: enforceDeltaBand
             ? { min: deltaMin, max: deltaMax, target: deltaTarget }
             : null,
@@ -844,6 +895,7 @@ async function pickOptionContractForSignal({
     debugTopN > 0
       ? poolForDebug.slice(0, debugTopN).map((x) => ({
           tradingsymbol: x.row.tradingsymbol,
+          instrument_token: Number(x.row.instrument_token),
           strike: Number(x.row.strike),
           ltp: Number(x.row.ltp),
           spread_bps: Number(x.row.spread_bps),
@@ -858,6 +910,9 @@ async function pickOptionContractForSignal({
           iv_change_pts: Number(x.row.iv_change_pts),
           vega_1pct: Number(x.row.vega_1pct),
           theta_per_day: Number(x.row.theta_per_day),
+          health_score: Number(x.row.health_score),
+          book_flicker: Number(x.row.book_flicker || 0),
+          impact_cost_bps: Number(x.row.impact_cost_bps),
           distSteps: Number(x.distSteps),
           score: Number(x.score),
           ok: !!x.ok,
@@ -898,16 +953,19 @@ async function pickOptionContractForSignal({
     ltp: Number(best.row.ltp),
     bps: Number(best.row.spread_bps),
     depth: Number(best.row.depth_qty_top || 0),
-    iv: Number(best.row.iv),
-    iv_pts: Number(best.row.iv_pts),
-    iv_change_pts: Number(best.row.iv_change_pts),
-    delta: Number(best.row.delta),
-    gamma: Number(best.row.gamma),
-    vega_1pct: Number(best.row.vega_1pct),
-    theta_per_day: Number(best.row.theta_per_day),
+    iv: Number.isFinite(Number(best.row.iv)) ? Number(best.row.iv) : null,
+    iv_pts: Number.isFinite(Number(best.row.iv_pts)) ? Number(best.row.iv_pts) : null,
+    iv_change_pts: Number.isFinite(Number(best.row.iv_change_pts)) ? Number(best.row.iv_change_pts) : null,
+    delta: Number.isFinite(Number(best.row.delta)) ? Number(best.row.delta) : null,
+    gamma: Number.isFinite(Number(best.row.gamma)) ? Number(best.row.gamma) : null,
+    vega_1pct: Number.isFinite(Number(best.row.vega_1pct)) ? Number(best.row.vega_1pct) : null,
+    theta_per_day: Number.isFinite(Number(best.row.theta_per_day)) ? Number(best.row.theta_per_day) : null,
     oi: Number(best.row.oi || 0),
-    oi_change: Number(best.row.oi_change),
-    spread_bps_change: Number(best.row.spread_bps_change),
+    oi_change: Number.isFinite(Number(best.row.oi_change)) ? Number(best.row.oi_change) : null,
+    spread_bps_change: Number.isFinite(Number(best.row.spread_bps_change)) ? Number(best.row.spread_bps_change) : null,
+    health_score: Number.isFinite(Number(best.row.health_score)) ? Number(best.row.health_score) : null,
+    book_flicker: Number(best.row.book_flicker || 0),
+    impact_cost_bps: Number.isFinite(Number(best.row.impact_cost_bps)) ? Number(best.row.impact_cost_bps) : null,
 
     meta: {
       policy: picked?.policy || null,
@@ -928,7 +986,7 @@ async function pickOptionContractForSignal({
         dropBlockPts: ivDropBlockPts,
         neutralPts: ivNeutralPts,
       },
-      micro: { maxBps, spreadRiseBlockBps, minDepth },
+      micro: { maxBps, spreadRiseBlockBps, minDepth, flickerBlock, minHealthScore },
       oiContext,
       weights,
       fromCache: !!chain?.fromCache,

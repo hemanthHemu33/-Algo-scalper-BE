@@ -240,6 +240,15 @@ class TradeManager {
       size: Math.max(5, Number(env.SLIPPAGE_FEEDBACK_SAMPLE || 25)),
     };
 
+    // Rolling circuit breakers (5-minute window)
+    this._cbEvents = {
+      rejects: [],
+      spreadSpikes: [],
+      staleTicks: [],
+      quoteGuard: [],
+    };
+    this._cbCooldownUntil = 0;
+
     // Strategy-level loss throttling
     this._strategyLossStreak = new Map();
     this._strategyCooldownUntil = new Map();
@@ -250,6 +259,49 @@ class TradeManager {
 
   setRuntimeAddTokens(fn) {
     this.runtimeAddTokens = typeof fn === "function" ? fn : null;
+  }
+
+  _pushCircuitEvent(kind) {
+    const k = String(kind || "");
+    if (!this._cbEvents[k]) return;
+    const now = Date.now();
+    const windowMs = 5 * 60 * 1000;
+    const arr = this._cbEvents[k];
+    arr.push(now);
+    while (arr.length && now - arr[0] > windowMs) arr.shift();
+  }
+
+  _checkCircuitBreakers() {
+    if (!Boolean(env.CIRCUIT_BREAKERS_ENABLED ?? true)) {
+      return { ok: true, reason: "DISABLED" };
+    }
+    const now = Date.now();
+    if (this._cbCooldownUntil && now < this._cbCooldownUntil) {
+      return { ok: false, reason: "COOLDOWN", until: this._cbCooldownUntil };
+    }
+    const caps = {
+      rejects: Number(env.CB_MAX_REJECTS_5M || 5),
+      spreadSpikes: Number(env.CB_MAX_SPREAD_SPIKES_5M || 8),
+      staleTicks: Number(env.CB_MAX_STALE_TICKS_5M || 12),
+      quoteGuard: Number(env.CB_MAX_QUOTE_GUARD_HITS_5M || 4),
+    };
+    for (const [k, maxN] of Object.entries(caps)) {
+      const cnt = this._cbEvents[k]?.length || 0;
+      if (Number.isFinite(maxN) && maxN > 0 && cnt >= maxN) {
+        const cd = Math.max(30, Number(env.CB_COOLDOWN_SEC || 180));
+        this._cbCooldownUntil = now + cd * 1000;
+        logger.error(
+          { kind: k, count: cnt, max: maxN, cooldownSec: cd },
+          "[guard] circuit breaker tripped",
+        );
+        return {
+          ok: false,
+          reason: `CIRCUIT_${k.toUpperCase()}`,
+          until: this._cbCooldownUntil,
+        };
+      }
+    }
+    return { ok: true, reason: "OK" };
   }
 
   _isFnoEnabled() {
@@ -1311,6 +1363,64 @@ class TradeManager {
     }
   }
 
+  _buildEntryLadderPrices({ side, basePrice, tick }) {
+    const steps = Math.max(0, Number(env.ENTRY_LADDER_TICKS || 2));
+    const dir = String(side || "BUY").toUpperCase() === "BUY" ? 1 : -1;
+    const out = [];
+    for (let i = 0; i <= steps; i++) {
+      out.push(roundToTick(Number(basePrice) + dir * i * tick, tick, dir > 0 ? "up" : "down"));
+    }
+    return Array.from(new Set(out.filter((n) => Number.isFinite(n) && n > 0)));
+  }
+
+  async _startEntryLadder({ tradeId, entryOrderId, instrument, side, basePrice }) {
+    if (!Boolean(env.ENTRY_LADDER_ENABLED ?? true)) return;
+    const tick = Number(instrument?.tick_size || 0.05);
+    const delayMs = Math.max(100, Number(env.ENTRY_LADDER_STEP_DELAY_MS || 350));
+    const ladder = this._buildEntryLadderPrices({ side, basePrice, tick });
+    if (ladder.length <= 1) return;
+
+    const startPx = Number(ladder[0]);
+    const maxChaseBps = Math.max(0, Number(env.ENTRY_LADDER_MAX_CHASE_BPS || 35));
+
+    for (let i = 1; i < ladder.length; i++) {
+      await sleep(delayMs);
+      const fresh = await getTrade(tradeId);
+      if (!fresh) return;
+      if (String(fresh.status || "").toUpperCase() !== STATUS.ENTRY_OPEN) return;
+
+      const st = await this._getOrderStatus(entryOrderId);
+      const os = String(st?.status || "").toUpperCase();
+      if (os !== "OPEN") return;
+
+      const nextPx = Number(ladder[i]);
+      const driftBps =
+        Number.isFinite(startPx) && startPx > 0
+          ? (Math.abs(nextPx - startPx) / startPx) * 10000
+          : 0;
+      if (driftBps > maxChaseBps) {
+        logger.warn({ tradeId, nextPx, startPx, driftBps, maxChaseBps }, "[entry_ladder] stopped (max chase)");
+        return;
+      }
+
+      try {
+        await this._safeModifyOrder(
+          env.DEFAULT_ORDER_VARIETY,
+          entryOrderId,
+          { price: nextPx },
+          { purpose: "ENTRY_LADDER", tradeId },
+        );
+        await updateTrade(tradeId, {
+          expectedEntryPrice: nextPx,
+          ...this._eventPatch("ENTRY_LADDER_STEP", { tradeId, price: nextPx, step: i }),
+        });
+      } catch (e) {
+        logger.warn({ tradeId, entryOrderId, price: nextPx, e: e?.message || String(e) }, "[entry_ladder] modify failed");
+        return;
+      }
+    }
+  }
+
   _parseQuoteTimeMs(q) {
     const cands = [q?.timestamp, q?.last_trade_time, q?.exchange_timestamp];
     for (const v of cands) {
@@ -1337,6 +1447,7 @@ class TradeManager {
     try {
       const resp = await this.kite.getQuote([key]);
       const q = resp?.[key];
+      const minHealth = Number(env.OPT_HEALTH_SCORE_MIN ?? 45);
       const bid = Number(q?.depth?.buy?.[0]?.price);
       const ask = Number(q?.depth?.sell?.[0]?.price);
       const bidQty = Number(q?.depth?.buy?.[0]?.quantity || 0);
@@ -1349,6 +1460,18 @@ class TradeManager {
 
       const mid = (bid + ask) / 2;
       const spreadBps = mid > 0 ? ((ask - bid) / mid) * 10000 : Number.NaN;
+      const spreadPenalty = Number.isFinite(spreadBps)
+        ? Math.min(35, Math.max(0, spreadBps / 2))
+        : 35;
+      const depthScore = Math.min(25, Math.log(Math.max(1, bidQty + askQty)) * 3);
+      const healthScore = Math.max(0, Math.min(100, 55 + depthScore - spreadPenalty));
+      if (Number.isFinite(minHealth) && healthScore < minHealth) {
+        return {
+          ok: false,
+          reason: "HEALTH_SCORE_LOW",
+          meta: { healthScore, minHealth, spreadBps, bidQty, askQty },
+        };
+      }
       const maxSpreadBps = Number(env.OPT_MAX_SPREAD_BPS ?? 35);
       if (!(Number.isFinite(spreadBps) && spreadBps <= maxSpreadBps)) {
         return {
@@ -1394,6 +1517,7 @@ class TradeManager {
           quoteTsMs,
           bidQty,
           askQty,
+          healthScore,
         },
       };
     } catch (e) {
@@ -2267,6 +2391,8 @@ class TradeManager {
       staleMs > 0 &&
       lastTickAt > 0 &&
       Date.now() - lastTickAt > staleMs;
+
+    if (isStale) this._pushCircuitEvent("staleTicks");
 
     if (Number.isFinite(cached) && !isStale) return cached;
 
@@ -4280,8 +4406,10 @@ class TradeManager {
     }
 
     const minMs = Number(env.DYNAMIC_EXIT_MIN_INTERVAL_MS || 5000);
+    const minModifyMs = Number(env.DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS || 1200);
     const now = Date.now();
     const lastEval = Number(this._dynExitLastEvalAt.get(tradeId) || 0);
+    const lastModify = Number(this._dynExitLastAt.get(tradeId) || 0);
     if (now - lastEval < minMs) return;
 
     const backoffUntil = Number(
@@ -4436,6 +4564,7 @@ class TradeManager {
 
         // Only modify while it's pending (OPEN means it likely triggered already).
         if (slStatus === "TRIGGER PENDING") {
+          if (now - lastModify < minModifyMs) return;
           const slSide = trade.side === "BUY" ? "SELL" : "BUY";
 
           const patch = { trigger_price: plan.sl.stopLoss };
@@ -4606,6 +4735,7 @@ class TradeManager {
         const tgtType = String(tgt?.order_type || "").toUpperCase();
         // Only modify an open LIMIT target (market targets can't be modified meaningfully)
         if (tgtStatus === "OPEN" && (tgtType === "LIMIT" || tgtType === "LM")) {
+          if (now - lastModify < minModifyMs) return;
           try {
             await this._safeModifyOrder(
               env.DEFAULT_ORDER_VARIETY,
@@ -5835,6 +5965,7 @@ class TradeManager {
         typeof isQuoteGuardBreakerOpen === "function" &&
         isQuoteGuardBreakerOpen()
       ) {
+        this._pushCircuitEvent("quoteGuard");
         const st =
           typeof getQuoteGuardStats === "function"
             ? getQuoteGuardStats()
@@ -5937,6 +6068,26 @@ class TradeManager {
 
       const liq = await this._preEntryOptionLiquidityCheck(picked);
       if (!liq.ok) {
+        const alt = (picked?.meta?.topCandidates || []).find(
+          (c) =>
+            Number(c?.instrument_token || 0) > 0 &&
+            Number(c?.health_score || 0) >= Number(env.OPT_HEALTH_SCORE_MIN || 45),
+        );
+        if (alt && Number(alt.instrument_token) !== Number(picked.instrument_token)) {
+          picked.instrument_token = Number(alt.instrument_token);
+          picked.tradingsymbol = alt.tradingsymbol || picked.tradingsymbol;
+          picked.exchange = alt.exchange || picked.exchange;
+          picked.health_score = Number(alt.health_score);
+          logger.warn(
+            {
+              from: liq.reason,
+              oldToken: Number(s.instrument_token),
+              newToken: picked.instrument_token,
+              newHealth: picked.health_score,
+            },
+            "[options] switched to healthier alternate contract before entry",
+          );
+        } else {
         logger.info(
           {
             token: picked.instrument_token,
@@ -5946,6 +6097,7 @@ class TradeManager {
           "[trade] blocked (option liquidity recheck)",
         );
         return;
+        }
       }
 
       // Ensure we subscribe the chosen option contract (so downstream OMS/risk gets ticks)
@@ -6042,6 +6194,12 @@ class TradeManager {
       return;
     }
 
+    const cbState = this._checkCircuitBreakers();
+    if (!cbState.ok) {
+      logger.warn({ token, cbState }, "[trade] blocked (circuit breaker)");
+      return;
+    }
+
     if (this.risk.getKillSwitch()) {
       logger.warn("[trade] blocked (kill switch)");
       return;
@@ -6072,12 +6230,31 @@ class TradeManager {
     const conf = Number(s.confidence);
     if (Number.isFinite(minConf) && minConf > 0 && Number.isFinite(conf)) {
       if (conf < minConf) {
+        telemetry.recordDecision({
+          signal: s,
+          token,
+          outcome: "IDEA_SIGNAL",
+          stage: "gate",
+          reason: "LOW_CONFIDENCE",
+          meta: { conf, minConf },
+        });
         logger.info(
           { token: s.instrument_token, conf, minConf },
           "[trade] blocked (low confidence)",
         );
         return;
       }
+    }
+
+    if (Boolean(env.EXECUTABLE_SIGNAL_GATE_ENABLED ?? true)) {
+      telemetry.recordDecision({
+        signal: s,
+        token,
+        outcome: "EXECUTABLE_SIGNAL",
+        stage: "gate",
+        reason: "PASS",
+        meta: { conf, minConf, regime: s.regime, side: s.side },
+      });
     }
     const instrument = await ensureInstrument(this.kite, token);
 
@@ -6130,6 +6307,9 @@ class TradeManager {
         : Number(policy?.maxSpreadBps ?? env.MAX_SPREAD_BPS ?? 15),
     });
     if (!sp.ok) {
+      if (String(sp.reason || "").toUpperCase().includes("SPREAD")) {
+        this._pushCircuitEvent("spreadSpikes");
+      }
       logger.info(
         { token, reason: sp.reason, meta: sp.meta },
         "[trade] blocked (spread)",
@@ -6639,6 +6819,14 @@ class TradeManager {
       entryPrice: entryGuess,
       stopLoss,
       riskInr: _riskInrOverride,
+      lotSize: Number(instrument.lot_size || 1),
+      expectedSlippagePts: Number(
+        env.EXPECTED_SLIPPAGE_POINTS ||
+          (Number(quoteAtEntry?.bps || 0) > 0 && Number(entryGuess) > 0
+            ? (Number(quoteAtEntry.bps) / 10000) * Number(entryGuess)
+            : 0),
+      ),
+      feePerLotInr: Number(env.EXPECTED_FEES_PER_LOT_INR || 0),
     });
 
     // If you want sizing purely from available margin, set:
@@ -7082,6 +7270,19 @@ class TradeManager {
     }
 
     // Pro: if LIMIT entry is not filled quickly, fallback to MARKET (options only)
+    if (entryOrderType === "LIMIT") {
+      this._startEntryLadder({
+        tradeId,
+        entryOrderId,
+        instrument,
+        side,
+        basePrice: Number(entryParams.price || expectedEntryPrice || entryGuess),
+      }).catch((e) => {
+        logger.warn({ tradeId, e: e?.message || String(e) }, "[entry_ladder] failed");
+      });
+    }
+
+    // Pro: if LIMIT entry is not filled quickly, fallback to MARKET (options only)
     if (
       isOptContract &&
       entryOrderType === "LIMIT" &&
@@ -7132,6 +7333,7 @@ class TradeManager {
 
     const hit = await findTradeByOrder(orderId);
     const status = String(order.status || "").toUpperCase();
+    if (status === "REJECTED") this._pushCircuitEvent("rejects");
     try {
       await appendOrderLog({
         order_id: orderId,
