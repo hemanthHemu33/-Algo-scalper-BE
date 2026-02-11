@@ -724,12 +724,6 @@ async function pickOptionContractForSignal({
   const ivNeutralPts = Number(env.OPT_IV_NEUTRAL_PTS ?? 20);
 
   const oiWallBlock = Boolean(env.OPT_OI_WALL_BLOCK ?? true);
-  const oiContext = computeOiWallContext({
-    rows: chain?.snapshot?.rows || [],
-    optType,
-    desiredStrike,
-    step,
-  });
 
   const weights = parseWeights(env.OPT_PICK_SCORE_WEIGHTS);
 
@@ -782,6 +776,13 @@ async function pickOptionContractForSignal({
           deltaMax,
         })
       : baseDesiredStrike;
+
+  const oiContext = computeOiWallContext({
+    rows: chain?.snapshot?.rows || [],
+    optType,
+    desiredStrike,
+    step,
+  });
 
   // Optional debug payload (kept OFF by default)
   // Helps you see why a specific option was picked (top N candidates).
