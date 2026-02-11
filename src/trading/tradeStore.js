@@ -57,9 +57,25 @@ async function updateTrade(tradeId, patch) {
       const current = await db.collection(TRADES).findOne({ tradeId });
       const fromStatus = current?.status || null;
       const toStatus = normalizeTradeStatus(update.status);
+
+      // Broker order postbacks can arrive out of order.
+      // Ignore late ENTRY_FILLED updates once a trade already has SL/LIVE state.
+      const staleEntryFill =
+        toStatus === "ENTRY_FILLED" &&
+        ["SL_PLACED", "SL_OPEN", "SL_CONFIRMED", "LIVE"].includes(
+          normalizeTradeStatus(fromStatus),
+        );
+      if (staleEntryFill) {
+        logger.info(
+          { tradeId, fromStatus, toStatus },
+          "[trade] stale ENTRY_FILLED transition ignored",
+        );
+        delete update.status;
+      }
+
       const validation = canTransition(fromStatus, toStatus);
 
-      if (!validation.ok) {
+      if (!staleEntryFill && !validation.ok) {
         logger.error(
           { tradeId, fromStatus, toStatus, reason: validation.reason },
           "[trade] invalid status transition blocked",
@@ -71,7 +87,7 @@ async function updateTrade(tradeId, patch) {
           reason: validation.reason,
           ts: new Date(),
         };
-      } else {
+      } else if (!staleEntryFill) {
         update.status = toStatus;
       }
     } catch (e) {
