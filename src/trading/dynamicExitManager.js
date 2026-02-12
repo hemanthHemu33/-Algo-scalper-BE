@@ -213,6 +213,10 @@ function applyMinGreenExitRules({
     };
   }
 
+  let beLockHit = false;
+  let trailHit = false;
+  const skipReasons = [];
+
   const beLockAt = Number(env.BE_LOCK_AT_PROFIT_INR || 0);
   if (
     Number.isFinite(beLockAt) &&
@@ -223,6 +227,7 @@ function applyMinGreenExitRules({
     const desired = side === "BUY" ? entry + minGreenPts : entry - minGreenPts;
     if (side === "BUY") newSL = Math.max(newSL, desired);
     else newSL = Math.min(newSL, desired);
+    beLockHit = true;
     if (!trade?.beLocked) {
       tradePatch.beLocked = true;
       tradePatch.beLockedAt = new Date(now);
@@ -251,6 +256,7 @@ function applyMinGreenExitRules({
     trailGap > 0 &&
     Number.isFinite(ltp)
   ) {
+    trailHit = true;
     const prevPeak = Number(trade?.peakLtp || NaN);
     let peakLtp = prevPeak;
     if (side === "BUY") {
@@ -323,6 +329,27 @@ function applyMinGreenExitRules({
   const slMove = side === "BUY" ? newSL - curSL : curSL - newSL;
   const shouldMoveSL = Number.isFinite(slMove) && slMove >= step;
 
+  if (!beLockHit) {
+    if (!(Number.isFinite(beLockAt) && beLockAt > 0)) skipReasons.push("be_lock_disabled");
+    else if (!(pnlInr >= beLockAt))
+      skipReasons.push(`pnlInr=${Number(pnlInr || 0).toFixed(2)} < beLockAt=${beLockAt}`);
+  }
+
+  if (!trailHit) {
+    if (!(Number.isFinite(trailGap) && trailGap > 0)) skipReasons.push("trail_gap_disabled");
+    else if (!allowTrail) {
+      const thresholdText =
+        Number.isFinite(trailStartInr) && trailStartInr > 0
+          ? `pnlInr=${Number(pnlInr || 0).toFixed(2)} < trailStartInr=${trailStartInr}`
+          : "trail_not_armed";
+      skipReasons.push(thresholdText);
+    }
+  }
+
+  if (!shouldMoveSL) {
+    skipReasons.push(`sl_move_below_step (move=${Number(slMove || 0).toFixed(2)}, step=${Number(step || 0).toFixed(2)})`);
+  }
+
   return {
     ...basePlan,
     ok: true,
@@ -338,6 +365,10 @@ function applyMinGreenExitRules({
       trailAfterBe,
       trailStartInr: Number.isFinite(trailStartInr) ? trailStartInr : null,
       allowTrail,
+      beLockHit,
+      trailHit,
+      peakLtp: Number(tradePatch?.peakLtp ?? trade?.peakLtp),
+      skipReason: skipReasons.join(" | ") || null,
       holdMin,
       allowWiden,
       widenMult: Number.isFinite(widenMult) ? widenMult : null,
