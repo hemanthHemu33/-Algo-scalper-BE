@@ -107,6 +107,19 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function parseOrderTimestampMs(order) {
+  const raw =
+    order?.order_timestamp ||
+    order?.exchange_timestamp ||
+    order?.exchange_update_timestamp ||
+    order?.created_at ||
+    order?.updated_at ||
+    null;
+  if (!raw) return null;
+  const ms = new Date(raw).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
 function worseSlippageBps({ side, expected, actual, leg }) {
   const exp = Number(expected);
   const act = Number(actual);
@@ -181,6 +194,8 @@ class TradeManager {
     // Throttle expensive DB-based checks (avoid per-tick Mongo hammering)
     this._lastDailyLossCheckAt = 0;
     this._lastFlattenCheckAt = 0;
+    this._lastEodConvertCheckAt = 0;
+    this._eodConvertAttempted = new Set();
 
     // Optional fallback LTP fetch throttle (helps OPT mode when ticks are sparse)
     this._lastLtpFetchAtByToken = new Map(); // token -> ts
@@ -2253,6 +2268,7 @@ class TradeManager {
         qty: remainingQty,
         reason: `${reason || "PANIC_EXIT"}_TIMEOUT_REPLACE`,
         marketError: "PANIC_EXIT_TIMEOUT",
+        product: this._activeTradeProduct(fresh),
       });
 
       const newOrderId = fb?.orderId || null;
@@ -2602,8 +2618,101 @@ class TradeManager {
     }
   }
 
+  _activeTradeProduct(trade) {
+    const product = String(trade?.product || env.DEFAULT_PRODUCT || "MIS").toUpperCase();
+    return product || "MIS";
+  }
+
+  async _maybeConvertMisToNrmlIfNeeded() {
+    if (!this.activeTradeId) return;
+    if (!env.EOD_MIS_TO_NRML_ENABLED) return;
+    if (!env.EOD_CARRY_ALLOWED) return;
+    if (!this.kite || typeof this.kite.convertPosition !== "function") return;
+
+    const tz = env.CANDLE_TZ || "Asia/Kolkata";
+    const now = DateTime.now().setZone(tz);
+    const convertAt = DateTime.fromFormat(env.EOD_MIS_TO_NRML_AT || "15:18", "HH:mm", {
+      zone: tz,
+    });
+    if (!convertAt.isValid) return;
+
+    const convertToday = now.set({
+      hour: convertAt.hour,
+      minute: convertAt.minute,
+      second: 0,
+      millisecond: 0,
+    });
+    if (now < convertToday) return;
+
+    const trade = await getTrade(this.activeTradeId);
+    if (!trade) return;
+    const tradeId = String(trade.tradeId || "");
+    if (!tradeId) return;
+    if (this._eodConvertAttempted.has(tradeId)) return;
+
+    if (
+      ![STATUS.ENTRY_OPEN, STATUS.ENTRY_FILLED, STATUS.LIVE, STATUS.GUARD_FAILED].includes(
+        trade.status,
+      )
+    ) {
+      return;
+    }
+
+    const product = this._activeTradeProduct(trade);
+    if (product !== "MIS") {
+      this._eodConvertAttempted.add(tradeId);
+      return;
+    }
+
+    const qty = Math.abs(Number(trade.qty || 0));
+    if (!Number.isFinite(qty) || qty < 1) return;
+
+    const side = String(trade.side || "").toUpperCase();
+    const transactionType = side === "SELL" ? "SELL" : "BUY";
+
+    try {
+      await this.kite.convertPosition({
+        exchange: trade.instrument?.exchange,
+        tradingsymbol: trade.instrument?.tradingsymbol,
+        transaction_type: transactionType,
+        position_type: "DAY",
+        quantity: qty,
+        old_product: "MIS",
+        new_product: "NRML",
+      });
+
+      this._eodConvertAttempted.add(tradeId);
+      await updateTrade(tradeId, {
+        product: "NRML",
+        eodCarryConvertedAt: new Date(),
+      });
+
+      logger.warn(
+        { tradeId, qty, transactionType },
+        "[time_guard] EOD MIS->NRML conversion successful",
+      );
+      alert("warn", "⏰ EOD carry conversion done (MIS → NRML)", {
+        tradeId,
+        qty,
+      }).catch(() => {});
+    } catch (e) {
+      this._eodConvertAttempted.add(tradeId);
+      logger.error(
+        { tradeId, e: e?.message || String(e) },
+        "[time_guard] EOD MIS->NRML conversion failed",
+      );
+      alert("error", "🛑 EOD MIS → NRML conversion failed", {
+        tradeId,
+        message: e?.message || String(e),
+      }).catch(() => {});
+    }
+  }
+
   async _forceFlattenIfNeeded() {
     if (!this.activeTradeId) return;
+
+    await this._maybeConvertMisToNrmlIfNeeded();
+
     if (this.risk.getKillSwitch()) return;
 
     const tz = env.CANDLE_TZ || "Asia/Kolkata";
@@ -2643,7 +2752,7 @@ class TradeManager {
       reason: "FORCE_FLATTEN",
       lastTradeId: trade.tradeId,
     });
-    await this._panicExit(trade, "FORCE_FLATTEN");
+    await this._panicExit({ ...trade, product: this._activeTradeProduct(trade) }, "FORCE_FLATTEN");
   }
 
   _scheduleReconcile(reason = "order_update") {
@@ -3410,6 +3519,80 @@ class TradeManager {
     }
   }
 
+  async _matchUnlinkedBrokerExit(order) {
+    const status = String(order?.status || "").toUpperCase();
+    if (status !== "COMPLETE") return null;
+
+    const symbol = String(order?.tradingsymbol || "").toUpperCase();
+    const txnType = String(order?.transaction_type || "").toUpperCase();
+    const qty = Math.abs(Number(order?.filled_quantity || order?.quantity || 0));
+    if (!symbol || !txnType || !(qty > 0)) return null;
+
+    const ms = parseOrderTimestampMs(order) || Date.now();
+    const winMs = Math.max(
+      15_000,
+      Number(env.RECONCILE_BROKER_SQOFF_MATCH_WINDOW_SEC || 300) * 1000,
+    );
+
+    const actives = await getActiveTrades();
+    let best = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (const t of actives || []) {
+      const tSymbol = String(t?.instrument?.tradingsymbol || "").toUpperCase();
+      const tQty = Math.abs(Number(t?.qty || 0));
+      const tExitSide = String(t?.side || "").toUpperCase() === "BUY" ? "SELL" : "BUY";
+      const tStatus = String(t?.status || "").toUpperCase();
+      if (!symbol || symbol !== tSymbol) continue;
+      if (tQty !== qty) continue;
+      if (txnType !== tExitSide) continue;
+      if (![STATUS.ENTRY_FILLED, STATUS.LIVE, STATUS.GUARD_FAILED].includes(tStatus)) continue;
+
+      const touchMs =
+        parseOrderTimestampMs(t) ||
+        new Date(t?.slOrderStatusUpdatedAt || t?.updatedAt || t?.createdAt || Date.now()).getTime();
+      const delta = Math.abs(ms - touchMs);
+      if (!Number.isFinite(delta) || delta > winMs) continue;
+      if (delta < bestScore) {
+        bestScore = delta;
+        best = t;
+      }
+    }
+
+    return best;
+  }
+
+  async _closeByBrokerSquareoff(trade, order, reason = "BROKER_SQUAREOFF") {
+    if (!trade?.tradeId) return false;
+
+    const tradeId = String(trade.tradeId);
+    const exitPrice = Number(order?.average_price || order?.price || trade?.exitPrice || 0);
+    await updateTrade(tradeId, {
+      status: STATUS.CLOSED,
+      exitPrice: exitPrice > 0 ? exitPrice : trade?.exitPrice,
+      closeReason: reason,
+      exitReason: reason,
+      brokerSquareoffOrderId: String(order?.order_id || "") || null,
+      brokerSquareoffAt: new Date(),
+      closedAt: new Date(),
+    });
+
+    logger.warn(
+      {
+        tradeId,
+        reason,
+        orderId: String(order?.order_id || ""),
+        symbol: order?.tradingsymbol,
+        qty: order?.filled_quantity || order?.quantity,
+      },
+      "[reconcile] broker square-off matched and trade closed",
+    );
+
+    await this._bookRealizedPnl(tradeId);
+    await this._finalizeClosed(tradeId, trade.instrument_token);
+    return true;
+  }
+
   async _panicExit(trade, reason, opts = {}) {
     const tradeId = trade?.tradeId;
     try {
@@ -3494,6 +3677,7 @@ class TradeManager {
       const instrument = fresh.instrument;
       const exitSide = netQty > 0 ? "SELL" : "BUY";
       const qty = Math.abs(netQty);
+      const exitProduct = this._activeTradeProduct(fresh);
 
       logger.warn(
         { tradeId, reason, exitSide, qty },
@@ -3513,7 +3697,7 @@ class TradeManager {
             tradingsymbol: instrument.tradingsymbol,
             transaction_type: exitSide,
             quantity: qty,
-            product: env.DEFAULT_PRODUCT,
+            product: exitProduct,
             order_type: "MARKET",
             validity: "DAY",
             tag: makeTag(tradeId, "PANIC_EXIT"),
@@ -3540,6 +3724,7 @@ class TradeManager {
               qty,
               reason,
               marketError: msg,
+              product: exitProduct,
             });
             exitOrderId = fb?.orderId || null;
           } catch (e2) {
@@ -3587,6 +3772,7 @@ class TradeManager {
     qty,
     reason,
     marketError,
+    product = null,
   }) {
     if (!this.kite || typeof this.kite.getQuote !== "function") {
       throw new Error("no_getQuote_for_panic_fallback");
@@ -3665,7 +3851,7 @@ class TradeManager {
         tradingsymbol: instrument.tradingsymbol,
         transaction_type: exitSide,
         quantity: qty,
-        product: env.DEFAULT_PRODUCT,
+        product: String(product || env.DEFAULT_PRODUCT || "MIS").toUpperCase(),
         order_type: "LIMIT",
         price,
         validity: "DAY",
@@ -4504,6 +4690,18 @@ class TradeManager {
         underlyingLtp: Number.isFinite(underlyingLtp) ? underlyingLtp : null,
       });
       if (!plan?.ok) return;
+
+      logger.info(
+        {
+          tradeId,
+          pnlInr: plan?.meta?.pnlInr ?? null,
+          peakLtp: plan?.meta?.peakLtp ?? tradeForPlan?.peakLtp ?? null,
+          beLockHit: Boolean(plan?.meta?.beLockHit),
+          trailHit: Boolean(plan?.meta?.trailHit),
+          skipReason: plan?.meta?.skipReason || null,
+        },
+        "[dyn_exit] eval",
+      );
 
       if (plan?.action?.exitNow) {
         if (plan?.tradePatch && Object.keys(plan.tradePatch).length) {
@@ -7363,6 +7561,7 @@ class TradeManager {
       exitPrice: null,
       closeReason: null,
       targetReplaceCount: 0,
+      product: String(env.DEFAULT_PRODUCT || "MIS").toUpperCase(),
     };
 
     await insertTrade(trade);
@@ -7497,6 +7696,30 @@ class TradeManager {
       });
     } catch {}
     if (!hit) {
+      if (status === "COMPLETE") {
+        try {
+          const matched = await this._matchUnlinkedBrokerExit(order);
+          if (matched?.tradeId) {
+            await linkOrder({
+              order_id: orderId,
+              tradeId: matched.tradeId,
+              role: "BROKER_SQUAREOFF",
+            });
+            await this._closeByBrokerSquareoff(
+              matched,
+              order,
+              "BROKER_SQUAREOFF",
+            );
+            return;
+          }
+        } catch (e) {
+          logger.warn(
+            { orderId, e: e?.message || String(e) },
+            "[order_update] unlinked complete match failed",
+          );
+        }
+      }
+
       // Early order_update race: store and replay after link exists.
       await saveOrphanOrderUpdate({ order_id: orderId, payload: order });
       logger.warn(
@@ -7530,6 +7753,13 @@ class TradeManager {
       },
       "[order_update]",
     );
+
+    if (link.role === "BROKER_SQUAREOFF") {
+      if (status === "COMPLETE") {
+        await this._closeByBrokerSquareoff(trade, order, "BROKER_SQUAREOFF");
+      }
+      return;
+    }
 
     // ✅ FIXED: PANIC_EXIT must not reference undefined variables and must not finalize on dead status
     if (link.role === "PANIC_EXIT") {
