@@ -576,8 +576,13 @@ const schema = z.object({
 
   // Trading window (MIS safe)
   AUTO_FIX_TIME_WINDOWS: z.string().default("false"),
-  STOP_NEW_ENTRIES_AFTER: z.string().default("15:00"), // HH:mm in CANDLE_TZ
-  FORCE_FLATTEN_AT: z.string().default("15:15"), // HH:mm in CANDLE_TZ
+  STOP_NEW_ENTRIES_AFTER: z.string().default("15:10"), // HH:mm in CANDLE_TZ
+  FORCE_FLATTEN_AT: z.string().default("15:20"), // HH:mm in CANDLE_TZ
+  EOD_MIS_TO_NRML_ENABLED: z.coerce.boolean().default(true),
+  EOD_MIS_TO_NRML_AT: z.string().default("15:18"), // HH:mm in CANDLE_TZ (must be < FORCE_FLATTEN_AT)
+  EOD_CARRY_ALLOWED: z.coerce.boolean().default(false),
+  EOD_MIS_TO_NRML_RETRY_COOLDOWN_MS: z.coerce.number().default(15000),
+  RECONCILE_BROKER_SQOFF_MATCH_WINDOW_SEC: z.coerce.number().default(300),
 
   // Additional no-trade windows: comma-separated "HH:mm-HH:mm" ranges
   // Example: "09:15-09:25,15:20-15:30"
@@ -1166,7 +1171,17 @@ function toHHmm(totalMin) {
     } else {
       // Fail-fast: never start trading with unsafe windows.
       throw new Error(
-        `${msg} Fix your .env (recommended: STOP_NEW_ENTRIES_AFTER=15:00, FORCE_FLATTEN_AT=15:15)`,
+        `${msg} Fix your .env (recommended: STOP_NEW_ENTRIES_AFTER=15:10, FORCE_FLATTEN_AT=15:20)`,
+      );
+    }
+  }
+
+  const convertEnabled = env.EOD_MIS_TO_NRML_ENABLED !== false;
+  if (convertEnabled) {
+    const convertMin = parseHHmm(env.EOD_MIS_TO_NRML_AT, "EOD_MIS_TO_NRML_AT");
+    if (convertMin >= flattenMin) {
+      throw new Error(
+        `[config] EOD_MIS_TO_NRML_AT (${env.EOD_MIS_TO_NRML_AT}) must be earlier than FORCE_FLATTEN_AT (${env.FORCE_FLATTEN_AT}).`,
       );
     }
   }
