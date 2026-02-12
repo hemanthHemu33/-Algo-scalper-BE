@@ -53,6 +53,7 @@ const {
   normalizeActiveTrade,
   normalizeTradeRow,
 } = require("./trading/tradeNormalization");
+const { STATUS } = require("./trading/tradeStateMachine");
 
 function buildAdminAuth() {
   const expected = env.ADMIN_API_KEY;
@@ -845,6 +846,91 @@ function buildApp() {
       res.status(503).json({ ok: false, error: e.message });
     }
   });
+
+  // Startup/restart guardrail:
+  // quickly detect any trades still carrying pre-state-machine / unknown statuses.
+  app.get(
+    "/admin/trades/legacy-statuses",
+    requirePerm("read"),
+    async (req, res) => {
+      try {
+        const limitRaw = Number(req.query.limit || 200);
+        const limit = Number.isFinite(limitRaw)
+          ? Math.min(500, Math.max(1, limitRaw))
+          : 200;
+        const sinceHoursRaw = Number(req.query.sinceHours || 72);
+        const sinceHours = Number.isFinite(sinceHoursRaw)
+          ? Math.min(24 * 30, Math.max(1, sinceHoursRaw))
+          : 72;
+
+        const knownStatuses = Object.values(STATUS || {}).map((s) =>
+          String(s || "").toUpperCase(),
+        );
+        const knownSet = new Set(knownStatuses);
+        const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000);
+
+        const db = getDb();
+        const rows = await db
+          .collection("trades")
+          .find({
+            createdAt: { $gte: since },
+            status: { $exists: true, $ne: null },
+          })
+          .project({ tradeId: 1, status: 1, createdAt: 1, updatedAt: 1 })
+          .sort({ updatedAt: -1, createdAt: -1 })
+          .limit(limit)
+          .toArray();
+
+        const legacyRows = [];
+        const byStatus = new Map();
+
+        for (const row of rows) {
+          const normalized = String(row?.status || "").trim().toUpperCase();
+          if (!normalized || knownSet.has(normalized)) continue;
+
+          legacyRows.push({
+            tradeId: row?.tradeId || null,
+            status: row?.status || null,
+            normalizedStatus: normalized,
+            createdAt: row?.createdAt || null,
+            updatedAt: row?.updatedAt || null,
+          });
+
+          const prev = byStatus.get(normalized) || {
+            status: row?.status || normalized,
+            normalizedStatus: normalized,
+            count: 0,
+            latestUpdatedAt: null,
+          };
+          prev.count += 1;
+          if (!prev.latestUpdatedAt || row?.updatedAt > prev.latestUpdatedAt) {
+            prev.latestUpdatedAt = row?.updatedAt || null;
+          }
+          byStatus.set(normalized, prev);
+        }
+
+        const summary = Array.from(byStatus.values()).sort(
+          (a, b) => b.count - a.count,
+        );
+
+        res.json({
+          ok: true,
+          monitorWindow: {
+            since: since.toISOString(),
+            sinceHours,
+            scannedRows: rows.length,
+            scanLimit: limit,
+          },
+          hasLegacyStatuses: legacyRows.length > 0,
+          summary,
+          rows: legacyRows,
+          knownStatuses,
+        });
+      } catch (e) {
+        res.status(503).json({ ok: false, error: e?.message || String(e) });
+      }
+    },
+  );
 
   // Account / equity service
   app.get("/admin/account/equity", requirePerm("read"), async (req, res) => {
