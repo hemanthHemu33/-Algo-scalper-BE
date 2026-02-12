@@ -196,7 +196,6 @@ class TradeManager {
     this._lastFlattenCheckAt = 0;
     this._lastEodConvertCheckAt = 0;
     this._eodConvertAttempted = new Set();
-    this._eodConvertLastAttemptAt = new Map();
 
     // Optional fallback LTP fetch throttle (helps OPT mode when ticks are sparse)
     this._lastLtpFetchAtByToken = new Map(); // token -> ts
@@ -2630,13 +2629,8 @@ class TradeManager {
     if (!env.EOD_CARRY_ALLOWED) return;
     if (!this.kite || typeof this.kite.convertPosition !== "function") return;
 
-    const nowMs = Date.now();
-    const checkEveryMs = Math.max(500, Number(env.FORCE_FLATTEN_CHECK_MS || 1000));
-    if (nowMs - Number(this._lastEodConvertCheckAt || 0) < checkEveryMs) return;
-    this._lastEodConvertCheckAt = nowMs;
-
     const tz = env.CANDLE_TZ || "Asia/Kolkata";
-    const now = DateTime.fromMillis(nowMs).setZone(tz);
+    const now = DateTime.now().setZone(tz);
     const convertAt = DateTime.fromFormat(env.EOD_MIS_TO_NRML_AT || "15:18", "HH:mm", {
       zone: tz,
     });
@@ -2670,34 +2664,11 @@ class TradeManager {
       return;
     }
 
-    const retryCooldownMs = Math.max(1000, Number(env.EOD_MIS_TO_NRML_RETRY_COOLDOWN_MS || 15000));
-    const prevAttempt = Number(this._eodConvertLastAttemptAt.get(tradeId) || 0);
-    if (nowMs - prevAttempt < retryCooldownMs) return;
-    this._eodConvertLastAttemptAt.set(tradeId, nowMs);
+    const qty = Math.abs(Number(trade.qty || 0));
+    if (!Number.isFinite(qty) || qty < 1) return;
 
-    let netQty = Math.abs(Number(trade.qty || 0));
-    let transactionType = String(trade.side || "").toUpperCase() === "SELL" ? "SELL" : "BUY";
-
-    try {
-      if (typeof this.kite.getPositions === "function") {
-        const positions = await this.kite.getPositions();
-        const net = positions?.net || positions?.day || [];
-        const token = Number(trade.instrument_token);
-        const pos = Array.isArray(net)
-          ? net.find((x) => Number(x?.instrument_token) === token)
-          : null;
-        const q = Number(pos?.quantity ?? pos?.net_quantity ?? 0);
-        if (Number.isFinite(q) && q !== 0) {
-          netQty = Math.abs(q);
-          transactionType = q > 0 ? "BUY" : "SELL";
-        }
-      }
-    } catch {}
-
-    if (!Number.isFinite(netQty) || netQty < 1) {
-      this._eodConvertAttempted.add(tradeId);
-      return;
-    }
+    const side = String(trade.side || "").toUpperCase();
+    const transactionType = side === "SELL" ? "SELL" : "BUY";
 
     try {
       await this.kite.convertPosition({
@@ -2705,32 +2676,32 @@ class TradeManager {
         tradingsymbol: trade.instrument?.tradingsymbol,
         transaction_type: transactionType,
         position_type: "DAY",
-        quantity: netQty,
+        quantity: qty,
         old_product: "MIS",
         new_product: "NRML",
       });
 
       this._eodConvertAttempted.add(tradeId);
-      this._eodConvertLastAttemptAt.delete(tradeId);
       await updateTrade(tradeId, {
         product: "NRML",
         eodCarryConvertedAt: new Date(),
       });
 
       logger.warn(
-        { tradeId, qty: netQty, transactionType },
+        { tradeId, qty, transactionType },
         "[time_guard] EOD MIS->NRML conversion successful",
       );
       alert("warn", "⏰ EOD carry conversion done (MIS → NRML)", {
         tradeId,
-        qty: netQty,
+        qty,
       }).catch(() => {});
     } catch (e) {
+      this._eodConvertAttempted.add(tradeId);
       logger.error(
-        { tradeId, qty: netQty, transactionType, e: e?.message || String(e) },
-        "[time_guard] EOD MIS->NRML conversion failed (will retry)",
+        { tradeId, e: e?.message || String(e) },
+        "[time_guard] EOD MIS->NRML conversion failed",
       );
-      alert("error", "🛑 EOD MIS → NRML conversion failed (will retry)", {
+      alert("error", "🛑 EOD MIS → NRML conversion failed", {
         tradeId,
         message: e?.message || String(e),
       }).catch(() => {});
@@ -3595,32 +3566,10 @@ class TradeManager {
     if (!trade?.tradeId) return false;
 
     const tradeId = String(trade.tradeId);
-    const fresh = (await getTrade(tradeId)) || trade;
-    const terminal = [
-      STATUS.EXITED_TARGET,
-      STATUS.EXITED_SL,
-      STATUS.ENTRY_FAILED,
-      STATUS.ENTRY_CANCELLED,
-      STATUS.CLOSED,
-    ];
-    if (terminal.includes(String(fresh?.status || "").toUpperCase())) {
-      return false;
-    }
-
-    for (const oid of [fresh.slOrderId, fresh.targetOrderId, fresh.tp1OrderId, fresh.tp2OrderId].filter(Boolean)) {
-      try {
-        this.expectedCancelOrderIds.add(String(oid));
-        await this._safeCancelOrder(env.DEFAULT_ORDER_VARIETY, oid, {
-          purpose: "BROKER_SQOFF_CANCEL_REMAINING",
-          tradeId,
-        });
-      } catch {}
-    }
-
-    const exitPrice = Number(order?.average_price || order?.price || fresh?.exitPrice || 0);
+    const exitPrice = Number(order?.average_price || order?.price || trade?.exitPrice || 0);
     await updateTrade(tradeId, {
       status: STATUS.CLOSED,
-      exitPrice: exitPrice > 0 ? exitPrice : fresh?.exitPrice,
+      exitPrice: exitPrice > 0 ? exitPrice : trade?.exitPrice,
       closeReason: reason,
       exitReason: reason,
       brokerSquareoffOrderId: String(order?.order_id || "") || null,
@@ -3640,7 +3589,7 @@ class TradeManager {
     );
 
     await this._bookRealizedPnl(tradeId);
-    await this._finalizeClosed(tradeId, fresh.instrument_token);
+    await this._finalizeClosed(tradeId, trade.instrument_token);
     return true;
   }
 

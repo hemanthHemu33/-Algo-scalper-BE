@@ -581,7 +581,6 @@ const schema = z.object({
   EOD_MIS_TO_NRML_ENABLED: z.coerce.boolean().default(true),
   EOD_MIS_TO_NRML_AT: z.string().default("15:18"), // HH:mm in CANDLE_TZ (must be < FORCE_FLATTEN_AT)
   EOD_CARRY_ALLOWED: z.coerce.boolean().default(false),
-  EOD_MIS_TO_NRML_RETRY_COOLDOWN_MS: z.coerce.number().default(15000),
   RECONCILE_BROKER_SQOFF_MATCH_WINDOW_SEC: z.coerce.number().default(300),
 
   // Additional no-trade windows: comma-separated "HH:mm-HH:mm" ranges
