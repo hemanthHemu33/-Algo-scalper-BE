@@ -2717,7 +2717,7 @@ class TradeManager {
 
     const tz = env.CANDLE_TZ || "Asia/Kolkata";
     const now = DateTime.now().setZone(tz);
-    const flat = DateTime.fromFormat(env.FORCE_FLATTEN_AT || "15:15", "HH:mm", {
+    const flat = DateTime.fromFormat(env.FORCE_FLATTEN_AT || "15:20", "HH:mm", {
       zone: tz,
     });
     if (!flat.isValid) return;
@@ -2733,7 +2733,13 @@ class TradeManager {
     const trade = await getTrade(this.activeTradeId);
     if (!trade) return;
     if (
-      ![STATUS.ENTRY_OPEN, STATUS.ENTRY_FILLED, STATUS.LIVE].includes(
+      ![
+        STATUS.ENTRY_OPEN,
+        STATUS.ENTRY_FILLED,
+        STATUS.SL_PLACED,
+        STATUS.SL_CONFIRMED,
+        STATUS.LIVE,
+      ].includes(
         trade.status,
       )
     )
@@ -4603,7 +4609,16 @@ class TradeManager {
 
   async _maybeDynamicAdjustExits(trade, byId) {
     if (String(env.DYNAMIC_EXITS_ENABLED) !== "true") return;
-    if (!trade || trade.status !== STATUS.LIVE) return;
+    if (
+      !trade ||
+      ![
+        STATUS.ENTRY_FILLED,
+        STATUS.SL_PLACED,
+        STATUS.SL_CONFIRMED,
+        STATUS.LIVE,
+      ].includes(trade.status)
+    )
+      return;
     if (!trade.slOrderId && !trade.targetOrderId) return;
 
     const tradeId = trade.tradeId;
