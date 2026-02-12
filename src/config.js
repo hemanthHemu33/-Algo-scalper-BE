@@ -576,7 +576,7 @@ const schema = z.object({
 
   // Trading window (MIS safe)
   AUTO_FIX_TIME_WINDOWS: z.string().default("false"),
-  STOP_NEW_ENTRIES_AFTER: z.string().default("15:10"), // HH:mm in CANDLE_TZ
+  STOP_NEW_ENTRIES_AFTER: z.string().default("15:00"), // HH:mm in CANDLE_TZ
   FORCE_FLATTEN_AT: z.string().default("15:20"), // HH:mm in CANDLE_TZ
   EOD_MIS_TO_NRML_ENABLED: z.coerce.boolean().default(true),
   EOD_MIS_TO_NRML_AT: z.string().default("15:18"), // HH:mm in CANDLE_TZ (must be < FORCE_FLATTEN_AT)
@@ -1170,7 +1170,7 @@ function toHHmm(totalMin) {
     } else {
       // Fail-fast: never start trading with unsafe windows.
       throw new Error(
-        `${msg} Fix your .env (recommended: STOP_NEW_ENTRIES_AFTER=15:10, FORCE_FLATTEN_AT=15:20)`,
+        `${msg} Fix your .env (recommended: STOP_NEW_ENTRIES_AFTER=15:00, FORCE_FLATTEN_AT=15:20)`,
       );
     }
   }
