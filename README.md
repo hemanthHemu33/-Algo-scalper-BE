@@ -440,6 +440,12 @@ See [`RENDER_DEPLOY.md`](./RENDER_DEPLOY.md) for step-by-step Render setup, heal
    - `/health` returns 200
    - `/ready` returns 200 after ticker connects
    - Alerts (Telegram) are working
+   - No legacy trade statuses are present in first live-session checks:
+     ```bash
+     curl -H "x-api-key: $ADMIN_API_KEY" \
+       "http://localhost:4001/admin/trades/legacy-statuses?sinceHours=24&limit=300"
+     ```
+     (`hasLegacyStatuses=false` is expected)
 3. Enable trading during market hours only.
 4. Start with a **single symbol** and conservative risk.
 

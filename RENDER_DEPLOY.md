@@ -56,6 +56,12 @@ The bot will send alerts for:
    - `/ready` becomes ok after ticker connects
    - Telegram messages are received
 3. Turn on `TRADING_ENABLED=true` during market hours only.
-4. Start with 1 stock and small sizing.
+4. During the first live sessions (and before any restart), verify no legacy trade statuses are stuck:
+   ```bash
+   curl -H "x-api-key: $ADMIN_API_KEY" \
+     "http://localhost:4001/admin/trades/legacy-statuses?sinceHours=24&limit=300"
+   ```
+   Expect `hasLegacyStatuses=false`.
+5. Start with 1 stock and small sizing.
 
 > ⚠️ Render free tier can sleep. Use a plan that stays awake for real trading.
