@@ -59,6 +59,7 @@ const {
   findTradeByOrder,
   saveOrphanOrderUpdate,
   popOrphanOrderUpdates,
+  deadLetterOrphanOrderUpdates,
   appendOrderLog,
   upsertLiveOrderSnapshot,
   getLiveOrderSnapshotsByTradeIds,
@@ -107,6 +108,26 @@ function dayRange() {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function jitterMs(baseMs, jitterPct = 0) {
+  const base = Math.max(0, Number(baseMs || 0));
+  const pct = Math.max(0, Number(jitterPct || 0));
+  if (!(base > 0) || !(pct > 0)) return base;
+  const delta = base * pct;
+  return Math.max(0, Math.round(base - delta + Math.random() * delta * 2));
+}
+
+function percentile(values, p) {
+  if (!Array.isArray(values) || !values.length) return null;
+  const sorted = values
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v))
+    .sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const rank = Math.max(0, Math.min(1, Number(p || 0.95)));
+  const idx = Math.min(sorted.length - 1, Math.floor(rank * (sorted.length - 1)));
+  return sorted[idx];
 }
 
 function parseOrderTimestampMs(order) {
@@ -236,6 +257,38 @@ class TradeManager {
     this._dynExitInFlight = new Set(); // tradeId -> lock for dynamic exit
     this._dynExitFailBackoffUntil = new Map(); // tradeId -> ts backoff
     this._dynPeakLtpByTrade = new Map(); // tradeId -> peak ltp (tick-driven)
+    this._dynExitCadenceStats = {
+      attempts: 0,
+      skippedEvalThrottle: 0,
+      skippedModifyThrottle: 0,
+      skippedBackoff: 0,
+      skippedInFlight: 0,
+      evalRuns: 0,
+      evalNoPlan: 0,
+      modifyRuns: 0,
+      planExitNow: 0,
+      errors: 0,
+      burstWindowMs: 10_000,
+      evalTs: [],
+      modifyTs: [],
+      evalIntervalsMs: [],
+      modifyIntervalsMs: [],
+      maxEvalBurst: 0,
+      maxModifyBurst: 0,
+      lastEvalAt: null,
+      lastModifyAt: null,
+    };
+    this._orphanReplayStats = {
+      queued: 0,
+      replayedPayloads: 0,
+      retriesScheduled: 0,
+      retriesExhausted: 0,
+      deadLettered: 0,
+      popFailures: 0,
+      replayFailures: 0,
+      lastReplayAt: null,
+      lastDeadLetterAt: null,
+    };
     this._activeTradeToken = null;
     this._activeTradeSide = null;
 
@@ -3695,27 +3748,73 @@ class TradeManager {
       1,
       Number(env.ORPHAN_REPLAY_MAX_ATTEMPTS || 4),
     );
-    const delayMs = Math.max(0, Number(env.ORPHAN_REPLAY_DELAY_MS || 250));
+    const baseDelayMs = Math.max(0, Number(env.ORPHAN_REPLAY_DELAY_MS || 250));
+    const backoffFactor = Math.max(
+      1,
+      Number(env.ORPHAN_REPLAY_BACKOFF_FACTOR || 2),
+    );
+    const backoffMaxMs = Math.max(
+      baseDelayMs,
+      Number(env.ORPHAN_REPLAY_BACKOFF_MAX_MS || 10_000),
+    );
+    const jitterPct = Math.max(0, Number(env.ORPHAN_REPLAY_JITTER_PCT || 0.15));
 
     try {
       const linkCheck = await findTradeByOrder(oid);
       if (!linkCheck?.link) {
         if (attempt < maxAttempts) {
+          const rawBackoff = Math.min(
+            backoffMaxMs,
+            baseDelayMs * Math.pow(backoffFactor, Math.max(0, attempt)),
+          );
+          const delayMs = jitterMs(rawBackoff, jitterPct);
+          this._orphanReplayStats.retriesScheduled += 1;
           setTimeout(() => {
             this._replayOrphanUpdates(oid, { attempt: attempt + 1 }).catch(
               (e) => {
+                this._orphanReplayStats.replayFailures += 1;
                 logger.warn(
-                  { orderId: oid, e: e.message },
+                  { orderId: oid, attempt: attempt + 1, e: e.message },
                   "[orphan] replay retry failed",
                 );
               },
             );
           }, delayMs);
         } else {
-          logger.warn(
-            { orderId: oid },
-            "[orphan] replay skipped; link not ready",
-          );
+          this._orphanReplayStats.retriesExhausted += 1;
+          const dlqEnabled =
+            String(env.ORPHAN_REPLAY_DEAD_LETTER_ENABLED || "true") === "true";
+          if (dlqEnabled) {
+            try {
+              const moved = await deadLetterOrphanOrderUpdates({
+                order_id: oid,
+                reason: "LINK_NOT_READY_MAX_RETRIES",
+                meta: {
+                  attempt,
+                  maxAttempts,
+                  baseDelayMs,
+                  backoffFactor,
+                  backoffMaxMs,
+                },
+              });
+              this._orphanReplayStats.deadLettered += Number(moved?.moved || 0);
+              this._orphanReplayStats.lastDeadLetterAt = Date.now();
+              logger.warn(
+                { orderId: oid, moved: moved?.moved || 0, attempt, maxAttempts },
+                "[orphan] replay dead-lettered",
+              );
+            } catch (e) {
+              logger.warn(
+                { orderId: oid, e: e.message },
+                "[orphan] dead-letter move failed",
+              );
+            }
+          } else {
+            logger.warn(
+              { orderId: oid },
+              "[orphan] replay skipped; link not ready",
+            );
+          }
         }
         return;
       }
@@ -3725,6 +3824,8 @@ class TradeManager {
     try {
       const payloads = await popOrphanOrderUpdates(oid);
       if (!payloads.length) return;
+      this._orphanReplayStats.replayedPayloads += payloads.length;
+      this._orphanReplayStats.lastReplayAt = Date.now();
       logger.warn(
         { orderId: oid, count: payloads.length },
         "[order_update] replaying orphan updates",
@@ -3734,10 +3835,12 @@ class TradeManager {
         try {
           await this.onOrderUpdate(payload);
         } catch (e) {
+          this._orphanReplayStats.replayFailures += 1;
           logger.warn({ orderId: oid, e: e.message }, "[orphan] replay failed");
         }
       }
     } catch (e) {
+      this._orphanReplayStats.popFailures += 1;
       logger.warn({ orderId: oid, e: e.message }, "[orphan] pop failed");
     }
   }
@@ -4869,6 +4972,64 @@ class TradeManager {
     }
   }
 
+  _trackDynExitCadence(kind, ts = Date.now()) {
+    const st = this._dynExitCadenceStats;
+    const arr = kind === "modify" ? st.modifyTs : st.evalTs;
+    const iv = kind === "modify" ? st.modifyIntervalsMs : st.evalIntervalsMs;
+    const lastKey = kind === "modify" ? "lastModifyAt" : "lastEvalAt";
+
+    const prev = Number(st[lastKey] || 0);
+    if (prev > 0 && ts >= prev) iv.push(ts - prev);
+    st[lastKey] = ts;
+
+    arr.push(ts);
+    const cutoff = ts - st.burstWindowMs;
+    while (arr.length && arr[0] < cutoff) arr.shift();
+
+    if (kind === "modify") st.maxModifyBurst = Math.max(st.maxModifyBurst, arr.length);
+    else st.maxEvalBurst = Math.max(st.maxEvalBurst, arr.length);
+
+    const maxSamples = 200;
+    if (iv.length > maxSamples) iv.splice(0, iv.length - maxSamples);
+  }
+
+  _dynExitCadenceSnapshot() {
+    const st = this._dynExitCadenceStats;
+    return {
+      attempts: st.attempts,
+      evalRuns: st.evalRuns,
+      modifyRuns: st.modifyRuns,
+      planExitNow: st.planExitNow,
+      evalNoPlan: st.evalNoPlan,
+      errors: st.errors,
+      skipped: {
+        evalThrottle: st.skippedEvalThrottle,
+        modifyThrottle: st.skippedModifyThrottle,
+        backoff: st.skippedBackoff,
+        inFlight: st.skippedInFlight,
+      },
+      evalCadenceMs: {
+        p50: percentile(st.evalIntervalsMs, 0.5),
+        p95: percentile(st.evalIntervalsMs, 0.95),
+        samples: st.evalIntervalsMs.length,
+      },
+      modifyCadenceMs: {
+        p50: percentile(st.modifyIntervalsMs, 0.5),
+        p95: percentile(st.modifyIntervalsMs, 0.95),
+        samples: st.modifyIntervalsMs.length,
+      },
+      burst: {
+        windowMs: st.burstWindowMs,
+        evalCurrent: st.evalTs.length,
+        evalMax: st.maxEvalBurst,
+        modifyCurrent: st.modifyTs.length,
+        modifyMax: st.maxModifyBurst,
+      },
+      lastEvalAt: st.lastEvalAt,
+      lastModifyAt: st.lastModifyAt,
+    };
+  }
+
   async _maybeDynamicAdjustExits(trade, byId) {
     if (String(env.DYNAMIC_EXITS_ENABLED) !== "true") return;
     if (
@@ -4884,6 +5045,7 @@ class TradeManager {
     if (!trade.slOrderId && !trade.targetOrderId) return;
 
     const tradeId = trade.tradeId;
+    this._dynExitCadenceStats.attempts += 1;
     const scaleOutEnabled = this._scaleOutEligible(trade);
     const keepTp2Resting =
       scaleOutEnabled &&
@@ -4905,14 +5067,23 @@ class TradeManager {
     const now = Date.now();
     const lastEval = Number(this._dynExitLastEvalAt.get(tradeId) || 0);
     const lastModify = Number(this._dynExitLastAt.get(tradeId) || 0);
-    if (now - lastEval < minMs) return;
+    if (now - lastEval < minMs) {
+      this._dynExitCadenceStats.skippedEvalThrottle += 1;
+      return;
+    }
 
     const backoffUntil = Number(
       this._dynExitFailBackoffUntil.get(tradeId) || 0,
     );
-    if (Number.isFinite(backoffUntil) && now < backoffUntil) return;
+    if (Number.isFinite(backoffUntil) && now < backoffUntil) {
+      this._dynExitCadenceStats.skippedBackoff += 1;
+      return;
+    }
 
-    if (this._dynExitInFlight.has(tradeId)) return;
+    if (this._dynExitInFlight.has(tradeId)) {
+      this._dynExitCadenceStats.skippedInFlight += 1;
+      return;
+    }
     this._dynExitInFlight.add(tradeId);
 
     try {
@@ -4966,7 +5137,12 @@ class TradeManager {
         env,
         underlyingLtp: Number.isFinite(underlyingLtp) ? underlyingLtp : null,
       });
-      if (!plan?.ok) return;
+      if (!plan?.ok) {
+        this._dynExitCadenceStats.evalNoPlan += 1;
+        return;
+      }
+      this._dynExitCadenceStats.evalRuns += 1;
+      this._trackDynExitCadence("eval", now);
 
       logger.info(
         {
@@ -4981,6 +5157,7 @@ class TradeManager {
       );
 
       if (plan?.action?.exitNow) {
+        this._dynExitCadenceStats.planExitNow += 1;
         if (plan?.tradePatch && Object.keys(plan.tradePatch).length) {
           const patch = { ...plan.tradePatch };
           if (plan.action.reason === "TIME_STOP") {
@@ -5071,7 +5248,10 @@ class TradeManager {
 
         // Only modify while it's pending (OPEN means it likely triggered already).
         if (slStatus === "TRIGGER PENDING") {
-          if (now - lastModify < minModifyMs) return;
+          if (now - lastModify < minModifyMs) {
+            this._dynExitCadenceStats.skippedModifyThrottle += 1;
+            return;
+          }
           const slSide = trade.side === "BUY" ? "SELL" : "BUY";
 
           const patch = { trigger_price: plan.sl.stopLoss };
@@ -5244,7 +5424,10 @@ class TradeManager {
         const tgtType = String(tgt?.order_type || "").toUpperCase();
         // Only modify an open LIMIT target (market targets can't be modified meaningfully)
         if (tgtStatus === "OPEN" && (tgtType === "LIMIT" || tgtType === "LM")) {
-          if (now - lastModify < minModifyMs) return;
+          if (now - lastModify < minModifyMs) {
+            this._dynExitCadenceStats.skippedModifyThrottle += 1;
+            return;
+          }
           try {
             await this._safeModifyOrder(
               env.DEFAULT_ORDER_VARIETY,
@@ -5293,8 +5476,14 @@ class TradeManager {
       }
 
       if (did) {
-        this._dynExitLastAt.set(tradeId, Date.now());
+        const modifiedAt = Date.now();
+        this._dynExitLastAt.set(tradeId, modifiedAt);
+        this._dynExitCadenceStats.modifyRuns += 1;
+        this._trackDynExitCadence("modify", modifiedAt);
       }
+    } catch (e) {
+      this._dynExitCadenceStats.errors += 1;
+      throw e;
     } finally {
       this._dynExitInFlight.delete(tradeId);
       this._dynExitLastEvalAt.set(tradeId, Date.now());
@@ -8029,6 +8218,7 @@ class TradeManager {
 
       // Early order_update race: store and replay after link exists.
       await saveOrphanOrderUpdate({ order_id: orderId, payload: order });
+      this._orphanReplayStats.queued += 1;
       logger.warn(
         { orderId, status: order.status },
         "[order_update] orphan stored (no link yet)",
@@ -10882,6 +11072,8 @@ class TradeManager {
       dailyRiskState: risk?.state || "RUNNING",
       dailyRiskReason: risk?.stateReason || null,
       ordersPlacedToday: this.ordersPlacedToday,
+      dynamicExitCadence: this._dynExitCadenceSnapshot(),
+      orphanReplay: { ...this._orphanReplayStats },
     };
   }
 }
