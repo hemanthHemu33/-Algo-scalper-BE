@@ -618,6 +618,10 @@ const schema = z.object({
   // Orphan order-update replay
   ORPHAN_REPLAY_DELAY_MS: z.coerce.number().default(250),
   ORPHAN_REPLAY_MAX_ATTEMPTS: z.coerce.number().default(4),
+  ORPHAN_REPLAY_BACKOFF_FACTOR: z.coerce.number().default(2),
+  ORPHAN_REPLAY_BACKOFF_MAX_MS: z.coerce.number().default(10_000),
+  ORPHAN_REPLAY_JITTER_PCT: z.coerce.number().default(0.15),
+  ORPHAN_REPLAY_DEAD_LETTER_ENABLED: z.coerce.boolean().default(true),
 
   // SL fill watchdog: protects SL-L (stoploss-limit) from staying OPEN after trigger in fast moves.
   SL_WATCHDOG_ENABLED: z.coerce.boolean().default(true),

@@ -182,6 +182,10 @@ function buildApp() {
       const ticker = getTickerStatus?.() || {};
       const mh = marketHealth.snapshot?.({}) || { totals: {} };
       const sig = telemetry.snapshot ? telemetry.snapshot() : {};
+      const pipeline = getPipeline?.();
+      const tradeStatus = pipeline?.status ? await pipeline.status() : {};
+      const dyn = tradeStatus?.dynamicExitCadence || {};
+      const orphan = tradeStatus?.orphanReplay || {};
       const lines = [
         "# TYPE engine_ticker_connected gauge",
         `engine_ticker_connected ${ticker.connected ? 1 : 0}`,
@@ -195,6 +199,24 @@ function buildApp() {
         `engine_signals_total ${Number(sig?.counts?.total || 0)}`,
         "# TYPE engine_signals_accepted_total counter",
         `engine_signals_accepted_total ${Number(sig?.counts?.accepted || 0)}`,
+        "# TYPE engine_dynamic_exit_eval_runs_total counter",
+        `engine_dynamic_exit_eval_runs_total ${Number(dyn?.evalRuns || 0)}`,
+        "# TYPE engine_dynamic_exit_modify_runs_total counter",
+        `engine_dynamic_exit_modify_runs_total ${Number(dyn?.modifyRuns || 0)}`,
+        "# TYPE engine_dynamic_exit_skipped_eval_throttle_total counter",
+        `engine_dynamic_exit_skipped_eval_throttle_total ${Number(dyn?.skipped?.evalThrottle || 0)}`,
+        "# TYPE engine_dynamic_exit_skipped_modify_throttle_total counter",
+        `engine_dynamic_exit_skipped_modify_throttle_total ${Number(dyn?.skipped?.modifyThrottle || 0)}`,
+        "# TYPE engine_dynamic_exit_eval_cadence_p95_ms gauge",
+        `engine_dynamic_exit_eval_cadence_p95_ms ${Number(dyn?.evalCadenceMs?.p95 || 0)}`,
+        "# TYPE engine_dynamic_exit_modify_cadence_p95_ms gauge",
+        `engine_dynamic_exit_modify_cadence_p95_ms ${Number(dyn?.modifyCadenceMs?.p95 || 0)}`,
+        "# TYPE engine_dynamic_exit_eval_burst_max gauge",
+        `engine_dynamic_exit_eval_burst_max ${Number(dyn?.burst?.evalMax || 0)}`,
+        "# TYPE engine_orphan_replay_retries_scheduled_total counter",
+        `engine_orphan_replay_retries_scheduled_total ${Number(orphan?.retriesScheduled || 0)}`,
+        "# TYPE engine_orphan_replay_dead_lettered_total counter",
+        `engine_orphan_replay_dead_lettered_total ${Number(orphan?.deadLettered || 0)}`,
       ];
       res.set("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
       return res.send(lines.join("\n") + "\n");

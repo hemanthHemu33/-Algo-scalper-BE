@@ -7,6 +7,7 @@ const ORDER_LINKS = "order_links";
 const DAILY_RISK = "daily_risk";
 const RISK_STATE = "risk_state";
 const ORPHAN_ORDER_UPDATES = "orphan_order_updates";
+const ORPHAN_ORDER_UPDATES_DLQ = "orphan_order_updates_dlq";
 const ORDER_LOGS = "order_logs";
 const LIVE_ORDER_SNAPSHOTS = "live_order_snapshots";
 // Patch-6: cost calibration & reconciliations (post-trade cost model tuning)
@@ -44,6 +45,12 @@ async function ensureTradeIndexes() {
   await db
     .collection(ORPHAN_ORDER_UPDATES)
     .createIndex({ order_id: 1, createdAt: 1 });
+  await db
+    .collection(ORPHAN_ORDER_UPDATES_DLQ)
+    .createIndex({ order_id: 1, deadLetteredAt: -1 });
+  await db
+    .collection(ORPHAN_ORDER_UPDATES_DLQ)
+    .createIndex({ deadLetteredAt: 1 });
 }
 
 async function insertTrade(trade) {
@@ -186,6 +193,34 @@ async function popOrphanOrderUpdates(order_id) {
   return rows.map((r) => r.payload).filter(Boolean);
 }
 
+async function deadLetterOrphanOrderUpdates({ order_id, reason, meta }) {
+  const db = getDb();
+  const oid = String(order_id || "");
+  if (!oid) return { moved: 0 };
+
+  const rows = await db
+    .collection(ORPHAN_ORDER_UPDATES)
+    .find({ order_id: oid })
+    .sort({ createdAt: 1 })
+    .toArray();
+
+  if (!rows.length) return { moved: 0 };
+
+  await db.collection(ORPHAN_ORDER_UPDATES_DLQ).insertMany(
+    rows.map((row) => ({
+      order_id: oid,
+      payload: row.payload || null,
+      orphanCreatedAt: row.createdAt || new Date(),
+      deadLetteredAt: new Date(),
+      reason: reason || "MAX_RETRIES_EXHAUSTED",
+      meta: meta || null,
+    })),
+  );
+
+  await db.collection(ORPHAN_ORDER_UPDATES).deleteMany({ order_id: oid });
+  return { moved: rows.length };
+}
+
 async function appendOrderLog({ order_id, tradeId, status, payload }) {
   const db = getDb();
   const oid = String(order_id || "");
@@ -312,6 +347,7 @@ module.exports = {
   findTradeByOrder,
   saveOrphanOrderUpdate,
   popOrphanOrderUpdates,
+  deadLetterOrphanOrderUpdates,
   appendOrderLog,
   getOrderLogs,
   upsertLiveOrderSnapshot,
