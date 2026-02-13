@@ -2197,6 +2197,74 @@ class TradeManager {
     return latest;
   }
 
+  _isCancelProcessingError(e) {
+    const msg = String(e?.message || e || "").toLowerCase();
+    return (
+      msg.includes("cannot be cancelled") &&
+      (msg.includes("being processed") || msg.includes("try later"))
+    );
+  }
+
+  async _isFlatStateLikelyExitInProgress(trade, byId = null) {
+    const graceMs = Math.max(
+      0,
+      Number(env.OCO_FLAT_GRACE_MS || env.OCO_POSITION_FLAT_GRACE_MS || 3000),
+    );
+    const now = Date.now();
+    const inGraceByTimestamp =
+      graceMs > 0 &&
+      [
+        trade?.slOrderStatusUpdatedAt,
+        trade?.targetOrderStatusUpdatedAt,
+        trade?.panicExitAt,
+        trade?.updatedAt,
+      ]
+        .map((x) => (x ? new Date(x).getTime() : 0))
+        .some((ts) => Number.isFinite(ts) && now - ts <= graceMs);
+
+    const exitOrderIds = [
+      trade?.slOrderId,
+      trade?.targetOrderId,
+      trade?.tp1OrderId,
+      trade?.panicExitOrderId,
+    ]
+      .map((x) => String(x || ""))
+      .filter(Boolean);
+
+    const inFlightStatuses = new Set([
+      "OPEN",
+      "TRIGGER PENDING",
+      "TRIGGERED",
+      "PARTIAL",
+      "MODIFY PENDING",
+      "CANCEL PENDING",
+      "PUT ORDER REQ RECEIVED",
+      "VALIDATION PENDING",
+    ]);
+
+    for (const oid of exitOrderIds) {
+      const known = (byId && byId.get(oid)) || this._lastOrdersById.get(oid);
+      const knownSt = String(known?.status || "").toUpperCase();
+      if (knownSt === "COMPLETE") return { benign: true, reason: "exit_complete" };
+      if (inGraceByTimestamp && inFlightStatuses.has(knownSt)) {
+        return { benign: true, reason: `in_grace_${knownSt}` };
+      }
+    }
+
+    for (const oid of exitOrderIds) {
+      try {
+        const latest = await this._getOrderStatus(oid);
+        const st = String(latest?.status || "").toUpperCase();
+        if (st === "COMPLETE") return { benign: true, reason: `history_complete_${oid}` };
+        if (inGraceByTimestamp && inFlightStatuses.has(st)) {
+          return { benign: true, reason: `history_in_grace_${st}` };
+        }
+      } catch {}
+    }
+
+    return { benign: false, reason: inGraceByTimestamp ? "grace_elapsed" : "no_exit_signal" };
+  }
+
   _clearPanicExitWatch(tradeId) {
     const id = String(tradeId || "");
     if (!id) return;
@@ -3387,6 +3455,13 @@ class TradeManager {
       logger.info({ tradeId, purpose, orderId: oid }, "[orders] cancelled");
       return resp;
     } catch (e) {
+      if (this._isCancelProcessingError(e)) {
+        logger.warn(
+          { tradeId, purpose, orderId: oid, e: e?.message || String(e) },
+          "[orders] cancel deferred (broker processing)",
+        );
+        return { skipped: true, reason: "broker_processing" };
+      }
       logger.error(
         { tradeId, purpose, orderId: oid, e: e.message },
         "[orders] cancel failed",
@@ -4372,12 +4447,21 @@ class TradeManager {
             );
           }
 
-          // If trade still thinks it's active, this is a state mismatch -> stop trading (safest)
+          // If trade still thinks it's active, verify exit state first (grace + history) before fatal mismatch.
           if (
             [STATUS.ENTRY_FILLED, STATUS.LIVE, STATUS.GUARD_FAILED].includes(
               trade.status,
             )
           ) {
+            const flatCheck = await this._isFlatStateLikelyExitInProgress(trade);
+            if (flatCheck?.benign) {
+              logger.warn(
+                { tradeId, token, status: trade.status, reason: flatCheck.reason },
+                "[oco] broker flat observed during exit processing; skipping fatal mismatch",
+              );
+              continue;
+            }
+
             logger.error(
               { tradeId, token, status: trade.status },
               "[oco] broker position flat while trade is active (state mismatch)",
@@ -4505,6 +4589,15 @@ class TradeManager {
         trade.status,
       )
     ) {
+      const flatCheck = await this._isFlatStateLikelyExitInProgress(trade, byId);
+      if (flatCheck?.benign) {
+        logger.warn(
+          { tradeId, token, status: trade.status, reason: flatCheck.reason },
+          "[reconcile] broker flat observed during exit processing; waiting",
+        );
+        return;
+      }
+
       logger.error(
         { tradeId, token, status: trade.status },
         "[reconcile] broker position flat while trade is active (manual exit / RMS?)",
@@ -7945,6 +8038,13 @@ class TradeManager {
 
     const { trade, link } = hit;
     try {
+      await linkOrder({
+        order_id: orderId,
+        tradeId: trade.tradeId,
+        role: link?.role || "UNKNOWN",
+      });
+    } catch {}
+    try {
       await upsertLiveOrderSnapshot({
         tradeId: trade.tradeId,
         orderId,
@@ -8576,6 +8676,13 @@ class TradeManager {
       return;
     }
     if (link.role === "TARGET") {
+      try {
+        await updateTrade(trade.tradeId, {
+          targetOrderStatus: status || null,
+          targetOrderStatusUpdatedAt: new Date(),
+        });
+      } catch {}
+
       // Partial exit fills are dangerous (remaining qty may be unprotected or double-exited).
       const filledNow = Number(order.filled_quantity || 0);
       const qtyNow = Number(order.quantity || trade.qty || 0);
@@ -8606,6 +8713,14 @@ class TradeManager {
         const freshTrade = await getTrade(trade.tradeId);
         const tStatus = freshTrade?.status || trade.status;
         if ([STATUS.EXITED_SL, STATUS.CLOSED].includes(tStatus)) {
+          const closedByOrderId = String(freshTrade?.exitOrderId || "");
+          if (closedByOrderId && closedByOrderId === String(orderId)) {
+            logger.info(
+              { tradeId: trade.tradeId, orderId, tradeStatus: tStatus },
+              "[order_update] duplicate TARGET complete ignored (same exit order)",
+            );
+            return;
+          }
           logger.error(
             {
               tradeId: trade.tradeId,
@@ -8732,6 +8847,14 @@ class TradeManager {
         const freshTrade = await getTrade(trade.tradeId);
         const tStatus = freshTrade?.status || trade.status;
         if ([STATUS.EXITED_TARGET, STATUS.CLOSED].includes(tStatus)) {
+          const closedByOrderId = String(freshTrade?.exitOrderId || "");
+          if (closedByOrderId && closedByOrderId === String(orderId)) {
+            logger.info(
+              { tradeId: trade.tradeId, orderId, tradeStatus: tStatus },
+              "[order_update] duplicate SL complete ignored (same exit order)",
+            );
+            return;
+          }
           logger.error(
             {
               tradeId: trade.tradeId,
@@ -10299,6 +10422,8 @@ class TradeManager {
       exitSlippageInrWorse,
       closeReason: "TARGET_HIT",
       exitReason: "TARGET_HIT",
+      exitOrderId: String(targetOrder?.order_id || targetOrder?.orderId || trade?.targetOrderId || ""),
+      exitOrderRole: "TARGET",
     });
     alert("info", "🏁 TARGET HIT", { tradeId, exitPrice }).catch(() => {});
     this.risk.resetFailures();
@@ -10384,6 +10509,8 @@ class TradeManager {
       exitSlippageInrWorse,
       closeReason: "SL_HIT",
       exitReason: "SL_HIT",
+      exitOrderId: String(slOrder?.order_id || slOrder?.orderId || trade?.slOrderId || ""),
+      exitOrderRole: "SL",
     });
     alert("warn", "🛑 SL HIT", { tradeId, exitPrice }).catch(() => {});
     this.risk.resetFailures();

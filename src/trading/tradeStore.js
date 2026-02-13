@@ -243,7 +243,7 @@ async function upsertLiveOrderSnapshot({ tradeId, orderId, role, order, source }
     { tradeId: tid },
     {
       $set: setPatch,
-      $setOnInsert: { createdAt: now, tradeId: tid },
+      $setOnInsert: { createdAt: now },
     },
     { upsert: true },
   );
