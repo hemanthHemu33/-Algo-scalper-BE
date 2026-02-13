@@ -8,6 +8,7 @@ const DAILY_RISK = "daily_risk";
 const RISK_STATE = "risk_state";
 const ORPHAN_ORDER_UPDATES = "orphan_order_updates";
 const ORDER_LOGS = "order_logs";
+const LIVE_ORDER_SNAPSHOTS = "live_order_snapshots";
 // Patch-6: cost calibration & reconciliations (post-trade cost model tuning)
 const COST_CALIBRATION = "cost_calibration";
 const COST_RECONCILIATIONS = "cost_reconciliations";
@@ -23,6 +24,10 @@ async function ensureTradeIndexes() {
   await db.collection(DAILY_RISK).createIndex({ date: 1 }, { unique: true });
   await db.collection(ORDER_LOGS).createIndex({ order_id: 1, createdAt: -1 });
   await db.collection(ORDER_LOGS).createIndex({ tradeId: 1, createdAt: -1 });
+  await db
+    .collection(LIVE_ORDER_SNAPSHOTS)
+    .createIndex({ tradeId: 1 }, { unique: true });
+  await db.collection(LIVE_ORDER_SNAPSHOTS).createIndex({ updatedAt: -1 });
   await db.collection(RISK_STATE).createIndex({ date: 1 }, { unique: true });
 
   // Cost calibration (one doc per segmentKey)
@@ -207,6 +212,53 @@ async function getOrderLogs({ order_id, tradeId, limit = 200 }) {
     .toArray();
 }
 
+async function upsertLiveOrderSnapshot({ tradeId, orderId, role, order, source }) {
+  const db = getDb();
+  const tid = String(tradeId || "");
+  const oid = String(orderId || "");
+  if (!tid || !oid) return;
+
+  const now = new Date();
+  const roleKey = String(role || "UNKNOWN")
+    .toUpperCase()
+    .replace(/[^A-Z0-9_]/g, "_");
+  const status = String(order?.status || "").toUpperCase() || null;
+  const snapshotEntry = {
+    orderId: oid,
+    role: roleKey,
+    status,
+    source: source || null,
+    seenAt: now,
+    order: order || null,
+  };
+
+  const setPatch = {
+    tradeId: tid,
+    updatedAt: now,
+    [`byOrderId.${oid}`]: snapshotEntry,
+  };
+  if (roleKey) setPatch[`byRole.${roleKey}`] = snapshotEntry;
+
+  await db.collection(LIVE_ORDER_SNAPSHOTS).updateOne(
+    { tradeId: tid },
+    {
+      $set: setPatch,
+      $setOnInsert: { createdAt: now, tradeId: tid },
+    },
+    { upsert: true },
+  );
+}
+
+async function getLiveOrderSnapshotsByTradeIds(tradeIds = []) {
+  const db = getDb();
+  const ids = (tradeIds || []).map((x) => String(x || "")).filter(Boolean);
+  if (!ids.length) return [];
+  return db
+    .collection(LIVE_ORDER_SNAPSHOTS)
+    .find({ tradeId: { $in: ids } })
+    .toArray();
+}
+
 async function upsertDailyRisk(date, patch) {
   const db = getDb();
   await db.collection(DAILY_RISK).updateOne(
@@ -248,6 +300,7 @@ module.exports = {
   RISK_STATE,
   ORPHAN_ORDER_UPDATES,
   ORDER_LOGS,
+  LIVE_ORDER_SNAPSHOTS,
   COST_CALIBRATION,
   COST_RECONCILIATIONS,
   ensureTradeIndexes,
@@ -261,6 +314,8 @@ module.exports = {
   popOrphanOrderUpdates,
   appendOrderLog,
   getOrderLogs,
+  upsertLiveOrderSnapshot,
+  getLiveOrderSnapshotsByTradeIds,
   upsertDailyRisk,
   getDailyRisk,
   upsertRiskState,
