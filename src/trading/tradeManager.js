@@ -220,6 +220,8 @@ class TradeManager {
     this._dynExitLastAt = new Map(); // tradeId -> last modify ts
     this._dynExitLastEvalAt = new Map(); // tradeId -> last eval ts
     this._lastOrdersById = new Map(); // last broker order map (reconcile)
+    this._terminalOrderStatusById = new Map(); // orderId -> terminal status
+    this._lastModifyAttemptAtByOrder = new Map(); // orderId -> ts
     this._exitLoopTimer = null;
     this._exitLoopInFlight = false;
     this._dynExitFailCount = new Map(); // tradeId -> failure count
@@ -3269,6 +3271,17 @@ class TradeManager {
     const oid = String(orderId || "");
     if (!oid) throw new Error("cancelOrder missing orderId");
 
+    const terminalStatus = String(
+      this._terminalOrderStatusById.get(oid) || "",
+    ).toUpperCase();
+    if (terminalStatus) {
+      logger.info(
+        { tradeId, purpose, orderId: oid, status: terminalStatus },
+        "[orders] cancel skipped (terminal order)",
+      );
+      return { skipped: true, reason: "terminal_order", status: terminalStatus };
+    }
+
     const rate = this.orderLimiter.check({ count: 1 });
     if (!rate.ok) {
       throw new Error(
@@ -3312,10 +3325,57 @@ class TradeManager {
     variety,
     orderId,
     patch,
-    { purpose, tradeId, retry } = {},
+    { purpose, tradeId, retry, tickSize = 0.05, minIntervalMs = 0 } = {},
   ) {
     const oid = String(orderId || "");
     if (!oid) throw new Error("modifyOrder missing orderId");
+
+    const now = Date.now();
+    const terminalStatus = String(
+      this._terminalOrderStatusById.get(oid) || "",
+    ).toUpperCase();
+    if (terminalStatus) {
+      logger.info(
+        { tradeId, purpose, orderId: oid, status: terminalStatus },
+        "[orders] modify skipped (terminal order)",
+      );
+      return { skipped: true, reason: "terminal_order", status: terminalStatus };
+    }
+
+    const cooldownMs = Math.max(0, Number(minIntervalMs || 0));
+    const lastModifyAt = Number(this._lastModifyAttemptAtByOrder.get(oid) || 0);
+    if (cooldownMs > 0 && now - lastModifyAt < cooldownMs) {
+      logger.info(
+        {
+          tradeId,
+          purpose,
+          orderId: oid,
+          waitedMs: now - lastModifyAt,
+          cooldownMs,
+        },
+        "[orders] modify skipped (cooldown)",
+      );
+      return { skipped: true, reason: "cooldown" };
+    }
+
+    const currentOrder = this._lastOrdersById.get(oid);
+    const nextPatch = { ...(patch || {}) };
+    const tick = Math.max(0.000001, Number(tickSize || 0.05));
+    const hasMeaningfulChange = Object.entries(nextPatch).some(([k, v]) => {
+      const cur = Number(currentOrder?.[k]);
+      const nxt = Number(v);
+      if (Number.isFinite(cur) && Number.isFinite(nxt)) {
+        return Math.abs(nxt - cur) >= tick;
+      }
+      return String(currentOrder?.[k] ?? "") !== String(v ?? "");
+    });
+    if (!hasMeaningfulChange) {
+      logger.info(
+        { tradeId, purpose, orderId: oid, patch: nextPatch },
+        "[orders] modify skipped (no effective change)",
+      );
+      return { skipped: true, reason: "no_effective_change" };
+    }
 
     const attemptModify = async (nextPatch, label) => {
       const rate = this.orderLimiter.check({ count: 1 });
@@ -3341,6 +3401,7 @@ class TradeManager {
         throw new Error("MAX_ORDERS_PER_DAY reached; kill-switch enabled.");
       }
 
+      this._lastModifyAttemptAtByOrder.set(oid, Date.now());
       const resp = await this.kite.modifyOrder(variety, oid, nextPatch);
       if (retry && !retry.appliedPatch) {
         retry.appliedPatch = nextPatch;
@@ -3359,6 +3420,13 @@ class TradeManager {
       return await attemptModify(patch);
     } catch (e) {
       const message = String(e?.message || "");
+      if (/order parameters are not changed/i.test(message)) {
+        logger.info(
+          { tradeId, purpose, orderId: oid, patch },
+          "[orders] modify skipped by broker (no change)",
+        );
+        return { skipped: true, reason: "broker_no_change" };
+      }
       const retryable = /trigger|invalid|rejected|range|cross/i.test(message);
       if (
         retryable &&
@@ -3631,12 +3699,38 @@ class TradeManager {
           fresh.tp2OrderId,
         ].filter(Boolean);
 
+        const cancellableStatuses = new Set([
+          "OPEN",
+          "TRIGGER PENDING",
+          "AMO REQ RECEIVED",
+          "MODIFY VALIDATION PENDING",
+          "MODIFY PENDING",
+          "PUT ORDER REQ RECEIVED",
+        ]);
+
         for (const oid of toCancel) {
           try {
+            const id = String(oid);
+            let status = String(this._lastOrdersById.get(id)?.status || "").toUpperCase();
+            if (!status) {
+              try {
+                const st = await this._getOrderStatus(id);
+                status = String(st?.status || st?.order?.status || "").toUpperCase();
+              } catch {}
+            }
+
+            if (status && !cancellableStatuses.has(status)) {
+              logger.info(
+                { tradeId, orderId: id, status },
+                "[panic] cancel skipped (order not cancellable)",
+              );
+              continue;
+            }
+
             try {
-              this.expectedCancelOrderIds.add(String(oid));
+              this.expectedCancelOrderIds.add(id);
             } catch {}
-            await this._safeCancelOrder(variety, oid, {
+            await this._safeCancelOrder(variety, id, {
               purpose: "PANIC_CANCEL",
               tradeId,
             });
@@ -3689,7 +3783,7 @@ class TradeManager {
         { tradeId, reason, exitSide, qty },
         "[panic] placing MARKET exit",
       );
-      alert("warn", `🚨 PANIC EXIT: ${reason}`, { tradeId }).catch(() => {});
+      alert("warn", `PANIC EXIT: ${reason}`, { tradeId }).catch(() => {});
 
       let exitOrderId = null;
 
@@ -4731,7 +4825,7 @@ class TradeManager {
                 minGreenInr: plan?.meta?.minGreenInr,
               }),
             );
-            alert("warn", "⏱️ Time stop triggered -> exit", {
+            alert("warn", "Time stop triggered -> exit", {
               tradeId,
               timeStopAtMs: plan?.meta?.timeStopAtMs,
               pnlInr: plan?.meta?.pnlInr,
@@ -4843,6 +4937,8 @@ class TradeManager {
                 purpose: "DYN_TRAIL_SL",
                 tradeId,
                 retry: retryMeta,
+                tickSize: Number(trade?.instrument?.tick_size || 0.05),
+                minIntervalMs: Math.max(1000, Number(minModifyMs || 0)),
               },
             );
             const appliedTrigger = Number(
@@ -4986,7 +5082,12 @@ class TradeManager {
               env.DEFAULT_ORDER_VARIETY,
               trade.targetOrderId,
               { price: plan.target.targetPrice },
-              { purpose: "DYN_ADJUST_TARGET", tradeId },
+              {
+                purpose: "DYN_ADJUST_TARGET",
+                tradeId,
+                tickSize: Number(trade?.instrument?.tick_size || 0.05),
+                minIntervalMs: Math.max(1000, Number(minModifyMs || 0)),
+              },
             );
             await updateTrade(tradeId, {
               targetPrice: plan.target.targetPrice,
@@ -7723,6 +7824,19 @@ class TradeManager {
     const hit = await findTradeByOrder(orderId);
     const status = String(order.status || "").toUpperCase();
     if (status === "REJECTED") this._pushCircuitEvent("rejects");
+
+    const terminalOrderStatuses = new Set([
+      "COMPLETE",
+      "CANCELLED",
+      "CANCELED",
+      "REJECTED",
+      "EXPIRED",
+    ]);
+    if (terminalOrderStatuses.has(status)) {
+      this._terminalOrderStatusById.set(orderId, status);
+    } else {
+      this._terminalOrderStatusById.delete(orderId);
+    }
     try {
       await appendOrderLog({
         order_id: orderId,
@@ -7813,7 +7927,7 @@ class TradeManager {
           closedAt: new Date(),
         });
 
-        alert("warn", "✅ PANIC EXIT filled", {
+        alert("warn", "PANIC EXIT filled", {
           tradeId: trade.tradeId,
           exitPrice: exitPrice > 0 ? exitPrice : null,
         }).catch(() => {});
@@ -10204,11 +10318,43 @@ class TradeManager {
   }
 
   async _guardFail(trade, reason) {
+    const freshTrade = (await getTrade(trade?.tradeId)) || trade;
+    const reasonKey = String(reason || "").toUpperCase();
+
+    // In panic/time-stop flow, SL cancellation is expected while flattening.
+    if (reasonKey === "SL_CANCELLED") {
+      const panicPlaced = !!freshTrade?.panicExitOrderId;
+      let isFlat = false;
+      try {
+        const token = Number(freshTrade?.instrument_token);
+        const positions = await this.kite.getPositions();
+        const net = positions?.net || positions?.day || [];
+        const p = Array.isArray(net)
+          ? net.find((x) => Number(x.instrument_token) === token)
+          : null;
+        const q = Number(p?.quantity ?? p?.net_quantity ?? 0);
+        isFlat = Number.isFinite(q) && q === 0;
+      } catch {}
+
+      if (panicPlaced || isFlat) {
+        logger.warn(
+          {
+            tradeId: freshTrade?.tradeId || trade?.tradeId,
+            reason,
+            panicPlaced,
+            isFlat,
+          },
+          "[guard] ignored expected SL cancel during panic/time-stop exit",
+        );
+        return;
+      }
+    }
+
     logger.error(
       { tradeId: trade.tradeId, reason },
       "[guard] exit leg failed -> kill switch",
     );
-    alert("error", "🛑 GUARD FAIL (exit leg failed) -> kill switch", {
+    alert("error", "GUARD FAIL (exit leg failed) -> kill switch", {
       tradeId: trade.tradeId,
       reason,
     }).catch(() => {});

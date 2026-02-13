@@ -33,6 +33,7 @@ let tickWatchdogTimer = null;
 let tickTapTimer = null;
 let tickTapCount = 0;
 let lastTickAt = 0;
+let recentOrderUpdateKeys = new Map();
 
 // Track ALL subscribed tokens (base universe + runtime position tokens)
 let subscribedTokens = new Set();
@@ -631,6 +632,27 @@ function wireEvents() {
   });
 
   ticker.on("order_update", (order) => {
+    const orderId = String(order?.order_id || order?.orderId || "");
+    const status = String(order?.status || "").toUpperCase();
+    const exTs = String(
+      order?.exchange_update_timestamp ||
+        order?.exchange_timestamp ||
+        order?.order_timestamp ||
+        "",
+    );
+    const dedupeKey = `${orderId}|${status}|${exTs}`;
+    const now = Date.now();
+    const dedupeTtlMs = 2500;
+
+    for (const [k, ts] of recentOrderUpdateKeys.entries()) {
+      if (now - Number(ts || 0) > dedupeTtlMs) recentOrderUpdateKeys.delete(k);
+    }
+    if (orderId && status && exTs && recentOrderUpdateKeys.has(dedupeKey)) {
+      logger.info({ order_id: orderId, status, exTs }, "[ticker] duplicate order_update ignored");
+      return;
+    }
+    if (orderId && status && exTs) recentOrderUpdateKeys.set(dedupeKey, now);
+
     logger.info(
       {
         order_id: order.order_id,
