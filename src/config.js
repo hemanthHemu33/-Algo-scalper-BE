@@ -1179,9 +1179,20 @@ function toHHmm(totalMin) {
   if (convertEnabled) {
     const convertMin = parseHHmm(env.EOD_MIS_TO_NRML_AT, "EOD_MIS_TO_NRML_AT");
     if (convertMin >= flattenMin) {
-      throw new Error(
-        `[config] EOD_MIS_TO_NRML_AT (${env.EOD_MIS_TO_NRML_AT}) must be earlier than FORCE_FLATTEN_AT (${env.FORCE_FLATTEN_AT}).`,
-      );
+      const eodTimeProvided = process.env.EOD_MIS_TO_NRML_AT != null;
+      if (!eodTimeProvided) {
+        const fixed = toHHmm(flattenMin - 2);
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[config] EOD_MIS_TO_NRML_AT default (${env.EOD_MIS_TO_NRML_AT}) is not earlier than FORCE_FLATTEN_AT (${env.FORCE_FLATTEN_AT}). ` +
+            `Auto-fixing EOD_MIS_TO_NRML_AT to ${fixed}. Set EOD_MIS_TO_NRML_AT explicitly to override.`,
+        );
+        env.EOD_MIS_TO_NRML_AT = fixed;
+      } else {
+        throw new Error(
+          `[config] EOD_MIS_TO_NRML_AT (${env.EOD_MIS_TO_NRML_AT}) must be earlier than FORCE_FLATTEN_AT (${env.FORCE_FLATTEN_AT}).`,
+        );
+      }
     }
   }
 })();
