@@ -60,6 +60,8 @@ const {
   saveOrphanOrderUpdate,
   popOrphanOrderUpdates,
   appendOrderLog,
+  upsertLiveOrderSnapshot,
+  getLiveOrderSnapshotsByTradeIds,
   upsertDailyRisk,
   getDailyRisk,
   upsertRiskState,
@@ -118,6 +120,11 @@ function parseOrderTimestampMs(order) {
   if (!raw) return null;
   const ms = new Date(raw).getTime();
   return Number.isFinite(ms) ? ms : null;
+}
+
+function isTerminalOrderStatus(status) {
+  const s = String(status || "").toUpperCase();
+  return ["COMPLETE", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"].includes(s);
 }
 
 function worseSlippageBps({ side, expected, actual, leg }) {
@@ -675,8 +682,75 @@ class TradeManager {
     await this.refreshRiskLimits();
     await this._hydrateRiskFromDb();
     await this._loadActiveTradeId();
+    await this._hydrateLiveOrderSnapshotsFromDb();
     await this._hydrateOpenPositionFromActiveTrade();
     this._startExitLoop();
+  }
+
+  _rememberLiveOrder(orderId, order) {
+    const oid = String(orderId || "");
+    if (!oid) return;
+    const status = String(order?.status || "").toUpperCase();
+    this._lastOrdersById.set(oid, order || { order_id: oid });
+    if (isTerminalOrderStatus(status)) this._terminalOrderStatusById.set(oid, status);
+    else this._terminalOrderStatusById.delete(oid);
+  }
+
+  async _hydrateLiveOrderSnapshotsFromDb() {
+    try {
+      const actives = await getActiveTrades();
+      const tradeIds = (actives || []).map((t) => t?.tradeId).filter(Boolean);
+      if (!tradeIds.length) return;
+
+      const rows = await getLiveOrderSnapshotsByTradeIds(tradeIds);
+      for (const snap of rows || []) {
+        const byOrderId = snap?.byOrderId || {};
+        for (const [orderId, entry] of Object.entries(byOrderId)) {
+          if (!orderId) continue;
+          this._rememberLiveOrder(orderId, entry?.order || { order_id: orderId, status: entry?.status });
+        }
+      }
+
+      if ((rows || []).length) {
+        logger.info(
+          { tradeCount: tradeIds.length, snapshotCount: rows.length, ordersHydrated: this._lastOrdersById.size },
+          "[init] hydrated persisted live order snapshots",
+        );
+      }
+    } catch (e) {
+      logger.warn({ e: e?.message || String(e) }, "[init] hydrate live order snapshots failed");
+    }
+  }
+
+  _extractTradeOrderRefs(trade) {
+    const refs = [];
+    for (const [k, v] of Object.entries(trade || {})) {
+      if (!/OrderId$/.test(String(k || ""))) continue;
+      const oid = String(v || "");
+      if (!oid) continue;
+      const role = String(k).replace(/OrderId$/, "").toUpperCase() || "UNKNOWN";
+      refs.push({ orderId: oid, role });
+    }
+    return refs;
+  }
+
+  async _persistLiveOrderSnapshotsForTrades(trades, byId, source = "reconcile") {
+    for (const trade of trades || []) {
+      const tradeId = trade?.tradeId;
+      if (!tradeId) continue;
+      for (const ref of this._extractTradeOrderRefs(trade)) {
+        const order = byId?.get?.(String(ref.orderId));
+        if (!order) continue;
+        this._rememberLiveOrder(ref.orderId, order);
+        await upsertLiveOrderSnapshot({
+          tradeId,
+          orderId: ref.orderId,
+          role: ref.role,
+          order,
+          source,
+        });
+      }
+    }
   }
 
   _startExitLoop() {
@@ -4007,6 +4081,7 @@ class TradeManager {
 
     // 3) Fetch active trades first
     const actives = await getActiveTrades();
+    await this._persistLiveOrderSnapshotsForTrades(actives, byId, "reconcile");
 
     this._syncRiskFromPositions(posQtyByToken, actives);
     await this._monitorPortfolioRisk("reconcile");
@@ -7821,22 +7896,11 @@ class TradeManager {
     const orderId = String(order.order_id || order.orderId || "");
     if (!orderId) return;
 
-    const hit = await findTradeByOrder(orderId);
     const status = String(order.status || "").toUpperCase();
-    if (status === "REJECTED") this._pushCircuitEvent("rejects");
+    this._rememberLiveOrder(orderId, order);
 
-    const terminalOrderStatuses = new Set([
-      "COMPLETE",
-      "CANCELLED",
-      "CANCELED",
-      "REJECTED",
-      "EXPIRED",
-    ]);
-    if (terminalOrderStatuses.has(status)) {
-      this._terminalOrderStatusById.set(orderId, status);
-    } else {
-      this._terminalOrderStatusById.delete(orderId);
-    }
+    const hit = await findTradeByOrder(orderId);
+    if (status === "REJECTED") this._pushCircuitEvent("rejects");
     try {
       await appendOrderLog({
         order_id: orderId,
@@ -7880,6 +7944,16 @@ class TradeManager {
     }
 
     const { trade, link } = hit;
+    try {
+      await upsertLiveOrderSnapshot({
+        tradeId: trade.tradeId,
+        orderId,
+        role: link?.role || "UNKNOWN",
+        order,
+        source: "order_update",
+      });
+    } catch {}
+
     this._scheduleReconcile("order_update");
 
     // Ignore expected OCO cancels
