@@ -6251,11 +6251,32 @@ class TradeManager {
       return;
     }
 
+    // Fast reject before expensive option routing work when confidence cannot reach the gate.
+    const isOptMode = this._isOptMode();
+    const mustRouteUnderlyingToOption = isOptMode || isIndexUnderlying;
+    const maxPossibleRouteBoost = 22; // _finalOptionSignalConfidence() max uplift (+12 health, +4 spread, +6 depth)
+    if (
+      mustRouteUnderlyingToOption &&
+      Number.isFinite(minConf) &&
+      minConf > 0 &&
+      Number.isFinite(conf) &&
+      conf + maxPossibleRouteBoost < minConf
+    ) {
+      logger.info(
+        {
+          token: signal?.instrument_token,
+          conf,
+          minConf,
+          maxPossibleRouteBoost,
+        },
+        "[trade] blocked (pre-route low confidence)",
+      );
+      return;
+    }
+
     // In OPT mode, we generate signals on an underlying (FUT/SPOT) but execute on an option contract.
     // Route here so downstream logic (risk, orders, telemetry) is consistent on the executed instrument.
     let s = signal;
-    const isOptMode = this._isOptMode();
-    const mustRouteUnderlyingToOption = isOptMode || isIndexUnderlying;
     if (mustRouteUnderlyingToOption) {
       // QuoteGuard safety: if quotes are unstable (breaker open), pause new OPT entries.
       const blockOnQG =
