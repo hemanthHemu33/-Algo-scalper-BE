@@ -30,7 +30,9 @@ function vwapReclaimStrategy({
 
   const curVol = Number(candles[n - 1].volume || 0);
   const av = avgVolume(candles, volLookback);
-  const volOk = av > 0 ? curVol >= av * volMult : true;
+  if (!Number.isFinite(av) || av <= 0) return null;
+
+  const volOk = curVol >= av * volMult;
 
   // Simple trend filter using EMA (prevents too many chop signals)
   const closes = candles.map(c => Number(c.close));

@@ -17,12 +17,15 @@ function breakoutStrategy({ candles, lookback = 20, volMult = 1.2, volLookback =
   const lo = minLow(prevRange);
 
   const curClose = Number(cur.close);
+  const prevClose = Number(candles[n - 2].close);
   const curVol = Number(cur.volume || 0);
 
   const av = avgVolume(candles, volLookback);
-  const volOk = av > 0 ? curVol >= av * volMult : true;
+  if (!Number.isFinite(av) || av <= 0) return null;
 
-  if (curClose > hi && volOk) {
+  const volOk = curVol >= av * volMult;
+
+  if (curClose > hi && prevClose <= hi && volOk) {
     const confidence = Math.min(
       92,
       55 + Math.round((curVol / Math.max(1, av)) * 20)
@@ -34,7 +37,7 @@ function breakoutStrategy({ candles, lookback = 20, volMult = 1.2, volLookback =
     };
   }
 
-  if (curClose < lo && volOk) {
+  if (curClose < lo && prevClose >= lo && volOk) {
     const confidence = Math.min(
       92,
       55 + Math.round((curVol / Math.max(1, av)) * 20)
