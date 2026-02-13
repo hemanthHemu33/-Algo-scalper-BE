@@ -213,7 +213,7 @@ function applyMinGreenExitRules({
     };
   }
 
-  let beLockHit = false;
+  let beLockHit = Boolean(trade?.beLocked);
   let trailHit = false;
   const skipReasons = [];
 
@@ -326,7 +326,9 @@ function applyMinGreenExitRules({
 
   const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 20);
   const step = stepTicks * tick;
-  const slMove = side === "BUY" ? newSL - curSL : curSL - newSL;
+  const curSlRounded = roundToTick(curSL, tick, side === "BUY" ? "down" : "up");
+  const newSlRounded = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
+  const slMove = side === "BUY" ? newSlRounded - curSlRounded : curSlRounded - newSlRounded;
   const shouldMoveSL = Number.isFinite(slMove) && slMove >= step;
 
   if (!beLockHit) {
@@ -353,7 +355,7 @@ function applyMinGreenExitRules({
   return {
     ...basePlan,
     ok: true,
-    sl: shouldMoveSL ? { stopLoss: newSL } : basePlan?.sl || null,
+    sl: shouldMoveSL ? { stopLoss: newSlRounded } : basePlan?.sl || null,
     tradePatch,
     meta: {
       ...(basePlan?.meta || {}),
