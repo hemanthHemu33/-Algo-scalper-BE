@@ -179,6 +179,7 @@ function applyMinGreenExitRules({
   const tradePatch = { ...(basePlan?.tradePatch || {}) };
 
   const pnlInr = unrealizedPnlInr({ side, entry, ltp, qty });
+  const riskPerTradeInr = Number(trade?.riskInr || env.RISK_PER_TRADE_INR || 0);
 
   const timeStopMin = Number(env.TIME_STOP_MIN || 0);
   const entryTs =
@@ -214,49 +215,70 @@ function applyMinGreenExitRules({
   }
 
   let beLockHit = Boolean(trade?.beLocked);
-  let trailHit = false;
+  let trailHit = Boolean(trade?.trailLocked);
   const skipReasons = [];
 
-  const beLockAt = Number(env.BE_LOCK_AT_PROFIT_INR || 0);
-  if (
-    Number.isFinite(beLockAt) &&
-    beLockAt > 0 &&
-    pnlInr >= beLockAt &&
-    minGreenPts > 0
-  ) {
-    const desired = side === "BUY" ? entry + minGreenPts : entry - minGreenPts;
-    if (side === "BUY") newSL = Math.max(newSL, desired);
-    else newSL = Math.min(newSL, desired);
+  const beArmR = Number(env.BE_ARM_R || 0.6);
+  const trailArmR = Number(env.TRAIL_ARM_R || 1.0);
+  const beLockAt =
+    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
+      ? beArmR * riskPerTradeInr
+      : Number(env.BE_LOCK_AT_PROFIT_INR || 0);
+  const trailStartInr =
+    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
+      ? trailArmR * riskPerTradeInr
+      : Number(env.DYN_TRAIL_START_PROFIT_INR || 0);
+
+  if (Number.isFinite(beLockAt) && beLockAt > 0 && pnlInr >= beLockAt) {
     beLockHit = true;
-    if (!trade?.beLocked) {
-      tradePatch.beLocked = true;
-      tradePatch.beLockedAt = new Date(now);
-      tradePatch.beLockedAtPrice = desired;
+  }
+  if (Number.isFinite(trailStartInr) && trailStartInr > 0 && pnlInr >= trailStartInr) {
+    trailHit = true;
+  }
+
+  if (beLockHit && !trade?.beLocked) {
+    tradePatch.beLocked = true;
+    tradePatch.beLockedAt = new Date(now);
+  }
+  if (trailHit && !trade?.trailLocked) {
+    tradePatch.trailLocked = true;
+    tradePatch.trailLockedAt = new Date(now);
+  }
+
+  // Latched behaviour: once armed, these states must remain active until trade closes.
+  const beLockedNow = Boolean(tradePatch.beLocked || trade?.beLocked || beLockHit);
+  const trailLockedNow = Boolean(tradePatch.trailLocked || trade?.trailLocked || trailHit);
+
+  const allowTrail = beLockedNow || trailLockedNow || trade?.tp1Done;
+
+  const trailGapPreBePct = Number(env.TRAIL_GAP_PRE_BE_PCT || 0.08);
+  const trailGapPostBePct = Number(env.TRAIL_GAP_POST_BE_PCT || 0.04);
+  const trailGapMinPts = Number(env.TRAIL_GAP_MIN_PTS || 2);
+  const trailGapMaxPts = Number(env.TRAIL_GAP_MAX_PTS || 10);
+  const beBufferTicks = Number(env.BE_BUFFER_TICKS || env.DYN_BE_BUFFER_TICKS || 1);
+  const triggerBufferTicks = Number(env.TRIGGER_BUFFER_TICKS || 1);
+
+  const trueBE = Number(basePlan?.meta?.trueBE || NaN);
+  let beFloor = null;
+  if (beLockedNow && Number.isFinite(trueBE)) {
+    const raw = side === "BUY" ? trueBE + beBufferTicks * tick : trueBE - beBufferTicks * tick;
+    beFloor = roundToTick(raw, tick, side === "BUY" ? "up" : "down");
+    if (side === "BUY") {
+      newSL = Math.max(newSL, beFloor);
+    } else {
+      newSL = Math.min(newSL, beFloor);
+    }
+    if (!trade?.beLockedAtPrice) {
+      tradePatch.beLockedAtPrice = beFloor;
     }
   }
 
-  const trailGap = Number(env.TRAIL_GAP_PREMIUM_POINTS || 0);
-  const trailAfterBe =
-    String(env.DYN_TRAIL_START_AFTER_BE_LOCK || "true") === "true";
-  const trailStartInr = Number(env.DYN_TRAIL_START_PROFIT_INR || 0);
-
-  // If BE lock activates in *this* evaluation, it lives in tradePatch (trade.beLocked may still be false).
-  const beLockedNow = Boolean(tradePatch.beLocked || trade?.beLocked);
-
-  const allowTrail =
-    (trailAfterBe ? beLockedNow : false) ||
-    (Number.isFinite(trailStartInr) && trailStartInr > 0
-      ? pnlInr >= trailStartInr
-      : false) ||
-    trade?.tp1Done;
+  let trailGap = null;
 
   if (
     allowTrail &&
-    Number.isFinite(trailGap) &&
-    trailGap > 0 &&
     Number.isFinite(ltp)
   ) {
-    trailHit = true;
     const prevPeak = Number(trade?.peakLtp || NaN);
     let peakLtp = prevPeak;
     if (side === "BUY") {
@@ -264,22 +286,34 @@ function applyMinGreenExitRules({
     } else {
       peakLtp = Number.isFinite(prevPeak) ? Math.min(prevPeak, ltp) : ltp;
     }
-    const trailSl = side === "BUY" ? peakLtp - trailGap : peakLtp + trailGap;
+    const gapPct = beLockedNow ? trailGapPostBePct : trailGapPreBePct;
+    const rawGap = clamp(peakLtp * gapPct, trailGapMinPts, trailGapMaxPts);
+    trailGap = roundToTick(rawGap, tick, "nearest");
+    if (!(Number.isFinite(trailGap) && trailGap > 0)) {
+      trailGap = null;
+    }
+
+    const trailSl =
+      Number.isFinite(trailGap) && trailGap > 0
+        ? side === "BUY"
+          ? peakLtp - trailGap
+          : peakLtp + trailGap
+        : null;
     if (!Number.isFinite(prevPeak) || peakLtp !== prevPeak) {
       tradePatch.peakLtp = peakLtp;
     }
-    if (
-      !Number.isFinite(Number(trade?.trailSl)) ||
-      trailSl !== trade?.trailSl
-    ) {
+    if (Number.isFinite(trailSl) && (!Number.isFinite(Number(trade?.trailSl)) || trailSl !== trade?.trailSl)) {
       tradePatch.trailSl = trailSl;
     }
 
-    const threshold = 2 * tick;
-    if (side === "BUY") {
-      if (trailSl > newSL + threshold) newSL = trailSl;
-    } else if (trailSl < newSL - threshold) {
-      newSL = trailSl;
+    if (Number.isFinite(trailSl)) {
+      if (beLockedNow && Number.isFinite(beFloor)) {
+        newSL = side === "BUY" ? Math.max(newSL, beFloor, trailSl) : Math.min(newSL, beFloor, trailSl);
+      } else if (side === "BUY") {
+        newSL = Math.max(newSL, trailSl);
+      } else {
+        newSL = Math.min(newSL, trailSl);
+      }
     }
   }
 
@@ -324,29 +358,46 @@ function applyMinGreenExitRules({
 
   newSL = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
 
-  const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 20);
+  const stepTicks = Number(
+    beLockedNow
+      ? env.DYN_STEP_TICKS_POST_BE || env.DYN_TRAIL_STEP_TICKS || 10
+      : env.DYN_STEP_TICKS_PRE_BE || env.DYN_TRAIL_STEP_TICKS || 20,
+  );
   const step = stepTicks * tick;
   const curSlRounded = roundToTick(curSL, tick, side === "BUY" ? "down" : "up");
   const newSlRounded = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
   const slMove = side === "BUY" ? newSlRounded - curSlRounded : curSlRounded - newSlRounded;
   const shouldMoveSL = Number.isFinite(slMove) && slMove >= step;
 
-  if (!beLockHit) {
+  if (!beLockedNow) {
     if (!(Number.isFinite(beLockAt) && beLockAt > 0)) skipReasons.push("be_lock_disabled");
     else if (!(pnlInr >= beLockAt))
       skipReasons.push(`pnlInr=${Number(pnlInr || 0).toFixed(2)} < beLockAt=${beLockAt}`);
   }
 
-  if (!trailHit) {
-    if (!(Number.isFinite(trailGap) && trailGap > 0)) skipReasons.push("trail_gap_disabled");
+  if (!allowTrail) {
+    skipReasons.push("trail_not_armed");
+  } else if (!(Number.isFinite(trailGap) && trailGap > 0)) {
+    skipReasons.push("trail_gap_disabled");
+  }
+
+  if (!trailLockedNow) {
+    if (!(Number.isFinite(trailStartInr) && trailStartInr > 0)) skipReasons.push("trail_arm_disabled");
     else if (!allowTrail) {
-      const thresholdText =
-        Number.isFinite(trailStartInr) && trailStartInr > 0
-          ? `pnlInr=${Number(pnlInr || 0).toFixed(2)} < trailStartInr=${trailStartInr}`
-          : "trail_not_armed";
-      skipReasons.push(thresholdText);
+      skipReasons.push(`pnlInr=${Number(pnlInr || 0).toFixed(2)} < trailStartInr=${trailStartInr}`);
     }
   }
+
+  const desiredStopLoss = newSlRounded;
+  const finalStopLoss = shouldMoveSL
+    ? roundToTick(
+        side === "BUY"
+          ? desiredStopLoss + triggerBufferTicks * tick
+          : desiredStopLoss - triggerBufferTicks * tick,
+        tick,
+        side === "BUY" ? "up" : "down",
+      )
+    : null;
 
   if (!shouldMoveSL) {
     skipReasons.push(`sl_move_below_step (move=${Number(slMove || 0).toFixed(2)}, step=${Number(step || 0).toFixed(2)})`);
@@ -355,7 +406,7 @@ function applyMinGreenExitRules({
   return {
     ...basePlan,
     ok: true,
-    sl: shouldMoveSL ? { stopLoss: newSlRounded } : basePlan?.sl || null,
+    sl: shouldMoveSL ? { stopLoss: finalStopLoss } : basePlan?.sl || null,
     tradePatch,
     meta: {
       ...(basePlan?.meta || {}),
@@ -364,11 +415,18 @@ function applyMinGreenExitRules({
       minGreenPts,
       beLockAt,
       trailGap,
-      trailAfterBe,
       trailStartInr: Number.isFinite(trailStartInr) ? trailStartInr : null,
       allowTrail,
-      beLockHit,
-      trailHit,
+      beLockHit: beLockedNow,
+      trailHit: trailLockedNow,
+      beArmR,
+      trailArmR,
+      riskPerTradeInr,
+      trueBE: Number.isFinite(trueBE) ? trueBE : null,
+      beFloor,
+      desiredStopLoss,
+      finalStopLoss,
+      triggerBufferTicks,
       peakLtp: Number(tradePatch?.peakLtp ?? trade?.peakLtp),
       skipReason: skipReasons.join(" | ") || null,
       holdMin,
