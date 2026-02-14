@@ -540,7 +540,15 @@ const schema = z.object({
   MIN_GREEN_ENABLED: z.string().default("true"),
   MIN_GREEN_SLIPPAGE_PTS_OPT: z.coerce.number().default(2),
   BE_LOCK_AT_PROFIT_INR: z.coerce.number().default(200),
+  BE_ARM_R: z.coerce.number().default(0.6),
+  TRAIL_ARM_R: z.coerce.number().default(1.0),
+  BE_BUFFER_TICKS: z.coerce.number().default(1),
+  TRIGGER_BUFFER_TICKS: z.coerce.number().default(1),
   TRAIL_GAP_PREMIUM_POINTS: z.coerce.number().default(8),
+  TRAIL_GAP_PRE_BE_PCT: z.coerce.number().default(0.08),
+  TRAIL_GAP_POST_BE_PCT: z.coerce.number().default(0.04),
+  TRAIL_GAP_MIN_PTS: z.coerce.number().default(2),
+  TRAIL_GAP_MAX_PTS: z.coerce.number().default(10),
   TIME_STOP_MIN: z.coerce.number().default(5),
   EXIT_LOOP_MS: z.coerce.number().default(1500),
   STALE_TICK_MS: z.coerce.number().default(3000),
@@ -899,6 +907,9 @@ const schema = z.object({
   DYN_TRAIL_START_R: z.coerce.number().default(1.0),
 
   DYN_TRAIL_STEP_TICKS: z.coerce.number().default(20),
+  DYN_STEP_TICKS_PRE_BE: z.coerce.number().default(20),
+  DYN_STEP_TICKS_POST_BE: z.coerce.number().default(10),
+  DYN_TRAIL_START_PROFIT_INR: z.coerce.number().default(0),
 
   // STATIC | FOLLOW_RR | TIGHTEN_VWAP
   DYN_TARGET_MODE: z.string().default("STATIC"),
