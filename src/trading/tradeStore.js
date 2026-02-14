@@ -110,9 +110,45 @@ async function updateTrade(tradeId, patch) {
     }
   }
 
-  await db
-    .collection(TRADES)
-    .updateOne({ tradeId }, { $set: { ...update, updatedAt: new Date() } });
+  const runUpdate = () =>
+    db
+      .collection(TRADES)
+      .updateOne({ tradeId }, { $set: { ...update, updatedAt: new Date() } });
+
+  let result;
+  try {
+    result = await runUpdate();
+  } catch (e) {
+    const retryable =
+      Boolean(e?.errorLabels?.includes?.("RetryableWriteError")) ||
+      Boolean(e?.errorLabels?.includes?.("TransientTransactionError")) ||
+      [6, 7, 89, 91, 189, 262, 9001, 11600, 11602, 13435, 13436].includes(
+        Number(e?.code),
+      );
+
+    if (!retryable) throw e;
+
+    logger.warn(
+      { tradeId, code: e?.code, message: e?.message || String(e) },
+      "[trade] updateTrade transient failure; retrying once",
+    );
+    result = await runUpdate();
+  }
+
+  if (!result?.acknowledged) {
+    throw new Error(`[trade] updateTrade not acknowledged for tradeId=${tradeId}`);
+  }
+
+  if (Number(result?.matchedCount || 0) === 0) {
+    const err = new Error(`[trade] updateTrade found no trade row: tradeId=${tradeId}`);
+    logger.error(
+      { tradeId, patchKeys: Object.keys(update) },
+      "[trade] updateTrade dropped because trade was not found",
+    );
+    throw err;
+  }
+
+  return result;
 }
 
 async function getTrade(tradeId) {
