@@ -10,6 +10,12 @@ const { evaluateOnCandles } = require("../src/strategy/replayEngine");
 const { computeDynamicExitPlan } = require("../src/trading/dynamicExitManager");
 const { estimateRoundTripCostInr } = require("../src/trading/costModel");
 const { createBacktestClock } = require("../src/backtest/clock");
+const { buildOptionBacktestProvider } = require("../src/backtest/optionBacktest");
+const {
+  calibrateFromRecentTrades,
+  applyExecutionRealism,
+  seeded,
+} = require("../src/backtest/executionRealism");
 
 function getArg(name, def = null) {
   const hit = process.argv.find((a) => a.startsWith(`${name}=`));
@@ -90,6 +96,7 @@ function resolveExitPrice({ side, candle, stopLoss, targetPrice, conservative = 
 }
 
 async function main() {
+  const mode = String(getArg("--mode", "EQ")).toUpperCase();
   const token = n(getArg("--token"), NaN);
   const intervalMin = n(getArg("--interval"), 1);
   const fromMs = toMs(getArg("--from"), null);
@@ -100,7 +107,19 @@ async function main() {
   const rrTarget = Math.max(0.5, n(getArg("--rr"), n(env.RR_TARGET, 1.4)));
   const slPct = Math.max(0.1, n(getArg("--slPct"), 0.7));
   const slipBps = Math.max(0, n(getArg("--slippageBps"), 3));
-  const seed = String(getArg("--seed", "42"));
+  const seed = n(getArg("--seed", "42"), 42);
+  const dynamicContracts = String(getArg("--dynamicContracts", "false")) === "true";
+  const optionType = String(getArg("--optionType", "CE")).toUpperCase();
+  const scanSteps = Math.max(0, n(getArg("--scanSteps"), 2));
+  const strikeStep = Math.max(1, n(getArg("--strikeStep"), 50));
+  const greeksFilter = String(getArg("--greeksFilter", "false")) === "true";
+  const minDelta = Math.max(0, n(getArg("--minDelta"), 0.2));
+  const maxDelta = Math.min(1, n(getArg("--maxDelta"), 0.85));
+  const ivMax = Math.max(0.1, n(getArg("--ivMax"), 2.5));
+  const execRealism = String(getArg("--execRealism", "true")) === "true";
+  const calibrationDays = Math.max(1, n(getArg("--calibrationDays"), 5));
+  const partialFillProbability = clamp01(n(getArg("--partialFillProbability"), 0.15));
+  const minPartialFillRatio = clamp01(n(getArg("--minPartialFillRatio"), 0.35));
   const out = getArg("--out", `bt_result_${Date.now()}.json`);
 
   if (!Number.isFinite(token)) throw new Error("Missing --token=<instrument_token>");
@@ -119,6 +138,27 @@ async function main() {
   const candles = await col.find(q).sort({ ts: 1 }).limit(limit).toArray();
   if (!candles.length) throw new Error("No candles found for query");
 
+  const optionProvider =
+    mode === "OPT" && dynamicContracts
+      ? await buildOptionBacktestProvider({
+          db,
+          intervalMin,
+          from: fromMs ? new Date(fromMs) : null,
+          to: toMsArg ? new Date(toMsArg) : null,
+          underlyingToken: token,
+          underlyingTradingsymbol: getArg("--underlying", ""),
+          optionType,
+          strikeStep,
+          scanSteps,
+          greeks: { enabled: greeksFilter, minDelta, maxDelta, ivMax },
+        })
+      : null;
+
+  const execCalibration = execRealism
+    ? await calibrateFromRecentTrades({ db, days: calibrationDays })
+    : null;
+  const rng = seeded(seed);
+
   const clock = createBacktestClock(candles[0].ts);
   const trades = [];
   let openTrade = null;
@@ -132,10 +172,15 @@ async function main() {
     const slice = candles.slice(0, i + 1);
 
     if (openTrade) {
+      const managedCandles =
+        mode === "OPT" && openTrade?.contractToken
+          ? optionProvider?.getCandlesByToken?.(openTrade.contractToken) || slice
+          : slice;
+
       const plan = computeDynamicExitPlan({
         trade: openTrade,
         ltp: Number(candle.close),
-        candles: slice,
+        candles: managedCandles,
         nowTs: clock.nowMs(),
         env,
       });
@@ -154,13 +199,29 @@ async function main() {
       const forceExit = plan?.action?.exitNow;
       if (pathExit.hit || forceExit) {
         const basePx = forceExit ? Number(candle.close) : pathExit.price;
-        const slipPx = basePx * (slipBps / 10000);
-        const exitPrice = openTrade.side === "BUY" ? basePx - slipPx : basePx + slipPx;
+        const exec = execRealism
+          ? applyExecutionRealism({
+              side: openTrade.side === "BUY" ? "SELL" : "BUY",
+              intendedPrice: basePx,
+              candle,
+              qty: openTrade.qty,
+              rand: rng,
+              model: {
+                spreadBps: execCalibration?.avgSpreadBps ?? 0,
+                slippageBps: (execCalibration?.avgEntrySlipBps ?? 0) + slipBps,
+                partialFillProbability,
+                minPartialFillRatio,
+                latencyBars: 0,
+              },
+            })
+          : null;
+        const exitPrice = Number(exec?.avgFillPrice || basePx);
+        const filledQty = Number(exec?.filledQty || openTrade.qty);
         const signed = openTrade.side === "BUY" ? 1 : -1;
-        const grossPnl = (exitPrice - openTrade.entryPrice) * openTrade.qty * signed;
+        const grossPnl = (exitPrice - openTrade.entryPrice) * filledQty * signed;
         const costs = estimateRoundTripCostInr({
           entryPrice: (openTrade.entryPrice + exitPrice) / 2,
-          qty: openTrade.qty,
+          qty: filledQty,
           spreadBps: 0,
           env,
           instrument: openTrade.instrument,
@@ -179,6 +240,7 @@ async function main() {
           grossPnl,
           estCostInr: Number(costs.estCostInr || 0),
           netPnl,
+          executionModel: exec || null,
           holdCandles: i - openTrade.entryIdx,
         });
         openTrade = null;
@@ -198,18 +260,52 @@ async function main() {
       const side = String(sig.side || "").toUpperCase();
       if (side !== "BUY" && side !== "SELL") continue;
 
-      const rawEntry = Number(candle.close);
+      const baseCandle = candle;
+      const selectedContract =
+        mode === "OPT" && optionProvider?.ready
+          ? optionProvider.selectContract({
+              ts: baseCandle.ts,
+              underlyingPrice: Number(baseCandle.close),
+            })
+          : null;
+
+      const tradedCandle =
+        mode === "OPT" && selectedContract?.selectedToken
+          ? optionProvider
+              ?.getCandlesByToken(selectedContract.selectedToken)
+              ?.find((c) => new Date(c.ts).getTime() === new Date(baseCandle.ts).getTime()) ||
+            null
+          : baseCandle;
+
+      const rawEntry = Number(tradedCandle?.close);
       if (!Number.isFinite(rawEntry) || rawEntry <= 0) continue;
 
-      const slipPx = rawEntry * (slipBps / 10000);
-      const entryPrice = side === "BUY" ? rawEntry + slipPx : rawEntry - slipPx;
+      const exec = execRealism
+        ? applyExecutionRealism({
+            side,
+            intendedPrice: rawEntry,
+            candle: tradedCandle || baseCandle,
+            qty,
+            rand: rng,
+            model: {
+              spreadBps: execCalibration?.avgSpreadBps ?? 0,
+              slippageBps: (execCalibration?.avgEntrySlipBps ?? 0) + slipBps,
+              partialFillProbability,
+              minPartialFillRatio,
+              latencyBars: Math.round((execCalibration?.avgFillLatencyMs || 0) / (intervalMin * 60 * 1000)),
+            },
+          })
+        : null;
+
+      const entryPrice = Number(exec?.avgFillPrice || rawEntry);
+      const filledQty = Number(exec?.filledQty || qty);
       const riskPts = Math.max(0.05, entryPrice * (slPct / 100));
       const stopLoss = side === "BUY" ? entryPrice - riskPts : entryPrice + riskPts;
       const targetPrice = side === "BUY" ? entryPrice + rrTarget * riskPts : entryPrice - rrTarget * riskPts;
 
       openTrade = {
         side,
-        qty,
+        qty: filledQty,
         entryTs: candle.ts,
         entryIdx: i,
         entryPrice,
@@ -220,6 +316,10 @@ async function main() {
         strategyId: sig.strategyId,
         confidence: Number(sig.confidence || 0),
         signalReason: sig.reason || null,
+        mode,
+        contractToken: selectedContract?.selectedToken || Number(token),
+        optionSnapshot: selectedContract?.snapshot || null,
+        executionModel: exec || null,
         instrument: { instrument_token: Number(token), tick_size: 0.05 },
       };
     }
@@ -243,6 +343,22 @@ async function main() {
     gitHash: gitHash(),
     configSnapshot: pickEnvSnapshot(),
     params: { warmup, qty, rrTarget, slPct, slippageBps: slipBps },
+    phase3: {
+      mode,
+      dynamicContracts,
+      optionType,
+      providerReady: !!optionProvider?.ready,
+      providerStats: optionProvider?.stats || null,
+      greeksFilter,
+      greeksBounds: { minDelta, maxDelta, ivMax },
+    },
+    phase4: {
+      executionRealism: execRealism,
+      calibrationDays,
+      calibration: execCalibration,
+      partialFillProbability,
+      minPartialFillRatio,
+    },
     metrics: {
       trades: trades.length,
       wins,
@@ -262,6 +378,12 @@ async function main() {
   fs.writeFileSync(outPath, JSON.stringify(run, null, 2));
   console.log(`Backtest complete: ${outPath}`);
   console.log(run.metrics);
+}
+
+function clamp01(v) {
+  const x = Number(v);
+  if (!Number.isFinite(x)) return 0;
+  return Math.max(0, Math.min(1, x));
 }
 
 main().catch((err) => {
