@@ -26,12 +26,12 @@ function parseDate(v) {
   }
 }
 
-function todayDate() {
+function todayDate(nowMs = Date.now()) {
   const tz = env.CANDLE_TZ || "Asia/Kolkata";
-  return DateTime.now().setZone(tz).startOf("day").toJSDate();
+  return DateTime.fromMillis(Number(nowMs)).setZone(tz).startOf("day").toJSDate();
 }
 
-function _dteDays(expiryISO) {
+function _dteDays(expiryISO, nowMs = Date.now()) {
   const tz = env.CANDLE_TZ || "Asia/Kolkata";
   const e = String(expiryISO || "").slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(e)) return null;
@@ -42,7 +42,7 @@ function _dteDays(expiryISO) {
     millisecond: 0,
   });
   if (!exp.isValid) return null;
-  const now = DateTime.now().setZone(tz);
+  const now = DateTime.fromMillis(Number(nowMs)).setZone(tz);
   const hours = exp.diff(now, "hours").hours;
   if (!Number.isFinite(hours)) return null;
   return hours / 24;
@@ -128,6 +128,7 @@ async function buildOptionSubscriptionCandidates({
   underlyingToken,
   underlyingTradingsymbol,
   underlyingLtp,
+  nowMs = Date.now(),
 }) {
   const u = resolveUnderlyingFromUniverse({
     universe,
@@ -159,8 +160,8 @@ async function buildOptionSubscriptionCandidates({
       })
       .filter(Boolean),
     env,
-    nowMs: Date.now(),
-  })?.expiryISO || pickNearestExpiryISO(optionRows);
+    nowMs,
+  })?.expiryISO || pickNearestExpiryISO(optionRows, nowMs);
 
   const slice = optionRows.filter((r) => {
     const exp = parseDate(r.expiry);
@@ -225,9 +226,9 @@ function detectStrikeStepFromRows(rows, fallbackStep) {
   return fallbackStep;
 }
 
-function pickNearestExpiryISO(rows) {
+function pickNearestExpiryISO(rows, nowMs = Date.now()) {
   // Returns an ISO yyyy-mm-dd string (nearest non-past expiry).
-  const today = todayDate();
+  const today = todayDate(nowMs);
   let bestExp = null;
   for (const r of rows || []) {
     const exp = parseDate(r.expiry);
@@ -469,6 +470,7 @@ async function pickOptionContractForSignal({
   forceExpiryISO,
   gateStage = 0,
   triedExpiries = [],
+  nowMs = Date.now(),
 }) {
   const u = resolveUnderlyingFromUniverse({
     universe,
@@ -551,9 +553,9 @@ async function pickOptionContractForSignal({
     })
     .filter(Boolean);
 
-  let expiryISO = forceExpiryISO || pickNearestExpiryISO(optionRows);
+  let expiryISO = forceExpiryISO || pickNearestExpiryISO(optionRows, nowMs);
   // Apply roll rules (min DTE / avoid expiry-day after cutoff)
-  const picked = pickBestExpiryISO({ expiries, env, nowMs: Date.now() });
+  const picked = pickBestExpiryISO({ expiries, env, nowMs });
   if (!forceExpiryISO && picked?.expiryISO) expiryISO = picked.expiryISO;
   const sortedExpiries = Array.from(new Set(expiries)).sort();
 
@@ -669,7 +671,7 @@ async function pickOptionContractForSignal({
     candidates,
     ttlMs,
     underlyingLtp,
-    nowMs: Date.now(),
+    nowMs,
   });
 
   const band = getPremiumBandForUnderlying(underlying);
@@ -710,7 +712,7 @@ async function pickOptionContractForSignal({
 
   const gammaMax = Number(env.OPT_GAMMA_MAX ?? 0.004);
   const gammaGateDteDays = Number(env.OPT_GAMMA_GATE_DTE_DAYS ?? 0.5);
-  const dteDays = _dteDays(expiryISO);
+  const dteDays = _dteDays(expiryISO, nowMs);
   const gammaGateActive = Number.isFinite(dteDays)
     ? dteDays <= gammaGateDteDays
     : false;

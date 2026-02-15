@@ -52,9 +52,9 @@ function matchesUnderlying(row, underlying) {
   );
 }
 
-function todayYMD() {
+function todayYMD(nowMs = Date.now()) {
   const tz = env.CANDLE_TZ || "Asia/Kolkata";
-  return DateTime.now().setZone(tz).toFormat("yyyy-MM-dd");
+  return DateTime.fromMillis(Number(nowMs)).setZone(tz).toFormat("yyyy-MM-dd");
 }
 
 function isEnabled() {
@@ -65,8 +65,8 @@ function getLastFnoUniverse() {
   return lastUniverse;
 }
 
-function bestRowByNearestExpiry(rows) {
-  const today = parseDate(todayYMD());
+function bestRowByNearestExpiry(rows, nowMs = Date.now()) {
+  const today = parseDate(todayYMD(nowMs));
   let best = null;
   let bestExp = null;
   let fallback = null;
@@ -84,7 +84,7 @@ function bestRowByNearestExpiry(rows) {
     const policy = isExpiryAllowed({
       expiryISO: r.expiry,
       env,
-      nowMs: Date.now(),
+      nowMs,
       minDaysToExpiry: env.FNO_MIN_DAYS_TO_EXPIRY,
       avoidExpiryDayAfter: env.FNO_AVOID_EXPIRY_DAY_AFTER,
     });
@@ -98,7 +98,7 @@ function bestRowByNearestExpiry(rows) {
   return best || fallback;
 }
 
-async function pickNearestFuture(kite, underlying, exchanges) {
+async function pickNearestFuture(kite, underlying, exchanges, nowMs = Date.now()) {
   const exList = uniq(exchanges);
   const u = String(underlying || "").toUpperCase();
 
@@ -115,7 +115,7 @@ async function pickNearestFuture(kite, underlying, exchanges) {
       return isFuture && matchesUnderlying(r, u);
     });
 
-    const best = bestRowByNearestExpiry(futs);
+    const best = bestRowByNearestExpiry(futs, nowMs);
     if (best) {
       return {
         underlying: u,
@@ -180,7 +180,7 @@ async function pickSpotIndexToken(kite, underlying) {
   };
 }
 
-async function buildFnoUniverse({ kite }) {
+async function buildFnoUniverse({ kite, nowMs = Date.now() }) {
   if (!isEnabled()) {
     lastUniverse = {
       ok: true,
@@ -208,7 +208,7 @@ async function buildFnoUniverse({ kite }) {
     let picked = null;
 
     if (mode === "FUT") {
-      picked = await pickNearestFuture(kite, u, exchanges);
+      picked = await pickNearestFuture(kite, u, exchanges, nowMs);
     } else if (mode === "OPT") {
       const src = String(env.OPT_UNDERLYING_SOURCE || "FUT").toUpperCase();
       const strikeRefSrc = String(
@@ -217,7 +217,7 @@ async function buildFnoUniverse({ kite }) {
       const signalContract =
         src === "SPOT"
           ? await pickSpotIndexToken(kite, u)
-          : await pickNearestFuture(kite, u, exchanges);
+          : await pickNearestFuture(kite, u, exchanges, nowMs);
 
       const spotRefContract = await pickSpotIndexToken(kite, u);
       const strikeRefContract =
