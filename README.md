@@ -422,6 +422,14 @@ Useful CLI utilities:
   ```bash
   npm run health:critical
   ```
+- **Run backtest engine** (supports EQ and dynamic OPT contracts)
+  ```bash
+  npm run bt:run -- --mode=OPT --token=260105 --underlying="NIFTY 50" --dynamicContracts=true --from=2025-01-01 --to=2025-01-31 --interval=1 --qty=50 --forceEodExit=true
+  ```
+- **Prepare option universe + historical candles for backtests**
+  ```bash
+  npm run bt:prepare-options -- --underlyingToken=260105 --underlying="NIFTY 50" --optionType=ALL --from=2025-01-01 --to=2025-01-31 --interval=1 --refreshInstruments=true
+  ```
 
 ---
 

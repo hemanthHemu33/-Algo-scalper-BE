@@ -98,6 +98,13 @@ function resolveExitPrice({ side, candle, stopLoss, targetPrice, conservative = 
   return { hit: false, reason: null, price: null };
 }
 
+function isTargetEnabledForMode(mode) {
+  if (String(mode).toUpperCase() === "OPT") {
+    return String(env.OPT_TP_ENABLED || "false") === "true";
+  }
+  return true;
+}
+
 async function main() {
   const mode = String(getArg("--mode", "EQ")).toUpperCase();
   const token = n(getArg("--token"), NaN);
@@ -145,6 +152,7 @@ async function main() {
 
   const candles = await col.find(q).sort({ ts: 1 }).limit(limit).toArray();
   if (!candles.length) throw new Error("No candles found for query");
+  const tokenInstrument = await db.collection("instruments_cache").findOne({ instrument_token: Number(token) });
 
   const dataQuality = dataQualityMode === "off" ? null : assessDataQuality({ candles, intervalMin, timezone });
   const dataIssues = Number(dataQuality?.summary?.totalIssues || 0);
@@ -188,10 +196,12 @@ async function main() {
   let peak = 0;
   let maxDD = 0;
 
-  for (let i = warmup; i < candles.length; i += 1) {
+  const replaySlice = [];
+  for (let i = 0; i < candles.length; i += 1) {
     const candle = candles[i];
+    replaySlice.push(candle);
+    if (i < warmup) continue;
     clock.set(candle.ts);
-    const slice = candles.slice(0, i + 1);
     const nowMs = clock.nowMs();
 
     if (pendingEntry && !openTrade && i >= pendingEntry.executeAtIdx) {
@@ -237,7 +247,12 @@ async function main() {
         if (filledQty > 0 && Number.isFinite(entryPrice) && entryPrice > 0) {
           const riskPts = Math.max(0.05, entryPrice * (slPct / 100));
           const stopLoss = pendingEntry.side === "BUY" ? entryPrice - riskPts : entryPrice + riskPts;
-          const targetPrice = pendingEntry.side === "BUY" ? entryPrice + rrTarget * riskPts : entryPrice - rrTarget * riskPts;
+          const targetEnabled = isTargetEnabledForMode(mode);
+          const targetPrice = targetEnabled
+            ? pendingEntry.side === "BUY"
+              ? entryPrice + rrTarget * riskPts
+              : entryPrice - rrTarget * riskPts
+            : null;
 
           openTrade = {
             side: pendingEntry.side,
@@ -275,7 +290,9 @@ async function main() {
             entryExecutionModel: exec || null,
             instrument: instrumentFromContract({
               fallbackToken: Number(token),
+              fallbackInstrument: tokenInstrument,
               selected: pendingEntry.selectedContract?.selected,
+              mode,
             }),
             exitFills: [],
             realizedGrossPnl: 0,
@@ -295,8 +312,13 @@ async function main() {
           : underlyingCandle;
       const managedCandles =
         mode === "OPT" && openTrade?.contractToken
-          ? optionProvider?.getCandlesUpToTs?.(openTrade.contractToken, underlyingCandle.ts) || []
-          : slice;
+          ? upsertOptionManagedCandles({
+              optionProvider,
+              token: openTrade.contractToken,
+              ts: underlyingCandle.ts,
+              trade: openTrade,
+            })
+          : replaySlice;
       const ltp = Number(tradedCandle?.close);
       if (Number.isFinite(ltp) && ltp > 0) openTrade.lastLtp = ltp;
 
@@ -331,7 +353,7 @@ async function main() {
         side: openTrade.side,
         candle: pricePathCandle,
         stopLoss: openTrade.stopLoss,
-        targetPrice: openTrade.targetPrice,
+        targetPrice: isTargetEnabledForMode(mode) ? openTrade.targetPrice : null,
         conservative: true,
       });
 
@@ -427,8 +449,11 @@ async function main() {
           equityCurve.push({ ts: underlyingCandle.ts, equity, drawdown: equity - peak });
 
           if (openTrade.qty <= 0) {
+            const finalizedTrade = { ...openTrade };
+            delete finalizedTrade._managedCandles;
+            delete finalizedTrade._lastManagedTs;
             trades.push({
-              ...openTrade,
+              ...finalizedTrade,
               qty: Number(openTrade.initialQty || 0),
               remainingQty: 0,
               exitTs: underlyingCandle.ts,
@@ -449,7 +474,7 @@ async function main() {
 
     if (!openTrade && !pendingEntry) {
       const sig = evaluateOnCandles({
-        candles: slice,
+        candles: replaySlice,
         intervalMin,
         instrument_token: token,
         now: clock.nowDate(),
@@ -504,8 +529,11 @@ async function main() {
       maxDD = Math.min(maxDD, equity - peak);
       equityCurve.push({ ts: last?.ts || new Date(), equity, drawdown: equity - peak });
 
+      const finalizedTrade = { ...openTrade };
+      delete finalizedTrade._managedCandles;
+      delete finalizedTrade._lastManagedTs;
       trades.push({
-        ...openTrade,
+        ...finalizedTrade,
         qty: Number(openTrade.initialQty || openTrade.qty || 0),
         remainingQty: 0,
         exitTs: last?.ts || new Date(),
@@ -723,18 +751,45 @@ function evaluateEodBoundary({ candles, idx, intervalMin, timezone }) {
   return { shouldExitNow: false, reason: null };
 }
 
-function instrumentFromContract({ fallbackToken, selected }) {
-  const token = Number(selected?.token || fallbackToken);
-  const tick = Number(selected?.instrument?.tick_size || 0.05);
-  const lot = Number(selected?.instrument?.lot_size || 1);
-  const tradingsymbol = String(selected?.instrument?.tradingsymbol || "").toUpperCase() || null;
-  const segment = String(selected?.instrument?.segment || "").toUpperCase() || null;
+function upsertOptionManagedCandles({ optionProvider, token, ts, trade }) {
+  if (!trade || !Number.isFinite(Number(token))) return [];
+  if (!Array.isArray(trade._managedCandles)) {
+    trade._managedCandles = optionProvider?.getCandlesUpToTs?.(token, ts) || [];
+    const lastTs = trade._managedCandles.length ? new Date(trade._managedCandles[trade._managedCandles.length - 1].ts).getTime() : null;
+    trade._lastManagedTs = Number.isFinite(lastTs) ? lastTs : null;
+    return trade._managedCandles;
+  }
+
+  const next = optionProvider?.getCandleAtTs?.(token, ts) || null;
+  const nextTs = new Date(ts).getTime();
+  if (next && Number.isFinite(nextTs) && (!Number.isFinite(trade._lastManagedTs) || nextTs > trade._lastManagedTs)) {
+    trade._managedCandles.push(next);
+    trade._lastManagedTs = nextTs;
+  }
+  return trade._managedCandles;
+}
+
+function instrumentFromContract({ fallbackToken, fallbackInstrument, selected, mode }) {
+  const selectedInstrument = selected?.instrument || null;
+  const inferredMode = String(mode || "").toUpperCase();
+  const token = Number(selected?.token || fallbackInstrument?.instrument_token || fallbackToken);
+  const tick = Number(selectedInstrument?.tick_size || fallbackInstrument?.tick_size || 0.05);
+  const lot = Number(selectedInstrument?.lot_size || fallbackInstrument?.lot_size || 1);
+  const tradingsymbol =
+    String(selectedInstrument?.tradingsymbol || fallbackInstrument?.tradingsymbol || "").toUpperCase() || null;
+  const segmentRaw =
+    String(selectedInstrument?.segment || fallbackInstrument?.segment || "").toUpperCase() ||
+    (inferredMode === "OPT" ? "NFO-OPT" : inferredMode === "FUT" ? "NFO-FUT" : "NSE");
+  const instrumentType =
+    String(selectedInstrument?.instrument_type || fallbackInstrument?.instrument_type || "").toUpperCase() ||
+    (inferredMode === "OPT" ? "CE" : inferredMode === "FUT" ? "FUT" : "EQ");
   return {
     instrument_token: token,
     tick_size: Number.isFinite(tick) && tick > 0 ? tick : 0.05,
     lot_size: Number.isFinite(lot) && lot > 0 ? lot : 1,
     tradingsymbol,
-    segment,
+    segment: segmentRaw,
+    instrument_type: instrumentType,
   };
 }
 
