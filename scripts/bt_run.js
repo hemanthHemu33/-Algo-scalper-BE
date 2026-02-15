@@ -95,6 +95,21 @@ function resolveExitPrice({ side, candle, stopLoss, targetPrice, conservative = 
   return { hit: false, reason: null, price: null };
 }
 
+function applyTradePatch(trade, patch) {
+  if (!trade || !patch || typeof patch !== "object") return trade;
+  for (const [k, v] of Object.entries(patch)) {
+    trade[k] = v;
+  }
+  return trade;
+}
+
+function findCandleAtTs(candles, ts) {
+  if (!Array.isArray(candles) || !candles.length) return null;
+  const want = new Date(ts).getTime();
+  if (!Number.isFinite(want)) return null;
+  return candles.find((c) => new Date(c.ts).getTime() === want) || null;
+}
+
 async function main() {
   const mode = String(getArg("--mode", "EQ")).toUpperCase();
   const token = n(getArg("--token"), NaN);
@@ -170,27 +185,41 @@ async function main() {
     const candle = candles[i];
     clock.set(candle.ts);
     const slice = candles.slice(0, i + 1);
+    const nowMs = clock.nowMs();
 
     if (openTrade) {
+      const optionCandles =
+        mode === "OPT" && openTrade?.contractToken
+          ? optionProvider?.getCandlesByToken?.(openTrade.contractToken) || []
+          : [];
+      const tradedCandle =
+        mode === "OPT" && openTrade?.contractToken
+          ? findCandleAtTs(optionCandles, candle.ts)
+          : candle;
       const managedCandles =
         mode === "OPT" && openTrade?.contractToken
-          ? optionProvider?.getCandlesByToken?.(openTrade.contractToken) || slice
+          ? optionCandles.filter((c) => new Date(c.ts).getTime() <= nowMs)
           : slice;
+      const ltp = Number(tradedCandle?.close);
+      if (Number.isFinite(ltp) && ltp > 0) openTrade.lastLtp = ltp;
 
       const plan = computeDynamicExitPlan({
         trade: openTrade,
-        ltp: Number(candle.close),
+        ltp: Number.isFinite(ltp) && ltp > 0 ? ltp : Number(openTrade.lastLtp),
         candles: managedCandles,
-        nowTs: clock.nowMs(),
+        nowTs: nowMs,
         env,
       });
 
-      if (plan?.sl?.stopLoss) openTrade.stopLoss = Number(plan.sl.stopLoss);
-      if (plan?.target?.targetPrice) openTrade.targetPrice = Number(plan.target.targetPrice);
+      applyTradePatch(openTrade, plan?.tradePatch);
+      openTrade.updatedAt = new Date(nowMs);
+
+      if (Number.isFinite(Number(plan?.sl?.stopLoss))) openTrade.stopLoss = Number(plan.sl.stopLoss);
+      if (Number.isFinite(Number(plan?.target?.targetPrice))) openTrade.targetPrice = Number(plan.target.targetPrice);
 
       const pathExit = resolveExitPrice({
         side: openTrade.side,
-        candle,
+        candle: tradedCandle || candle,
         stopLoss: openTrade.stopLoss,
         targetPrice: openTrade.targetPrice,
         conservative: true,
@@ -198,12 +227,16 @@ async function main() {
 
       const forceExit = plan?.action?.exitNow;
       if (pathExit.hit || forceExit) {
-        const basePx = forceExit ? Number(candle.close) : pathExit.price;
+        const basePx = forceExit
+          ? Number.isFinite(ltp) && ltp > 0
+            ? ltp
+            : Number(openTrade.lastLtp || candle.close)
+          : pathExit.price;
         const exec = execRealism
           ? applyExecutionRealism({
               side: openTrade.side === "BUY" ? "SELL" : "BUY",
               intendedPrice: basePx,
-              candle,
+              candle: tradedCandle || candle,
               qty: openTrade.qty,
               rand: rng,
               model: {
@@ -307,8 +340,12 @@ async function main() {
         side,
         qty: filledQty,
         entryTs: candle.ts,
+        entryFilledAt: new Date(candle.ts),
+        createdAt: new Date(candle.ts),
+        updatedAt: new Date(candle.ts),
         entryIdx: i,
         entryPrice,
+        lastLtp: entryPrice,
         stopLoss,
         initialStopLoss: stopLoss,
         targetPrice,
