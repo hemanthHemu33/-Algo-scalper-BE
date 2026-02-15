@@ -120,6 +120,7 @@ async function main() {
   const execRealism = String(getArg("--execRealism", "true")) === "true";
   const eventBroker = String(getArg("--eventBroker", "true")) === "true";
   const calibrationDays = Math.max(1, n(getArg("--calibrationDays"), 5));
+  const calibrationMode = String(getArg("--calibrationMode", "fixed")).toLowerCase();
   const partialFillProbability = clamp01(n(getArg("--partialFillProbability"), 0.15));
   const minPartialFillRatio = clamp01(n(getArg("--minPartialFillRatio"), 0.35));
   const out = getArg("--out", `bt_result_${Date.now()}.json`);
@@ -157,7 +158,9 @@ async function main() {
       : null;
 
   const execCalibration = execRealism
-    ? await calibrateFromRecentTrades({ db, days: calibrationDays })
+    ? calibrationMode === "recent"
+      ? { ...(await calibrateFromRecentTrades({ db, days: calibrationDays })), source: "recent_trades" }
+      : buildCalibrationFallback()
     : null;
   const rng = seeded(seed);
 
@@ -165,6 +168,8 @@ async function main() {
   const trades = [];
   const equityCurve = [];
   let openTrade = null;
+  let pendingEntry = null;
+  let pendingExit = null;
   let equity = 0;
   let peak = 0;
   let maxDD = 0;
@@ -174,6 +179,99 @@ async function main() {
     clock.set(candle.ts);
     const slice = candles.slice(0, i + 1);
     const nowMs = clock.nowMs();
+
+    if (pendingEntry && !openTrade && i >= pendingEntry.executeAtIdx) {
+      const baseCandle = candle;
+      const tradedCandle =
+        mode === "OPT" && pendingEntry.selectedContract?.selectedToken
+          ? optionProvider?.getCandleAtTs?.(pendingEntry.selectedContract.selectedToken, baseCandle.ts) || null
+          : baseCandle;
+      const rawEntry = Number(tradedCandle?.close);
+      if (Number.isFinite(rawEntry) && rawEntry > 0) {
+        const entryExecModel = {
+          spreadBps: execCalibration?.avgSpreadBps ?? 0,
+          slippageBps: (execCalibration?.avgEntrySlipBps ?? 0) + slipBps,
+          partialFillProbability,
+          minPartialFillRatio,
+          eventBroker,
+          latencyBars: 0,
+          tickSize: Number(pendingEntry.selectedContract?.selected?.instrument?.tick_size || 0.05),
+        };
+        const exec = execRealism
+          ? eventBroker
+            ? simulateOrderLifecycle({
+                side: pendingEntry.side,
+                intent: { type: "MARKET", price: rawEntry },
+                candle: tradedCandle || baseCandle,
+                qty: pendingEntry.qty,
+                nowTs,
+                model: entryExecModel,
+                rand: rng,
+              })
+            : applyExecutionRealism({
+                side: pendingEntry.side,
+                intendedPrice: rawEntry,
+                candle: tradedCandle || baseCandle,
+                qty: pendingEntry.qty,
+                rand: rng,
+                model: entryExecModel,
+              })
+          : null;
+
+        const entryPrice = Number(exec?.avgFillPrice || rawEntry);
+        const filledQty = Number(exec?.filledQty || pendingEntry.qty);
+        if (filledQty > 0 && Number.isFinite(entryPrice) && entryPrice > 0) {
+          const riskPts = Math.max(0.05, entryPrice * (slPct / 100));
+          const stopLoss = pendingEntry.side === "BUY" ? entryPrice - riskPts : entryPrice + riskPts;
+          const targetPrice = pendingEntry.side === "BUY" ? entryPrice + rrTarget * riskPts : entryPrice - rrTarget * riskPts;
+
+          openTrade = {
+            side: pendingEntry.side,
+            qty: filledQty,
+            initialQty: filledQty,
+            requestedQty: pendingEntry.qty,
+            entryTs: candle.ts,
+            entryPlacedAt: pendingEntry.signalTs,
+            entryFilledAt: candle.ts,
+            createdAt: candle.ts,
+            updatedAt: candle.ts,
+            entryIdx: i,
+            entryPrice,
+            lastLtp: entryPrice,
+            stopLoss,
+            initialStopLoss: stopLoss,
+            targetPrice,
+            rr: rrTarget,
+            strategyId: pendingEntry.sig.strategyId,
+            confidence: Number(pendingEntry.sig.confidence || 0),
+            signalReason: pendingEntry.sig.reason || null,
+            mode,
+            contractToken: pendingEntry.selectedContract?.selectedToken || Number(token),
+            optionSnapshot: pendingEntry.selectedContract?.snapshot || null,
+            option_meta:
+              mode === "OPT"
+                ? {
+                    optType: optionType,
+                    strike: Number(pendingEntry.selectedContract?.selected?.strike || 0) || null,
+                    expiry: pendingEntry.selectedContract?.selected?.expiryISO || null,
+                    underlyingToken: Number(token),
+                  }
+                : null,
+            executionModel: exec || null,
+            entryExecutionModel: exec || null,
+            instrument: instrumentFromContract({
+              fallbackToken: Number(token),
+              selected: pendingEntry.selectedContract?.selected,
+            }),
+            exitFills: [],
+            realizedGrossPnl: 0,
+            realizedCostInr: 0,
+            realizedNetPnl: 0,
+          };
+        }
+      }
+      pendingEntry = null;
+    }
 
     if (openTrade) {
       const underlyingCandle = candle;
@@ -197,9 +295,7 @@ async function main() {
         underlyingLtp: Number(underlyingCandle.close),
       });
 
-      if (plan?.tradePatch && Object.keys(plan.tradePatch).length) {
-        Object.assign(openTrade, plan.tradePatch);
-      }
+      if (plan?.tradePatch && Object.keys(plan.tradePatch).length) Object.assign(openTrade, plan.tradePatch);
       openTrade.updatedAt = new Date(nowMs);
 
       if (Number.isFinite(Number(plan?.sl?.stopLoss))) openTrade.stopLoss = Number(plan.sl.stopLoss);
@@ -225,19 +321,31 @@ async function main() {
         conservative: true,
       });
 
-      const forceExit = plan?.action?.exitNow;
-      if (pathExit.hit || forceExit) {
-        const basePx = forceExit
-          ? Number.isFinite(ltp) && ltp > 0
-            ? ltp
-            : Number(openTrade.lastLtp || underlyingCandle.close)
-          : pathExit.price;
+      if (!pendingExit) {
+        const forceExit = plan?.action?.exitNow;
+        if (pathExit.hit || forceExit) {
+          const basePx = forceExit
+            ? Number.isFinite(ltp) && ltp > 0
+              ? ltp
+              : Number(openTrade.lastLtp || underlyingCandle.close)
+            : pathExit.price;
+          const latencyBars = Math.max(0, Math.round((execCalibration?.avgFillLatencyMs || 0) / (intervalMin * 60 * 1000)));
+          pendingExit = {
+            executeAtIdx: i + latencyBars,
+            basePx,
+            reason: forceExit ? String(plan?.action?.reason || "DYNAMIC_EXIT") : pathExit.reason,
+            triggeredAt: underlyingCandle.ts,
+          };
+        }
+      }
+
+      if (pendingExit && i >= pendingExit.executeAtIdx) {
         const execModel = {
           spreadBps: execCalibration?.avgSpreadBps ?? 0,
           slippageBps: (execCalibration?.avgEntrySlipBps ?? 0) + slipBps,
           partialFillProbability,
           minPartialFillRatio,
-      eventBroker,
+          eventBroker,
           latencyBars: 0,
           tickSize: openTrade?.instrument?.tick_size || 0.05,
         };
@@ -245,7 +353,7 @@ async function main() {
           ? eventBroker
             ? simulateOrderLifecycle({
                 side: openTrade.side === "BUY" ? "SELL" : "BUY",
-                intent: { type: "MARKET", price: basePx },
+                intent: { type: "MARKET", price: pendingExit.basePx },
                 candle: pricePathCandle || underlyingCandle,
                 qty: openTrade.qty,
                 nowTs,
@@ -254,47 +362,67 @@ async function main() {
               })
             : applyExecutionRealism({
                 side: openTrade.side === "BUY" ? "SELL" : "BUY",
-                intendedPrice: basePx,
+                intendedPrice: pendingExit.basePx,
                 candle: pricePathCandle || underlyingCandle,
                 qty: openTrade.qty,
                 rand: rng,
                 model: execModel,
               })
           : null;
-        const exitPrice = Number(exec?.avgFillPrice || basePx);
-        const filledQty = Number(exec?.filledQty || openTrade.qty);
-        const signed = openTrade.side === "BUY" ? 1 : -1;
-        const grossPnl = (exitPrice - openTrade.entryPrice) * filledQty * signed;
-        const costs = estimateRoundTripCostInr({
-          entryPrice: (openTrade.entryPrice + exitPrice) / 2,
-          qty: filledQty,
-          spreadBps: 0,
-          env,
-          instrument: openTrade.instrument,
-        });
-        const netPnl = grossPnl - Number(costs.estCostInr || 0);
 
-        equity += netPnl;
-        peak = Math.max(peak, equity);
-        maxDD = Math.min(maxDD, equity - peak);
-        equityCurve.push({ ts: underlyingCandle.ts, equity, drawdown: equity - peak });
+        const exitPrice = Number(exec?.avgFillPrice || pendingExit.basePx);
+        const filledQty = Math.max(0, Math.min(Number(openTrade.qty || 0), Number(exec?.filledQty || openTrade.qty)));
+        if (filledQty > 0 && Number.isFinite(exitPrice)) {
+          const signed = openTrade.side === "BUY" ? 1 : -1;
+          const grossPnl = (exitPrice - openTrade.entryPrice) * filledQty * signed;
+          const costs = estimateRoundTripCostInr({
+            entryPrice: (openTrade.entryPrice + exitPrice) / 2,
+            qty: filledQty,
+            spreadBps: 0,
+            env,
+            instrument: openTrade.instrument,
+          });
+          const netPnl = grossPnl - Number(costs.estCostInr || 0);
 
-        trades.push({
-          ...openTrade,
-          exitTs: underlyingCandle.ts,
-          exitReason: forceExit ? String(plan?.action?.reason || "DYNAMIC_EXIT") : pathExit.reason,
-          exitPrice,
-          grossPnl,
-          estCostInr: Number(costs.estCostInr || 0),
-          netPnl,
-          executionModel: exec || null,
-          holdCandles: i - openTrade.entryIdx,
-        });
-        openTrade = null;
+          openTrade.qty -= filledQty;
+          openTrade.realizedGrossPnl = Number(openTrade.realizedGrossPnl || 0) + grossPnl;
+          openTrade.realizedCostInr = Number(openTrade.realizedCostInr || 0) + Number(costs.estCostInr || 0);
+          openTrade.realizedNetPnl = Number(openTrade.realizedNetPnl || 0) + netPnl;
+          openTrade.exitFills.push({
+            ts: underlyingCandle.ts,
+            qty: filledQty,
+            price: exitPrice,
+            reason: pendingExit.reason,
+            executionModel: exec || null,
+          });
+
+          equity += netPnl;
+          peak = Math.max(peak, equity);
+          maxDD = Math.min(maxDD, equity - peak);
+          equityCurve.push({ ts: underlyingCandle.ts, equity, drawdown: equity - peak });
+
+          if (openTrade.qty <= 0) {
+            trades.push({
+              ...openTrade,
+              qty: Number(openTrade.initialQty || 0),
+              remainingQty: 0,
+              exitTs: underlyingCandle.ts,
+              exitReason: pendingExit.reason,
+              exitPrice,
+              grossPnl: Number(openTrade.realizedGrossPnl || 0),
+              estCostInr: Number(openTrade.realizedCostInr || 0),
+              netPnl: Number(openTrade.realizedNetPnl || 0),
+              executionModel: exec || null,
+              holdCandles: i - openTrade.entryIdx,
+            });
+            openTrade = null;
+          }
+        }
+        pendingExit = null;
       }
     }
 
-    if (!openTrade) {
+    if (!openTrade && !pendingEntry) {
       const sig = evaluateOnCandles({
         candles: slice,
         intervalMin,
@@ -316,73 +444,16 @@ async function main() {
             })
           : null;
 
-      const tradedCandle =
-        mode === "OPT" && selectedContract?.selectedToken
-          ? optionProvider?.getCandleAtTs?.(selectedContract.selectedToken, baseCandle.ts) || null
-          : baseCandle;
+      if (mode === "OPT" && dynamicContracts && !selectedContract?.selectedToken) continue;
 
-      const rawEntry = Number(tradedCandle?.close);
-      if (!Number.isFinite(rawEntry) || rawEntry <= 0) continue;
-
-      const entryExecModel = {
-        spreadBps: execCalibration?.avgSpreadBps ?? 0,
-        slippageBps: (execCalibration?.avgEntrySlipBps ?? 0) + slipBps,
-        partialFillProbability,
-        minPartialFillRatio,
-      eventBroker,
-        latencyBars: Math.round((execCalibration?.avgFillLatencyMs || 0) / (intervalMin * 60 * 1000)),
-        tickSize: 0.05,
-      };
-      const exec = execRealism
-        ? eventBroker
-          ? simulateOrderLifecycle({
-              side,
-              intent: { type: "MARKET", price: rawEntry },
-              candle: tradedCandle || baseCandle,
-              qty,
-              nowTs,
-              model: entryExecModel,
-              rand: rng,
-            })
-          : applyExecutionRealism({
-              side,
-              intendedPrice: rawEntry,
-              candle: tradedCandle || baseCandle,
-              qty,
-              rand: rng,
-              model: entryExecModel,
-            })
-        : null;
-
-      const entryPrice = Number(exec?.avgFillPrice || rawEntry);
-      const filledQty = Number(exec?.filledQty || qty);
-      const riskPts = Math.max(0.05, entryPrice * (slPct / 100));
-      const stopLoss = side === "BUY" ? entryPrice - riskPts : entryPrice + riskPts;
-      const targetPrice = side === "BUY" ? entryPrice + rrTarget * riskPts : entryPrice - rrTarget * riskPts;
-
-      openTrade = {
+      const latencyBars = Math.max(0, Math.round((execCalibration?.avgFillLatencyMs || 0) / (intervalMin * 60 * 1000)));
+      pendingEntry = {
+        executeAtIdx: i + latencyBars,
+        signalTs: candle.ts,
         side,
-        qty: filledQty,
-        entryTs: candle.ts,
-        entryPlacedAt: candle.ts,
-        entryFilledAt: candle.ts,
-        createdAt: candle.ts,
-        updatedAt: candle.ts,
-        entryIdx: i,
-        entryPrice,
-        lastLtp: entryPrice,
-        stopLoss,
-        initialStopLoss: stopLoss,
-        targetPrice,
-        rr: rrTarget,
-        strategyId: sig.strategyId,
-        confidence: Number(sig.confidence || 0),
-        signalReason: sig.reason || null,
-        mode,
-        contractToken: selectedContract?.selectedToken || Number(token),
-        optionSnapshot: selectedContract?.snapshot || null,
-        executionModel: exec || null,
-        instrument: { instrument_token: Number(token), tick_size: 0.05 },
+        qty,
+        sig,
+        selectedContract,
       };
     }
   }
@@ -404,7 +475,7 @@ async function main() {
     seed,
     gitHash: gitHash(),
     configSnapshot: pickEnvSnapshot(),
-    params: { warmup, qty, rrTarget, slPct, slippageBps: slipBps, eventBroker },
+    params: { warmup, qty, rrTarget, slPct, slippageBps: slipBps, eventBroker, calibrationMode },
     phase3: {
       mode,
       dynamicContracts,
@@ -417,6 +488,7 @@ async function main() {
     phase4: {
       executionRealism: execRealism,
       calibrationDays,
+      calibrationMode,
       calibration: execCalibration,
       partialFillProbability,
       minPartialFillRatio,
@@ -480,6 +552,32 @@ function clamp01(v) {
   const x = Number(v);
   if (!Number.isFinite(x)) return 0;
   return Math.max(0, Math.min(1, x));
+}
+
+function buildCalibrationFallback() {
+  return {
+    sampleSize: 0,
+    avgEntrySlipBps: 0,
+    avgSpreadBps: 0,
+    avgFillRatio: 1,
+    avgFillLatencyMs: 0,
+    source: "fallback",
+  };
+}
+
+function instrumentFromContract({ fallbackToken, selected }) {
+  const token = Number(selected?.token || fallbackToken);
+  const tick = Number(selected?.instrument?.tick_size || 0.05);
+  const lot = Number(selected?.instrument?.lot_size || 1);
+  const tradingsymbol = String(selected?.instrument?.tradingsymbol || "").toUpperCase() || null;
+  const segment = String(selected?.instrument?.segment || "").toUpperCase() || null;
+  return {
+    instrument_token: token,
+    tick_size: Number.isFinite(tick) && tick > 0 ? tick : 0.05,
+    lot_size: Number.isFinite(lot) && lot > 0 ? lot : 1,
+    tradingsymbol,
+    segment,
+  };
 }
 
 main().catch((err) => {
