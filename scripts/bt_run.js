@@ -2,10 +2,12 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
+const { DateTime } = require("luxon");
 
 const { env } = require("../src/config");
 const { connectMongo, getDb } = require("../src/db");
 const { collectionName } = require("../src/market/candleStore");
+const { getSessionForDateTime, buildBoundsForToday } = require("../src/market/marketCalendar");
 const { evaluateOnCandles } = require("../src/strategy/replayEngine");
 const { computeDynamicExitPlan } = require("../src/trading/dynamicExitManager");
 const { estimateRoundTripCostInr } = require("../src/trading/costModel");
@@ -121,6 +123,9 @@ async function main() {
   const eventBroker = String(getArg("--eventBroker", "true")) === "true";
   const calibrationDays = Math.max(1, n(getArg("--calibrationDays"), 5));
   const calibrationMode = String(getArg("--calibrationMode", "fixed")).toLowerCase();
+  const dataQualityMode = String(getArg("--dataQuality", "strict")).toLowerCase(); // off|warn|strict
+  const forceEodExit = String(getArg("--forceEodExit", "false")) === "true";
+  const timezone = String(getArg("--timezone", env.CANDLE_TZ || "Asia/Kolkata"));
   const partialFillProbability = clamp01(n(getArg("--partialFillProbability"), 0.15));
   const minPartialFillRatio = clamp01(n(getArg("--minPartialFillRatio"), 0.35));
   const out = getArg("--out", `bt_result_${Date.now()}.json`);
@@ -140,6 +145,15 @@ async function main() {
 
   const candles = await col.find(q).sort({ ts: 1 }).limit(limit).toArray();
   if (!candles.length) throw new Error("No candles found for query");
+
+  const dataQuality = dataQualityMode === "off" ? null : assessDataQuality({ candles, intervalMin, timezone });
+  const dataIssues = Number(dataQuality?.summary?.totalIssues || 0);
+  if (dataIssues > 0 && dataQualityMode === "strict") {
+    throw new Error(`Data quality validation failed (${dataIssues} issues). Re-run with --dataQuality=warn to inspect.`);
+  }
+  if (dataIssues > 0 && dataQualityMode === "warn") {
+    console.warn("[bt_run] data quality guardrails warnings", dataQuality.summary);
+  }
 
   const optionProvider =
     mode === "OPT" && dynamicContracts
@@ -204,7 +218,7 @@ async function main() {
                 intent: { type: "MARKET", price: rawEntry },
                 candle: tradedCandle || baseCandle,
                 qty: pendingEntry.qty,
-                nowTs,
+                nowTs: nowMs,
                 model: entryExecModel,
                 rand: rng,
               })
@@ -323,17 +337,28 @@ async function main() {
 
       if (!pendingExit) {
         const forceExit = plan?.action?.exitNow;
-        if (pathExit.hit || forceExit) {
+        const eodBoundary = forceEodExit ? evaluateEodBoundary({ candles, idx: i, intervalMin, timezone }) : null;
+        if (pathExit.hit || forceExit || eodBoundary?.shouldExitNow) {
           const basePx = forceExit
             ? Number.isFinite(ltp) && ltp > 0
               ? ltp
               : Number(openTrade.lastLtp || underlyingCandle.close)
             : pathExit.price;
+          const exitBasePx =
+            eodBoundary?.shouldExitNow && !pathExit.hit && !forceExit
+              ? Number.isFinite(ltp) && ltp > 0
+                ? ltp
+                : Number(openTrade.lastLtp || underlyingCandle.close)
+              : basePx;
           const latencyBars = Math.max(0, Math.round((execCalibration?.avgFillLatencyMs || 0) / (intervalMin * 60 * 1000)));
           pendingExit = {
             executeAtIdx: i + latencyBars,
-            basePx,
-            reason: forceExit ? String(plan?.action?.reason || "DYNAMIC_EXIT") : pathExit.reason,
+            basePx: exitBasePx,
+            reason: forceExit
+              ? String(plan?.action?.reason || "DYNAMIC_EXIT")
+              : eodBoundary?.shouldExitNow && !pathExit.hit
+                ? eodBoundary.reason
+                : pathExit.reason,
             triggeredAt: underlyingCandle.ts,
           };
         }
@@ -356,7 +381,7 @@ async function main() {
                 intent: { type: "MARKET", price: pendingExit.basePx },
                 candle: pricePathCandle || underlyingCandle,
                 qty: openTrade.qty,
-                nowTs,
+                nowTs: nowMs,
                 model: execModel,
                 rand: rng,
               })
@@ -458,6 +483,44 @@ async function main() {
     }
   }
 
+  if (openTrade && forceEodExit) {
+    const last = candles[candles.length - 1] || null;
+    const exitPrice = Number(last?.close || openTrade.lastLtp || openTrade.entryPrice);
+    const filledQty = Number(openTrade.qty || 0);
+    if (filledQty > 0 && Number.isFinite(exitPrice) && exitPrice > 0) {
+      const signed = openTrade.side === "BUY" ? 1 : -1;
+      const grossPnl = (exitPrice - openTrade.entryPrice) * filledQty * signed;
+      const costs = estimateRoundTripCostInr({
+        entryPrice: (openTrade.entryPrice + exitPrice) / 2,
+        qty: filledQty,
+        spreadBps: 0,
+        env,
+        instrument: openTrade.instrument,
+      });
+      const netPnl = grossPnl - Number(costs.estCostInr || 0);
+
+      equity += netPnl;
+      peak = Math.max(peak, equity);
+      maxDD = Math.min(maxDD, equity - peak);
+      equityCurve.push({ ts: last?.ts || new Date(), equity, drawdown: equity - peak });
+
+      trades.push({
+        ...openTrade,
+        qty: Number(openTrade.initialQty || openTrade.qty || 0),
+        remainingQty: 0,
+        exitTs: last?.ts || new Date(),
+        exitReason: "FORCE_EOD_END",
+        exitPrice,
+        grossPnl,
+        estCostInr: Number(costs.estCostInr || 0),
+        netPnl,
+        holdCandles: candles.length - 1 - Number(openTrade.entryIdx || 0),
+      });
+    }
+    openTrade = null;
+    pendingExit = null;
+  }
+
   const wins = trades.filter((t) => Number(t.netPnl) > 0).length;
   const losses = trades.filter((t) => Number(t.netPnl) <= 0).length;
   const totalNet = trades.reduce((a, t) => a + Number(t.netPnl || 0), 0);
@@ -475,7 +538,8 @@ async function main() {
     seed,
     gitHash: gitHash(),
     configSnapshot: pickEnvSnapshot(),
-    params: { warmup, qty, rrTarget, slPct, slippageBps: slipBps, eventBroker, calibrationMode },
+    params: { warmup, qty, rrTarget, slPct, slippageBps: slipBps, eventBroker, calibrationMode, dataQualityMode, forceEodExit, timezone },
+    dataQuality: dataQuality || { mode: "off" },
     phase3: {
       mode,
       dynamicContracts,
@@ -490,6 +554,11 @@ async function main() {
       calibrationDays,
       calibrationMode,
       calibration: execCalibration,
+      deterministic: calibrationMode !== "recent",
+      determinismNote:
+        calibrationMode === "recent"
+          ? "Calibration derives from recent DB trades; results can vary when history changes."
+          : "Deterministic execution calibration (fixed fallback mode).",
       partialFillProbability,
       minPartialFillRatio,
       eventBroker,
@@ -563,6 +632,95 @@ function buildCalibrationFallback() {
     avgFillLatencyMs: 0,
     source: "fallback",
   };
+}
+
+function assessDataQuality({ candles, intervalMin, timezone }) {
+  const intervalMs = Math.max(1, Number(intervalMin)) * 60 * 1000;
+  const issues = {
+    nonMonotonicTs: [],
+    intervalAlignment: [],
+    gaps: [],
+    sessionBoundary: [],
+  };
+
+  for (let i = 0; i < candles.length; i += 1) {
+    const cur = candles[i];
+    const ts = new Date(cur?.ts).getTime();
+    const dt = DateTime.fromJSDate(new Date(cur.ts), { zone: timezone });
+
+    if (!dt.isValid || dt.second !== 0 || dt.millisecond !== 0 || dt.minute % intervalMin !== 0) {
+      issues.intervalAlignment.push({ idx: i, ts: cur?.ts || null });
+    }
+
+    const closeTs = dt.plus({ minutes: Math.max(1, intervalMin) });
+    const session = getSessionForDateTime(closeTs);
+    const { open, close } = buildBoundsForToday(session, closeTs);
+    const inSession =
+      session.allowTradingDay &&
+      open?.isValid &&
+      close?.isValid &&
+      closeTs.toMillis() >= open.toMillis() &&
+      closeTs.toMillis() <= close.toMillis();
+    if (!inSession) {
+      issues.sessionBoundary.push({ idx: i, ts: cur?.ts || null, dayKey: session.dayKey });
+    }
+
+    if (i === 0) continue;
+    const prev = candles[i - 1];
+    const prevTs = new Date(prev?.ts).getTime();
+    const diff = ts - prevTs;
+    if (!Number.isFinite(ts) || !Number.isFinite(prevTs) || diff <= 0) {
+      issues.nonMonotonicTs.push({ prevIdx: i - 1, idx: i, prevTs: prev?.ts || null, ts: cur?.ts || null });
+      continue;
+    }
+    const prevDt = DateTime.fromJSDate(new Date(prev.ts), { zone: timezone });
+    const sameSessionDay = prevDt.isValid && dt.isValid && prevDt.toFormat("yyyy-LL-dd") === dt.toFormat("yyyy-LL-dd");
+    if (sameSessionDay && diff > intervalMs) {
+      issues.gaps.push({ prevIdx: i - 1, idx: i, prevTs: prev?.ts || null, ts: cur?.ts || null, gapMs: diff - intervalMs });
+    }
+  }
+
+  return {
+    summary: {
+      candles: candles.length,
+      nonMonotonicTs: issues.nonMonotonicTs.length,
+      intervalAlignment: issues.intervalAlignment.length,
+      gaps: issues.gaps.length,
+      sessionBoundary: issues.sessionBoundary.length,
+      totalIssues:
+        issues.nonMonotonicTs.length +
+        issues.intervalAlignment.length +
+        issues.gaps.length +
+        issues.sessionBoundary.length,
+    },
+    samples: {
+      nonMonotonicTs: issues.nonMonotonicTs.slice(0, 10),
+      intervalAlignment: issues.intervalAlignment.slice(0, 10),
+      gaps: issues.gaps.slice(0, 10),
+      sessionBoundary: issues.sessionBoundary.slice(0, 10),
+    },
+  };
+}
+
+function evaluateEodBoundary({ candles, idx, intervalMin, timezone }) {
+  const cur = candles[idx];
+  const next = candles[idx + 1] || null;
+  if (!cur) return { shouldExitNow: false, reason: null };
+  if (!next) return { shouldExitNow: true, reason: "FORCE_EOD_DATA_END" };
+
+  const curDt = DateTime.fromJSDate(new Date(cur.ts), { zone: timezone });
+  const nextDt = DateTime.fromJSDate(new Date(next.ts), { zone: timezone });
+  if (!curDt.isValid || !nextDt.isValid) return { shouldExitNow: false, reason: null };
+
+  const curSession = getSessionForDateTime(curDt.plus({ minutes: intervalMin }));
+  const curDay = curSession.dayKey;
+  const nextDay = getSessionForDateTime(nextDt.plus({ minutes: intervalMin })).dayKey;
+  if (curDay !== nextDay) return { shouldExitNow: true, reason: "FORCE_EOD_SESSION_BOUNDARY" };
+
+  const diff = nextDt.toMillis() - curDt.toMillis();
+  if (diff > intervalMin * 60 * 1000) return { shouldExitNow: true, reason: "FORCE_EOD_GAP_BOUNDARY" };
+
+  return { shouldExitNow: false, reason: null };
 }
 
 function instrumentFromContract({ fallbackToken, selected }) {
