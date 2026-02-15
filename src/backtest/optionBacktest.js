@@ -195,6 +195,15 @@ async function buildOptionBacktestProvider({
     getCandlesByToken(token) {
       return Array.from(tokenCandleMap.get(Number(token))?.values() || []).sort((a, b) => new Date(a.ts) - new Date(b.ts));
     },
+    getCandleAtTs(token, ts) {
+      const key = new Date(ts).toISOString();
+      return tokenCandleMap.get(Number(token))?.get(key) || null;
+    },
+    getCandlesUpToTs(token, ts) {
+      const limitTs = new Date(ts).getTime();
+      if (!Number.isFinite(limitTs)) return [];
+      return this.getCandlesByToken(token).filter((c) => new Date(c.ts).getTime() <= limitTs);
+    },
     selectContract({ ts, underlyingPrice }) {
       const tsMs = new Date(ts).getTime();
       if (!(Number.isFinite(tsMs) && Number.isFinite(Number(underlyingPrice)))) return null;
