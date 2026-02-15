@@ -9,7 +9,9 @@
     "start": "node src/index.js",
     "sync:instruments": "node scripts/sync-instruments.js",
     "replay:signals": "node scripts/replay-signals.js",
-    "health:critical": "node scripts/health-critical.js"
+    "health:critical": "node scripts/health-critical.js",
+    "bt:run": "node scripts/bt_run.js",
+    "bt:prepare-options": "node scripts/bt_prepare_option_universe.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
