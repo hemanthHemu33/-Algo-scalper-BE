@@ -7,7 +7,7 @@ const {
 const { isHalted } = require("../runtime/halt");
 
 class RiskEngine {
-  constructor({ limits, onStateChange } = {}) {
+  constructor({ limits, onStateChange, clock } = {}) {
     this.kill = false;
     this.consecutiveFailures = 0;
     this.tradesToday = 0;
@@ -15,6 +15,7 @@ class RiskEngine {
     this.cooldownUntil = new Map(); // token -> timestamp
     this.limits = limits || {};
     this.onStateChange = typeof onStateChange === "function" ? onStateChange : null;
+    this.clock = clock && typeof clock.nowMs === "function" ? clock : { nowMs: () => Date.now() };
   }
 
   setStateChangeHandler(fn) {
@@ -101,7 +102,7 @@ class RiskEngine {
   setCooldown(token, seconds, reason) {
     const sec = Math.max(0, Number(seconds || 0));
     if (!Number.isFinite(sec) || sec <= 0) return;
-    this.cooldownUntil.set(Number(token), Date.now() + sec * 1000);
+    this.cooldownUntil.set(Number(token), this.clock.nowMs() + sec * 1000);
     this._emitStateChange();
     return { token: Number(token), seconds: sec, reason: reason || null };
   }
@@ -113,7 +114,7 @@ class RiskEngine {
 
     // Time window guard (MIS) + Holiday Calendar guard
     const tz = env.CANDLE_TZ || "Asia/Kolkata";
-    const now = DateTime.now().setZone(tz);
+    const now = DateTime.fromMillis(this.clock.nowMs()).setZone(tz);
 
     // Calendar-aware session (weekends + configured trading holidays + special sessions)
     const session = getSessionForDateTime(now, {
@@ -172,7 +173,7 @@ class RiskEngine {
     if (this.openPositions.has(token))
       return { ok: false, reason: "already_in_position" };
     const until = this.cooldownUntil.get(token) || 0;
-    if (Date.now() < until) return { ok: false, reason: "cooldown" };
+    if (this.clock.nowMs() < until) return { ok: false, reason: "cooldown" };
     return { ok: true };
   }
 
@@ -185,7 +186,7 @@ class RiskEngine {
   markTradeClosed(token) {
     this.openPositions.delete(Number(token));
     const cooldown = Number(env.SYMBOL_COOLDOWN_SECONDS || 180);
-    this.cooldownUntil.set(Number(token), Date.now() + cooldown * 1000);
+    this.cooldownUntil.set(Number(token), this.clock.nowMs() + cooldown * 1000);
     this._emitStateChange();
   }
 

@@ -225,12 +225,12 @@ function optionAbsDelta(env, optionMeta) {
   return safeNum(env.OPT_DELTA_ATM, 0.5);
 }
 
-function daysToExpiry(optionMeta) {
+function daysToExpiry(optionMeta, nowTs = Date.now()) {
   const exp = optionMeta?.expiry;
   if (!exp) return null;
   const d = new Date(exp);
   if (Number.isNaN(d.getTime())) return null;
-  const now = new Date();
+  const now = new Date(Number(nowTs));
   const diff = (d.getTime() - now.getTime()) / (1000 * 60 * 60 * 24);
   return Number.isFinite(diff) ? diff : null;
 }
@@ -249,6 +249,7 @@ function buildTradePlan({
   entryPremium,
   premiumTick,
   atrPctUnderlying,
+  nowTs = Date.now(),
 }) {
   const dir = String(side || "").toUpperCase();
   if (dir !== "BUY" && dir !== "SELL")
@@ -457,7 +458,7 @@ function buildTradePlan({
     );
     const gammaAbs = Number.isFinite(gamma) ? Math.abs(gamma) : null;
 
-    const dte = daysToExpiry(optionMeta);
+    const dte = daysToExpiry(optionMeta, nowTs);
     const near = Number.isFinite(dte) ? clamp((3 - dte) / 3, 0, 1) : 0;
 
     const atrPct = safeNum(atrPctUnderlying, null);
