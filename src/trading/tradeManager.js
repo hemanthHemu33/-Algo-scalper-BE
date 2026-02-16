@@ -313,6 +313,7 @@ class TradeManager {
 
     // ENTRY limit fallback timers (tradeId -> timeout)
     this._entryFallbackTimers = new Map();
+    this._entryFallbackInFlight = new Set();
 
     // PANIC exit watchdog (tradeId -> timeout)
     this._panicExitTimers = new Map();
@@ -5949,10 +5950,33 @@ class TradeManager {
   }
 
   async _entryLimitFallbackFire({ tradeId, entryOrderId, entryParams }) {
-    const t = await getTrade(tradeId);
-    if (!t) return;
+    const tradeKey = String(tradeId || "");
+    if (!tradeKey) return;
+    if (this._entryFallbackInFlight.has(tradeKey)) {
+      logger.info({ tradeId, entryOrderId }, "[entry_fallback] skipped; already in-flight");
+      return;
+    }
 
-    const terminal = [
+    this._entryFallbackInFlight.add(tradeKey);
+    const t = await getTrade(tradeId);
+    if (!t) {
+      this._entryFallbackInFlight.delete(tradeKey);
+      return;
+    }
+
+    if (t.entryFinalized === true) {
+      this._clearEntryLimitFallbackTimer(tradeId);
+      this._entryFallbackInFlight.delete(tradeKey);
+      return;
+    }
+
+    try {
+      await updateTrade(tradeId, {
+        entryFallbackInFlight: true,
+        entryFallbackStartedAt: new Date(),
+      });
+
+      const terminal = [
       STATUS.LIVE,
       STATUS.SL_PLACED,
       STATUS.SL_OPEN,
@@ -5968,10 +5992,10 @@ class TradeManager {
       STATUS.CLOSED,
       STATUS.GUARD_FAILED,
     ];
-    if (terminal.includes(t.status)) {
-      this._clearEntryLimitFallbackTimer(tradeId);
-      return;
-    }
+      if (terminal.includes(t.status)) {
+        this._clearEntryLimitFallbackTimer(tradeId);
+        return;
+      }
 
     const statusInfo = await this._getOrderStatus(entryOrderId);
     const status = String(statusInfo?.status || "").toUpperCase();
@@ -5981,12 +6005,13 @@ class TradeManager {
       order.average_price || t.entryPrice || t.candle?.close || 0,
     );
 
-    if (status === "COMPLETE") {
+      if (status === "COMPLETE") {
       const qty = Number(order.filled_quantity || t.qty);
       await updateTrade(tradeId, {
         status: STATUS.ENTRY_FILLED,
         entryPrice: avgNow > 0 ? avgNow : t.entryPrice,
         qty,
+        entryFinalized: true,
       });
       await this._placeExitsIfMissing({
         ...t,
@@ -5994,9 +6019,9 @@ class TradeManager {
         qty,
       });
       await this._ensureExitQty(tradeId, qty);
-      this._clearEntryLimitFallbackTimer(tradeId);
-      return;
-    }
+        this._clearEntryLimitFallbackTimer(tradeId);
+        return;
+      }
 
     if (isDead(status)) {
       if (status === "REJECTED") {
@@ -6013,6 +6038,7 @@ class TradeManager {
           status: STATUS.ENTRY_OPEN,
           entryPrice: avgNow > 0 ? avgNow : t.entryPrice,
           qty: filledNow,
+          entryFinalized: true,
         });
         await this._placeExitsIfMissing({
           ...t,
@@ -6034,6 +6060,7 @@ class TradeManager {
         status: STATUS.ENTRY_OPEN,
         entryPrice: avgNow > 0 ? avgNow : t.entryPrice,
         qty: filledNow,
+        entryFinalized: true,
       });
       await this._placeExitsIfMissing({
         ...t,
@@ -6071,6 +6098,7 @@ class TradeManager {
           status: STATUS.ENTRY_FILLED,
           entryPrice: avgAgain > 0 ? avgAgain : t.entryPrice,
           qty,
+          entryFinalized: true,
         });
         await this._placeExitsIfMissing({
           ...t,
@@ -6097,6 +6125,7 @@ class TradeManager {
             status: STATUS.ENTRY_OPEN,
             entryPrice: avgAgain > 0 ? avgAgain : t.entryPrice,
             qty: filledAgain,
+            entryFinalized: true,
           });
           await this._placeExitsIfMissing({
             ...t,
@@ -6123,6 +6152,7 @@ class TradeManager {
           status: STATUS.ENTRY_OPEN,
           entryPrice: avgAgain > 0 ? avgAgain : t.entryPrice,
           qty: filledAgain,
+          entryFinalized: true,
         });
         await this._placeExitsIfMissing({
           ...t,
@@ -6177,6 +6207,7 @@ class TradeManager {
         status: STATUS.ENTRY_FILLED,
         entryPrice: avgAfter > 0 ? avgAfter : t.entryPrice,
         qty,
+        entryFinalized: true,
       });
       await this._placeExitsIfMissing({
         ...t,
@@ -6193,6 +6224,7 @@ class TradeManager {
         status: STATUS.ENTRY_OPEN,
         entryPrice: avgAfter > 0 ? avgAfter : t.entryPrice,
         qty: filledAfter,
+        entryFinalized: true,
       });
       await this._placeExitsIfMissing({
         ...t,
@@ -6262,6 +6294,7 @@ class TradeManager {
       entryFallbackFrom: entryOrderId,
       entryFallbackPlacedAt: new Date(),
       status: STATUS.ENTRY_REPLACED,
+      entryFinalized: false,
     });
     await linkOrder({
       order_id: String(fallbackOrderId),
@@ -6270,7 +6303,14 @@ class TradeManager {
     });
     await this._replayOrphanUpdates(fallbackOrderId);
 
-    this._clearEntryLimitFallbackTimer(tradeId);
+      this._clearEntryLimitFallbackTimer(tradeId);
+    } finally {
+      this._entryFallbackInFlight.delete(tradeKey);
+      await updateTrade(tradeId, {
+        entryFallbackInFlight: false,
+        entryFallbackLastCompletedAt: new Date(),
+      }).catch(() => {});
+    }
   }
 
   async _watchExitLeg(tradeId, orderId, role) {
@@ -8401,6 +8441,8 @@ class TradeManager {
       optimizer: opt?.meta || null,
       status: STATUS.ENTRY_PLACED,
       entryOrderId: null,
+      entryFinalized: false,
+      entryFallbackInFlight: false,
       slOrderId: null,
       targetOrderId: null,
       entryPrice: null,
@@ -8511,6 +8553,7 @@ class TradeManager {
     await updateTrade(tradeId, {
       entryOrderId,
       status: STATUS.ENTRY_OPEN,
+      entryFinalized: false,
       ...this._eventPatch("ENTRY_PLACED", {
         orderId: entryOrderId,
         qty,
@@ -8768,6 +8811,18 @@ class TradeManager {
       }
 
       if (status === "COMPLETE") {
+        if (!isCurrentEntry) {
+          logger.warn(
+            {
+              tradeId: trade.tradeId,
+              orderId,
+              status,
+              currentEntryOrderId,
+            },
+            "[order_update] complete update for non-current entry order ignored",
+          );
+          return;
+        }
         this._clearEntryLimitFallbackTimer(trade.tradeId);
         const avg = Number(
           order.average_price || trade.entryPrice || trade.candle?.close,
@@ -8834,6 +8889,7 @@ class TradeManager {
           qty: filledQty,
           entrySlippageBps: slipBps,
           entryFilledAt: new Date(),
+          entryFinalized: true,
           ...this._eventPatch("ENTRY_FILLED", {
             avg,
             filledQty,
@@ -8995,15 +9051,18 @@ class TradeManager {
       if ((status === "PARTIAL" || status === "OPEN") && filledNow > 0) {
         if (!isCurrentEntry) {
           logger.warn(
-            { tradeId: trade.tradeId, orderId, status },
-            "[order_update] partial fill on non-current entry order",
+            { tradeId: trade.tradeId, orderId, status, currentEntryOrderId },
+            "[order_update] partial/open update for non-current entry order ignored",
           );
+          return;
         }
+        this._clearEntryLimitFallbackTimer(trade.tradeId);
         // Place protective exits for the filled quantity (safety first)
         await updateTrade(trade.tradeId, {
           status: STATUS.ENTRY_OPEN,
           entryPrice: avgNow > 0 ? avgNow : trade.entryPrice,
           qty: filledNow,
+          entryFinalized: true,
           ...this._eventPatch("ENTRY_PARTIAL_FILL", {
             avg: avgNow,
             filledQty: filledNow,
@@ -9149,6 +9208,20 @@ class TradeManager {
             tradeStatus: progressedStatus,
           },
           "[order_update] ignored (stale entry update)",
+        );
+        return;
+      }
+
+      if (!isCurrentEntry) {
+        logger.info(
+          {
+            tradeId: trade.tradeId,
+            role: link.role,
+            status,
+            orderId,
+            currentEntryOrderId,
+          },
+          "[order_update] ignored (non-current entry order)",
         );
         return;
       }
