@@ -5914,8 +5914,105 @@ class TradeManager {
 
     logger.warn(
       { tradeId, entryOrderId },
-      "[entry_fallback] timeout -> place MARKET then cancel LIMIT",
+      "[entry_fallback] timeout -> cancel LIMIT then place MARKET",
     );
+
+    // Last-second race guard: before fallback, re-check that the tracked
+    // entry order is still the same and that the trade has not progressed.
+    // This prevents double-entry when LIMIT completes around timeout.
+    const latestTrade = await getTrade(tradeId);
+    if (!latestTrade) {
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    const latestEntryOrderId = String(latestTrade.entryOrderId || "");
+    const latestStatus = String(latestTrade.status || "");
+    if (
+      (latestEntryOrderId && latestEntryOrderId !== String(entryOrderId)) ||
+      terminal.includes(latestStatus)
+    ) {
+      logger.info(
+        {
+          tradeId,
+          entryOrderId,
+          latestEntryOrderId,
+          tradeStatus: latestStatus,
+        },
+        "[entry_fallback] skipped (entry already progressed)",
+      );
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    let latestStatusInfo = await this._getOrderStatus(entryOrderId);
+    let latestOrderStatus = String(latestStatusInfo?.status || "").toUpperCase();
+    let latestOrder = latestStatusInfo?.order || {};
+    let latestFilled = Number(latestOrder.filled_quantity || 0);
+    if (latestOrderStatus === "COMPLETE" || latestFilled > 0) {
+      logger.info(
+        {
+          tradeId,
+          entryOrderId,
+          status: latestOrderStatus,
+          filledQty: latestFilled,
+        },
+        "[entry_fallback] skipped (limit order progressed at timeout)",
+      );
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    // Safety first: cancel old LIMIT before placing replacement MARKET.
+    // If cancel state cannot be confirmed, skip replacement to avoid double-entry.
+    if (!isDead(latestOrderStatus)) {
+      try {
+        this.expectedCancelOrderIds.add(String(entryOrderId));
+        await this._safeCancelOrder(
+          env.DEFAULT_ORDER_VARIETY || "regular",
+          entryOrderId,
+          {
+            purpose: "ENTRY_LIMIT_FALLBACK_CANCEL",
+            tradeId,
+          },
+        );
+      } catch (e) {
+        logger.warn(
+          { tradeId, entryOrderId, e: e.message },
+          "[entry_fallback] cancel failed before MARKET placement; skipping fallback",
+        );
+        this._clearEntryLimitFallbackTimer(tradeId);
+        return;
+      }
+
+      latestStatusInfo = await this._getOrderStatus(entryOrderId);
+      latestOrderStatus = String(latestStatusInfo?.status || "").toUpperCase();
+      latestOrder = latestStatusInfo?.order || {};
+      latestFilled = Number(latestOrder.filled_quantity || 0);
+
+      if (latestOrderStatus === "COMPLETE" || latestFilled > 0) {
+        logger.info(
+          {
+            tradeId,
+            entryOrderId,
+            status: latestOrderStatus,
+            filledQty: latestFilled,
+          },
+          "[entry_fallback] cancel raced with fill; skipped MARKET replacement",
+        );
+        this._clearEntryLimitFallbackTimer(tradeId);
+        return;
+      }
+
+      if (!isDead(latestOrderStatus)) {
+        logger.warn(
+          { tradeId, entryOrderId, status: latestOrderStatus },
+          "[entry_fallback] cancel not confirmed; skipping MARKET replacement",
+        );
+        this._clearEntryLimitFallbackTimer(tradeId);
+        return;
+      }
+    }
 
     const marketParams = {
       ...entryParams,
@@ -5953,24 +6050,6 @@ class TradeManager {
     });
     await this._replayOrphanUpdates(fallbackOrderId);
 
-    if (!isDead(status)) {
-      try {
-        this.expectedCancelOrderIds.add(String(entryOrderId));
-        await this._safeCancelOrder(
-          env.DEFAULT_ORDER_VARIETY || "regular",
-          entryOrderId,
-          {
-            purpose: "ENTRY_LIMIT_FALLBACK_CANCEL",
-            tradeId,
-          },
-        );
-      } catch (e) {
-        logger.warn(
-          { tradeId, entryOrderId, e: e.message },
-          "[entry_fallback] cancel failed after MARKET placement",
-        );
-      }
-    }
     this._clearEntryLimitFallbackTimer(tradeId);
   }
 
@@ -8367,7 +8446,12 @@ class TradeManager {
 
       const progressedSet0 = [
         STATUS.ENTRY_FILLED,
+        STATUS.SL_PLACED,
+        STATUS.SL_OPEN,
+        STATUS.SL_CONFIRMED,
         STATUS.LIVE,
+        STATUS.PANIC_EXIT_PLACED,
+        STATUS.PANIC_EXIT_CONFIRMED,
         STATUS.EXITED_TARGET,
         STATUS.EXITED_SL,
         STATUS.ENTRY_FAILED,
@@ -8774,7 +8858,12 @@ class TradeManager {
       if (
         [
           STATUS.ENTRY_FILLED,
+          STATUS.SL_PLACED,
+          STATUS.SL_OPEN,
+          STATUS.SL_CONFIRMED,
           STATUS.LIVE,
+          STATUS.PANIC_EXIT_PLACED,
+          STATUS.PANIC_EXIT_CONFIRMED,
           STATUS.EXITED_TARGET,
           STATUS.EXITED_SL,
           STATUS.ENTRY_FAILED,
