@@ -11148,6 +11148,7 @@ class TradeManager {
 
   async _onSlFilled(tradeId, trade, slOrder) {
     this._clearTargetWatch(tradeId);
+    this._dynExitDisabled.add(tradeId);
     // Cancel TP1 if still pending (avoid accidental over-exit)
     if (trade.tp1OrderId && !trade.tp1Done) {
       this.expectedCancelOrderIds.add(String(trade.tp1OrderId));
@@ -11217,6 +11218,8 @@ class TradeManager {
     });
     await updateTrade(tradeId, {
       status: STATUS.EXITED_SL,
+      dynExitDisabled: true,
+      dynExitDisabledAt: new Date(),
       exitPrice,
       exitExpectedPrice,
       exitQuoteAt,
