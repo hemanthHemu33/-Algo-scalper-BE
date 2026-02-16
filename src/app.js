@@ -27,6 +27,7 @@ const {
 const { getRiskLimits, setRiskLimits } = require("./risk/riskLimits");
 const { getStrategyKpis } = require("./telemetry/strategyKpi");
 const { getExecutionQuality } = require("./execution/executionStats");
+const { buildEodReport } = require("./reports/eodReport");
 const { marketHealth } = require("./market/marketHealth");
 const { recordAudit, listAuditLogs } = require("./audit/auditLog");
 const {
@@ -864,6 +865,15 @@ function buildApp() {
         .toArray();
 
       res.json({ ok: true, rows: rows.map((row) => normalizeTradeRow(row)) });
+    } catch (e) {
+      res.status(503).json({ ok: false, error: e.message });
+    }
+  });
+
+  app.get("/admin/reports/eod", requirePerm("read"), async (req, res) => {
+    try {
+      const report = await buildEodReport({ day: req.query.day });
+      res.json(report);
     } catch (e) {
       res.status(503).json({ ok: false, error: e.message });
     }

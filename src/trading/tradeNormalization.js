@@ -77,6 +77,19 @@ function normalizeTradeRow(row) {
     row.timeStopAtIso ??
     row.timeStopMs ??
     null;
+  const decisionAt =
+    row.decisionAt ?? row.decision_at ?? row.signalAt ?? row.signal_at ?? null;
+  const entryAt = row.entryAt ?? row.entry_at ?? row.entryFilledAt ?? null;
+  const exitAt = row.exitAt ?? row.exit_at ?? null;
+  const marketContextAtEntry =
+    row.marketContextAtEntry ?? row.market_context_at_entry ?? null;
+  const costPayload = row.costPayload ?? row.cost_payload ?? null;
+  const entryCostSlippage =
+    row.entrySlippage ?? costPayload?.entrySlippage ?? null;
+  const exitCostSlippage = row.exitSlippage ?? costPayload?.exitSlippage ?? null;
+  const brokerageCost = row.brokerage ?? costPayload?.brokerage ?? null;
+  const taxesCost = row.taxes ?? costPayload?.taxes ?? null;
+  const feesTotalCost = row.feesTotal ?? costPayload?.feesTotal ?? null;
 
   return {
     ...row,
@@ -108,6 +121,13 @@ function normalizeTradeRow(row) {
     exitReason: row.exitReason ?? row.exit_reason ?? null,
     createdAt: row.createdAt ?? row.created_at ?? null,
     updatedAt: row.updatedAt ?? row.updated_at ?? null,
+    decisionAt,
+    entryAt,
+    exitAt,
+    marketContextAtEntry,
+    market_context_at_entry: marketContextAtEntry,
+    costPayload,
+    cost_payload: costPayload,
     regime: row.regime ?? regimeValue,
     marketRegime: row.marketRegime ?? regimeValue,
     regimeLabel: row.regimeLabel ?? regimeValue,
@@ -121,6 +141,9 @@ function normalizeTradeRow(row) {
     exitSlippage: row.exitSlippage ?? exitSlippageValue,
     slippageExit: row.slippageExit ?? exitSlippageValue,
     slippage_exit: row.slippage_exit ?? exitSlippageValue,
+    brokerage: brokerageCost,
+    taxes: taxesCost,
+    feesTotal: feesTotalCost,
     slippage: row.slippage ?? totalSlippageValue,
     totalSlippage: row.totalSlippage ?? totalSlippageValue,
     slippageTotal: row.slippageTotal ?? totalSlippageValue,
