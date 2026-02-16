@@ -97,6 +97,14 @@ function unrealizedPnlInr({ side, entry, ltp, qty }) {
   return (entry - ltp) * qty;
 }
 
+function meetsThreshold(value, threshold, epsilon = 0) {
+  if (!Number.isFinite(value) || !Number.isFinite(threshold) || threshold <= 0) {
+    return false;
+  }
+  const eps = Number.isFinite(epsilon) && epsilon > 0 ? epsilon : 0;
+  return value + eps >= threshold;
+}
+
 function computeTargetFromRisk({ side, entry, risk, rr, tick }) {
   if (
     !Number.isFinite(entry) ||
@@ -220,6 +228,9 @@ function applyMinGreenExitRules({
 
   const beArmR = Number(env.BE_ARM_R || 0.6);
   const trailArmR = Number(env.TRAIL_ARM_R || 1.0);
+  const pnlStepInr = Number.isFinite(qty) && qty > 0 && Number.isFinite(tick) && tick > 0
+    ? qty * tick
+    : 0;
   const beLockAt =
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
       ? beArmR * riskPerTradeInr
@@ -228,11 +239,13 @@ function applyMinGreenExitRules({
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
       ? trailArmR * riskPerTradeInr
       : Number(env.DYN_TRAIL_START_PROFIT_INR || 0);
+  const beArmEpsInr = pnlStepInr;
+  const trailArmEpsInr = pnlStepInr;
 
-  if (Number.isFinite(beLockAt) && beLockAt > 0 && pnlInr >= beLockAt) {
+  if (meetsThreshold(pnlInr, beLockAt, beArmEpsInr)) {
     beLockHit = true;
   }
-  if (Number.isFinite(trailStartInr) && trailStartInr > 0 && pnlInr >= trailStartInr) {
+  if (meetsThreshold(pnlInr, trailStartInr, trailArmEpsInr)) {
     trailHit = true;
   }
 
@@ -371,8 +384,10 @@ function applyMinGreenExitRules({
 
   if (!beLockedNow) {
     if (!(Number.isFinite(beLockAt) && beLockAt > 0)) skipReasons.push("be_lock_disabled");
-    else if (!(pnlInr >= beLockAt))
-      skipReasons.push(`pnlInr=${Number(pnlInr || 0).toFixed(2)} < beLockAt=${beLockAt}`);
+    else if (!meetsThreshold(pnlInr, beLockAt, beArmEpsInr))
+      skipReasons.push(
+        `pnlInr=${Number(pnlInr || 0).toFixed(2)} < beLockAt=${beLockAt} (eps=${Number(beArmEpsInr || 0).toFixed(2)})`,
+      );
   }
 
   if (!allowTrail) {
@@ -414,8 +429,10 @@ function applyMinGreenExitRules({
       minGreenInr,
       minGreenPts,
       beLockAt,
+      beArmEpsInr,
       trailGap,
       trailStartInr: Number.isFinite(trailStartInr) ? trailStartInr : null,
+      trailArmEpsInr,
       allowTrail,
       beLockHit: beLockedNow,
       trailHit: trailLockedNow,
