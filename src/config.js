@@ -867,7 +867,7 @@ const schema = z.object({
   ENTRY_ORDER_TYPE: z.string().default("MARKET"),
   // Options-specific entry type (pro: LIMIT)
   ENTRY_ORDER_TYPE_OPT: z.string().default("LIMIT"),
-  ENTRY_LIMIT_TIMEOUT_MS: z.coerce.number().default(2500),
+  ENTRY_LIMIT_TIMEOUT_MS: z.coerce.number().default(4000),
   ENTRY_LIMIT_FALLBACK_GRACE_MS: z.coerce.number().default(250),
   ENTRY_LIMIT_FALLBACK_CANCEL_WAIT_MS: z.coerce.number().default(400),
   // Safety: do NOT auto-convert LIMIT -> MARKET. If you accept slippage, set ENTRY_ORDER_TYPE_OPT=MARKET explicitly.
