@@ -2325,6 +2325,14 @@ class TradeManager {
     return latest;
   }
 
+  _getKnownOrderStatus(orderId) {
+    const oid = String(orderId || "");
+    if (!oid) return { status: "", order: null };
+    const known = this._lastOrdersById.get(oid);
+    const st = String(known?.status || "").toUpperCase();
+    return { status: st, order: known || null };
+  }
+
   _isCancelProcessingError(e) {
     const msg = String(e?.message || e || "").toLowerCase();
     return (
@@ -6262,6 +6270,36 @@ class TradeManager {
     // Re-check trade status before placing MARKET (it may have moved to ENTRY_FILLED/LIVE in parallel)
     const tNow = await getTrade(tradeId);
     if (!tNow || terminal.includes(tNow.status)) {
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    // Guard against feed/API lag: websocket update may already know ENTRY LIMIT got filled.
+    const known = this._getKnownOrderStatus(entryOrderId);
+    const knownStatus = String(known?.status || "").toUpperCase();
+    const knownOrder = known?.order || {};
+    const knownFilled = Number(knownOrder.filled_quantity || 0);
+    const knownAvg = Number(
+      knownOrder.average_price || t.entryPrice || t.candle?.close || 0,
+    );
+    if (knownStatus === "COMPLETE" || knownFilled > 0) {
+      const qty = Number(knownOrder.filled_quantity || t.qty);
+      await updateTrade(tradeId, {
+        status: knownStatus === "COMPLETE" ? STATUS.ENTRY_FILLED : STATUS.ENTRY_OPEN,
+        entryPrice: knownAvg > 0 ? knownAvg : t.entryPrice,
+        qty,
+        entryFinalized: true,
+      });
+      await this._placeExitsIfMissing({
+        ...t,
+        entryPrice: knownAvg > 0 ? knownAvg : t.entryPrice,
+        qty,
+      });
+      await this._ensureExitQty(tradeId, qty);
+      logger.warn(
+        { tradeId, entryOrderId, knownStatus, knownFilled },
+        "[entry_fallback] broker stream indicates late/complete fill; skipping MARKET fallback",
+      );
       this._clearEntryLimitFallbackTimer(tradeId);
       return;
     }
