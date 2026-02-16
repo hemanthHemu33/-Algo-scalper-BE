@@ -118,6 +118,30 @@ function jitterMs(baseMs, jitterPct = 0) {
   return Math.max(0, Math.round(base - delta + Math.random() * delta * 2));
 }
 
+const ORDER_STATUS_RANK = Object.freeze({
+  OPEN: 1,
+  TRIGGER_PENDING: 2,
+  MODIFY_PENDING: 2,
+  AMO_REQ_RECEIVED: 2,
+  PARTIAL: 3,
+  COMPLETE: 4,
+  CANCELLED: 4,
+  CANCELED: 4,
+  REJECTED: 4,
+  LAPSED: 4,
+});
+
+function orderStatusRank(status) {
+  const s = String(status || "").toUpperCase();
+  return ORDER_STATUS_RANK[s] || 0;
+}
+
+function isOrderStatusRegression(prevStatus, nextStatus) {
+  const prev = orderStatusRank(prevStatus);
+  const next = orderStatusRank(nextStatus);
+  return prev > 0 && next > 0 && next < prev;
+}
+
 function percentile(values, p) {
   if (!Array.isArray(values) || !values.length) return null;
   const sorted = values
@@ -752,10 +776,22 @@ class TradeManager {
     const oid = String(orderId || "");
     if (!oid) return;
     const status = String(order?.status || "").toUpperCase();
-    this._lastOrdersById.set(oid, order || { order_id: oid });
-    if (isTerminalOrderStatus(status))
+    const prev = this._lastOrdersById.get(oid) || null;
+    const prevStatus = String(prev?.status || "").toUpperCase();
+    const nextOrder = order || { order_id: oid };
+
+    if (isOrderStatusRegression(prevStatus, status) && isTerminalOrderStatus(prevStatus)) {
+      this._lastOrdersById.set(oid, { ...nextOrder, status: prevStatus });
+      this._terminalOrderStatusById.set(oid, prevStatus);
+      return;
+    }
+
+    this._lastOrdersById.set(oid, nextOrder);
+    if (isTerminalOrderStatus(status)) {
       this._terminalOrderStatusById.set(oid, status);
-    else this._terminalOrderStatusById.delete(oid);
+    } else if (!this._terminalOrderStatusById.has(oid)) {
+      this._terminalOrderStatusById.delete(oid);
+    }
   }
 
   async _hydrateLiveOrderSnapshotsFromDb() {
@@ -8617,6 +8653,16 @@ class TradeManager {
     if (!orderId) return;
 
     const status = String(order.status || "").toUpperCase();
+    const prevOrder = this._lastOrdersById.get(orderId) || null;
+    const prevStatus = String(prevOrder?.status || "").toUpperCase();
+    if (isOrderStatusRegression(prevStatus, status) && isTerminalOrderStatus(prevStatus)) {
+      logger.info(
+        { orderId, prevStatus, incomingStatus: status },
+        "[order_update] ignored (status regression after terminal)",
+      );
+      return;
+    }
+
     this._rememberLiveOrder(orderId, order);
 
     const hit = await findTradeByOrder(orderId);
@@ -9693,15 +9739,21 @@ class TradeManager {
     // Adjust SL qty (safety critical)
     if (fresh.slOrderId && typeof this.kite.modifyOrder === "function") {
       try {
-        await this._safeModifyOrder(
+        const slModify = await this._safeModifyOrder(
           env.DEFAULT_ORDER_VARIETY,
           fresh.slOrderId,
           { quantity: qty },
           { purpose: "SL_QTY_MODIFY", tradeId },
         );
+        const slSkipped = Boolean(slModify?.skipped);
         logger.info(
-          { tradeId, slOrderId: fresh.slOrderId, qty },
-          "[trade] SL qty modified",
+          {
+            tradeId,
+            slOrderId: fresh.slOrderId,
+            qty,
+            result: slSkipped ? String(slModify?.reason || "skipped") : "modified",
+          },
+          slSkipped ? "[trade] SL qty sync skipped" : "[trade] SL qty modified",
         );
       } catch (e) {
         logger.error(
