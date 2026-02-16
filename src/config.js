@@ -868,6 +868,8 @@ const schema = z.object({
   // Options-specific entry type (pro: LIMIT)
   ENTRY_ORDER_TYPE_OPT: z.string().default("LIMIT"),
   ENTRY_LIMIT_TIMEOUT_MS: z.coerce.number().default(2500),
+  ENTRY_LIMIT_FALLBACK_GRACE_MS: z.coerce.number().default(250),
+  ENTRY_LIMIT_FALLBACK_CANCEL_WAIT_MS: z.coerce.number().default(400),
   // Safety: do NOT auto-convert LIMIT -> MARKET. If you accept slippage, set ENTRY_ORDER_TYPE_OPT=MARKET explicitly.
   ENTRY_LIMIT_FALLBACK_TO_MARKET: z.coerce.boolean().default(false),
   // Smart limit laddering (micro-improve fills without blind chasing)
@@ -1023,7 +1025,9 @@ const PROFILE_PRESETS = {
   },
 };
 
-const presetKey = String(env.PROFILE_PRESET || "").trim().toUpperCase();
+const presetKey = String(env.PROFILE_PRESET || "")
+  .trim()
+  .toUpperCase();
 if (presetKey && PROFILE_PRESETS[presetKey]) {
   const preset = PROFILE_PRESETS[presetKey];
   for (const [key, value] of Object.entries(preset)) {
@@ -1054,7 +1058,9 @@ function validateProfileCombos() {
   // - Our TradeManager already has SL-M -> SL fallback with buffers.
   // - Therefore: allow SL-M in OPT mode (warn only), and keep the conservative auto-fix for non-OPT modes.
   if (fnoEnabled && stopTypeFo === "SL-M") {
-    const fnoMode = String(env.FNO_MODE || "").toUpperCase().trim();
+    const fnoMode = String(env.FNO_MODE || "")
+      .toUpperCase()
+      .trim();
     if (fnoMode && fnoMode !== "OPT") {
       env.STOPLOSS_ORDER_TYPE_FO = "SL";
       // eslint-disable-next-line no-console
@@ -1102,14 +1108,20 @@ function validateProfileCombos() {
 
   const premiumMin = Number(env.OPT_MIN_PREMIUM ?? 0);
   const premiumMax = Number(env.OPT_MAX_PREMIUM ?? 0);
-  if (Number.isFinite(premiumMin) && Number.isFinite(premiumMax) && premiumMin > premiumMax) {
+  if (
+    Number.isFinite(premiumMin) &&
+    Number.isFinite(premiumMax) &&
+    premiumMin > premiumMax
+  ) {
     failOrWarn("[config] OPT_MIN_PREMIUM must be <= OPT_MAX_PREMIUM");
   }
 
   const deltaMin = Number(env.OPT_DELTA_BAND_MIN ?? 0);
   const deltaMax = Number(env.OPT_DELTA_BAND_MAX ?? 1);
   if (deltaMin < 0 || deltaMax > 1 || deltaMin >= deltaMax) {
-    failOrWarn("[config] Delta band invalid. Expected 0 <= OPT_DELTA_BAND_MIN < OPT_DELTA_BAND_MAX <= 1");
+    failOrWarn(
+      "[config] Delta band invalid. Expected 0 <= OPT_DELTA_BAND_MIN < OPT_DELTA_BAND_MAX <= 1",
+    );
   }
 }
 
@@ -1136,7 +1148,11 @@ validateProfileCombos();
     slSlaMs: env.SL_SAFETY_SLA_MS,
   };
   const payload = JSON.stringify(safeConfig);
-  const fp = crypto.createHash("sha1").update(payload).digest("hex").slice(0, 12);
+  const fp = crypto
+    .createHash("sha1")
+    .update(payload)
+    .digest("hex")
+    .slice(0, 12);
   // eslint-disable-next-line no-console
   console.info(`[config] fingerprint=${fp} ${payload}`);
 })();

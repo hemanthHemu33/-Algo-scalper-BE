@@ -126,7 +126,10 @@ function percentile(values, p) {
     .sort((a, b) => a - b);
   if (!sorted.length) return null;
   const rank = Math.max(0, Math.min(1, Number(p || 0.95)));
-  const idx = Math.min(sorted.length - 1, Math.floor(rank * (sorted.length - 1)));
+  const idx = Math.min(
+    sorted.length - 1,
+    Math.floor(rank * (sorted.length - 1)),
+  );
   return sorted[idx];
 }
 
@@ -145,7 +148,9 @@ function parseOrderTimestampMs(order) {
 
 function isTerminalOrderStatus(status) {
   const s = String(status || "").toUpperCase();
-  return ["COMPLETE", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"].includes(s);
+  return ["COMPLETE", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"].includes(
+    s,
+  );
 }
 
 function worseSlippageBps({ side, expected, actual, leg }) {
@@ -409,8 +414,10 @@ class TradeManager {
     if (!Number.isFinite(base)) return baseConfidence;
 
     let conf = base;
-    if (Number.isFinite(health)) conf += Math.max(-6, Math.min(12, (health - 55) / 4));
-    if (Number.isFinite(spreadBps)) conf -= Math.max(-4, Math.min(14, spreadBps / 20));
+    if (Number.isFinite(health))
+      conf += Math.max(-6, Math.min(12, (health - 55) / 4));
+    if (Number.isFinite(spreadBps))
+      conf -= Math.max(-4, Math.min(14, spreadBps / 20));
     if (Number.isFinite(depth) && depth > 0)
       conf += Math.max(0, Math.min(6, Math.log(depth + 1) - 2));
 
@@ -745,7 +752,8 @@ class TradeManager {
     if (!oid) return;
     const status = String(order?.status || "").toUpperCase();
     this._lastOrdersById.set(oid, order || { order_id: oid });
-    if (isTerminalOrderStatus(status)) this._terminalOrderStatusById.set(oid, status);
+    if (isTerminalOrderStatus(status))
+      this._terminalOrderStatusById.set(oid, status);
     else this._terminalOrderStatusById.delete(oid);
   }
 
@@ -760,18 +768,28 @@ class TradeManager {
         const byOrderId = snap?.byOrderId || {};
         for (const [orderId, entry] of Object.entries(byOrderId)) {
           if (!orderId) continue;
-          this._rememberLiveOrder(orderId, entry?.order || { order_id: orderId, status: entry?.status });
+          this._rememberLiveOrder(
+            orderId,
+            entry?.order || { order_id: orderId, status: entry?.status },
+          );
         }
       }
 
       if ((rows || []).length) {
         logger.info(
-          { tradeCount: tradeIds.length, snapshotCount: rows.length, ordersHydrated: this._lastOrdersById.size },
+          {
+            tradeCount: tradeIds.length,
+            snapshotCount: rows.length,
+            ordersHydrated: this._lastOrdersById.size,
+          },
           "[init] hydrated persisted live order snapshots",
         );
       }
     } catch (e) {
-      logger.warn({ e: e?.message || String(e) }, "[init] hydrate live order snapshots failed");
+      logger.warn(
+        { e: e?.message || String(e) },
+        "[init] hydrate live order snapshots failed",
+      );
     }
   }
 
@@ -781,13 +799,20 @@ class TradeManager {
       if (!/OrderId$/.test(String(k || ""))) continue;
       const oid = String(v || "");
       if (!oid) continue;
-      const role = String(k).replace(/OrderId$/, "").toUpperCase() || "UNKNOWN";
+      const role =
+        String(k)
+          .replace(/OrderId$/, "")
+          .toUpperCase() || "UNKNOWN";
       refs.push({ orderId: oid, role });
     }
     return refs;
   }
 
-  async _persistLiveOrderSnapshotsForTrades(trades, byId, source = "reconcile") {
+  async _persistLiveOrderSnapshotsForTrades(
+    trades,
+    byId,
+    source = "reconcile",
+  ) {
     for (const trade of trades || []) {
       const tradeId = trade?.tradeId;
       if (!tradeId) continue;
@@ -826,7 +851,17 @@ class TradeManager {
       if (!this.activeTradeId) return;
       const trade = await getTrade(this.activeTradeId);
       if (!trade) return;
-      if (![STATUS.ENTRY_FILLED, STATUS.SL_PLACED, STATUS.SL_OPEN, STATUS.SL_CONFIRMED, STATUS.RECOVERY_REHYDRATED, STATUS.LIVE].includes(trade.status)) return;
+      if (
+        ![
+          STATUS.ENTRY_FILLED,
+          STATUS.SL_PLACED,
+          STATUS.SL_OPEN,
+          STATUS.SL_CONFIRMED,
+          STATUS.RECOVERY_REHYDRATED,
+          STATUS.LIVE,
+        ].includes(trade.status)
+      )
+        return;
       this._syncActiveTradeState(trade);
 
       await this._maybeDynamicAdjustExits(trade, this._lastOrdersById);
@@ -1544,26 +1579,45 @@ class TradeManager {
     const dir = String(side || "BUY").toUpperCase() === "BUY" ? 1 : -1;
     const out = [];
     for (let i = 0; i <= steps; i++) {
-      out.push(roundToTick(Number(basePrice) + dir * i * tick, tick, dir > 0 ? "up" : "down"));
+      out.push(
+        roundToTick(
+          Number(basePrice) + dir * i * tick,
+          tick,
+          dir > 0 ? "up" : "down",
+        ),
+      );
     }
     return Array.from(new Set(out.filter((n) => Number.isFinite(n) && n > 0)));
   }
 
-  async _startEntryLadder({ tradeId, entryOrderId, instrument, side, basePrice }) {
+  async _startEntryLadder({
+    tradeId,
+    entryOrderId,
+    instrument,
+    side,
+    basePrice,
+  }) {
     if (!Boolean(env.ENTRY_LADDER_ENABLED ?? true)) return;
     const tick = Number(instrument?.tick_size || 0.05);
-    const delayMs = Math.max(100, Number(env.ENTRY_LADDER_STEP_DELAY_MS || 350));
+    const delayMs = Math.max(
+      100,
+      Number(env.ENTRY_LADDER_STEP_DELAY_MS || 350),
+    );
     const ladder = this._buildEntryLadderPrices({ side, basePrice, tick });
     if (ladder.length <= 1) return;
 
     const startPx = Number(ladder[0]);
-    const maxChaseBps = Math.max(0, Number(env.ENTRY_LADDER_MAX_CHASE_BPS || 35));
+    const maxChaseBps = Math.max(
+      0,
+      Number(env.ENTRY_LADDER_MAX_CHASE_BPS || 35),
+    );
 
     for (let i = 1; i < ladder.length; i++) {
       await sleep(delayMs);
       const fresh = await getTrade(tradeId);
       if (!fresh) return;
-      if (String(fresh.status || "").toUpperCase() !== STATUS.ENTRY_OPEN) return;
+      if (String(fresh.status || "").toUpperCase() !== STATUS.ENTRY_OPEN)
+        return;
 
       const st = await this._getOrderStatus(entryOrderId);
       const os = String(st?.status || "").toUpperCase();
@@ -1575,7 +1629,10 @@ class TradeManager {
           ? (Math.abs(nextPx - startPx) / startPx) * 10000
           : 0;
       if (driftBps > maxChaseBps) {
-        logger.warn({ tradeId, nextPx, startPx, driftBps, maxChaseBps }, "[entry_ladder] stopped (max chase)");
+        logger.warn(
+          { tradeId, nextPx, startPx, driftBps, maxChaseBps },
+          "[entry_ladder] stopped (max chase)",
+        );
         return;
       }
 
@@ -1588,10 +1645,17 @@ class TradeManager {
         );
         await updateTrade(tradeId, {
           expectedEntryPrice: nextPx,
-          ...this._eventPatch("ENTRY_LADDER_STEP", { tradeId, price: nextPx, step: i }),
+          ...this._eventPatch("ENTRY_LADDER_STEP", {
+            tradeId,
+            price: nextPx,
+            step: i,
+          }),
         });
       } catch (e) {
-        logger.warn({ tradeId, entryOrderId, price: nextPx, e: e?.message || String(e) }, "[entry_ladder] modify failed");
+        logger.warn(
+          { tradeId, entryOrderId, price: nextPx, e: e?.message || String(e) },
+          "[entry_ladder] modify failed",
+        );
         return;
       }
     }
@@ -1630,7 +1694,9 @@ class TradeManager {
       const askQty = Number(q?.depth?.sell?.[0]?.quantity || 0);
       const ltp = Number(q?.last_price);
 
-      if (!(Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask >= bid)) {
+      if (
+        !(Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask >= bid)
+      ) {
         return { ok: false, reason: "NO_DEPTH", meta: { bid, ask, ltp } };
       }
 
@@ -1639,8 +1705,14 @@ class TradeManager {
       const spreadPenalty = Number.isFinite(spreadBps)
         ? Math.min(35, Math.max(0, spreadBps / 2))
         : 35;
-      const depthScore = Math.min(25, Math.log(Math.max(1, bidQty + askQty)) * 3);
-      const healthScore = Math.max(0, Math.min(100, 55 + depthScore - spreadPenalty));
+      const depthScore = Math.min(
+        25,
+        Math.log(Math.max(1, bidQty + askQty)) * 3,
+      );
+      const healthScore = Math.max(
+        0,
+        Math.min(100, 55 + depthScore - spreadPenalty),
+      );
       if (Number.isFinite(minHealth) && healthScore < minHealth) {
         return {
           ok: false,
@@ -1674,7 +1746,9 @@ class TradeManager {
 
       const quoteTsMs = this._parseQuoteTimeMs(q);
       const freshnessMaxMs = Number(env.STALE_TICK_MS || 3000);
-      const ageMs = quoteTsMs ? Date.now() - quoteTsMs : Number.POSITIVE_INFINITY;
+      const ageMs = quoteTsMs
+        ? Date.now() - quoteTsMs
+        : Number.POSITIVE_INFINITY;
       if (!Number.isFinite(ageMs) || ageMs > freshnessMaxMs) {
         return {
           ok: false,
@@ -2298,7 +2372,8 @@ class TradeManager {
     for (const oid of exitOrderIds) {
       const known = (byId && byId.get(oid)) || this._lastOrdersById.get(oid);
       const knownSt = String(known?.status || "").toUpperCase();
-      if (knownSt === "COMPLETE") return { benign: true, reason: "exit_complete" };
+      if (knownSt === "COMPLETE")
+        return { benign: true, reason: "exit_complete" };
       if (inGraceByTimestamp && inFlightStatuses.has(knownSt)) {
         return { benign: true, reason: `in_grace_${knownSt}` };
       }
@@ -2308,14 +2383,18 @@ class TradeManager {
       try {
         const latest = await this._getOrderStatus(oid);
         const st = String(latest?.status || "").toUpperCase();
-        if (st === "COMPLETE") return { benign: true, reason: `history_complete_${oid}` };
+        if (st === "COMPLETE")
+          return { benign: true, reason: `history_complete_${oid}` };
         if (inGraceByTimestamp && inFlightStatuses.has(st)) {
           return { benign: true, reason: `history_in_grace_${st}` };
         }
       } catch {}
     }
 
-    return { benign: false, reason: inGraceByTimestamp ? "grace_elapsed" : "no_exit_signal" };
+    return {
+      benign: false,
+      reason: inGraceByTimestamp ? "grace_elapsed" : "no_exit_signal",
+    };
   }
 
   _clearPanicExitWatch(tradeId) {
@@ -2816,7 +2895,9 @@ class TradeManager {
   }
 
   _activeTradeProduct(trade) {
-    const product = String(trade?.product || env.DEFAULT_PRODUCT || "MIS").toUpperCase();
+    const product = String(
+      trade?.product || env.DEFAULT_PRODUCT || "MIS",
+    ).toUpperCase();
     return product || "MIS";
   }
 
@@ -2828,9 +2909,13 @@ class TradeManager {
 
     const tz = env.CANDLE_TZ || "Asia/Kolkata";
     const now = DateTime.now().setZone(tz);
-    const convertAt = DateTime.fromFormat(env.EOD_MIS_TO_NRML_AT || "15:18", "HH:mm", {
-      zone: tz,
-    });
+    const convertAt = DateTime.fromFormat(
+      env.EOD_MIS_TO_NRML_AT || "15:18",
+      "HH:mm",
+      {
+        zone: tz,
+      },
+    );
     if (!convertAt.isValid) return;
 
     const convertToday = now.set({
@@ -2848,9 +2933,12 @@ class TradeManager {
     if (this._eodConvertAttempted.has(tradeId)) return;
 
     if (
-      ![STATUS.ENTRY_OPEN, STATUS.ENTRY_FILLED, STATUS.LIVE, STATUS.GUARD_FAILED].includes(
-        trade.status,
-      )
+      ![
+        STATUS.ENTRY_OPEN,
+        STATUS.ENTRY_FILLED,
+        STATUS.LIVE,
+        STATUS.GUARD_FAILED,
+      ].includes(trade.status)
     ) {
       return;
     }
@@ -2936,9 +3024,7 @@ class TradeManager {
         STATUS.SL_PLACED,
         STATUS.SL_CONFIRMED,
         STATUS.LIVE,
-      ].includes(
-        trade.status,
-      )
+      ].includes(trade.status)
     )
       return;
 
@@ -2955,7 +3041,10 @@ class TradeManager {
       reason: "FORCE_FLATTEN",
       lastTradeId: trade.tradeId,
     });
-    await this._panicExit({ ...trade, product: this._activeTradeProduct(trade) }, "FORCE_FLATTEN");
+    await this._panicExit(
+      { ...trade, product: this._activeTradeProduct(trade) },
+      "FORCE_FLATTEN",
+    );
   }
 
   _scheduleReconcile(reason = "order_update") {
@@ -3474,7 +3563,11 @@ class TradeManager {
         { tradeId, purpose, orderId: oid, status: terminalStatus },
         "[orders] cancel skipped (terminal order)",
       );
-      return { skipped: true, reason: "terminal_order", status: terminalStatus };
+      return {
+        skipped: true,
+        reason: "terminal_order",
+        status: terminalStatus,
+      };
     }
 
     const rate = this.orderLimiter.check({ count: 1 });
@@ -3541,7 +3634,11 @@ class TradeManager {
         { tradeId, purpose, orderId: oid, status: terminalStatus },
         "[orders] modify skipped (terminal order)",
       );
-      return { skipped: true, reason: "terminal_order", status: terminalStatus };
+      return {
+        skipped: true,
+        reason: "terminal_order",
+        status: terminalStatus,
+      };
     }
 
     const cooldownMs = Math.max(0, Number(minIntervalMs || 0));
@@ -3800,7 +3897,12 @@ class TradeManager {
               this._orphanReplayStats.deadLettered += Number(moved?.moved || 0);
               this._orphanReplayStats.lastDeadLetterAt = Date.now();
               logger.warn(
-                { orderId: oid, moved: moved?.moved || 0, attempt, maxAttempts },
+                {
+                  orderId: oid,
+                  moved: moved?.moved || 0,
+                  attempt,
+                  maxAttempts,
+                },
                 "[orphan] replay dead-lettered",
               );
             } catch (e) {
@@ -3851,7 +3953,9 @@ class TradeManager {
 
     const symbol = String(order?.tradingsymbol || "").toUpperCase();
     const txnType = String(order?.transaction_type || "").toUpperCase();
-    const qty = Math.abs(Number(order?.filled_quantity || order?.quantity || 0));
+    const qty = Math.abs(
+      Number(order?.filled_quantity || order?.quantity || 0),
+    );
     if (!symbol || !txnType || !(qty > 0)) return null;
 
     const ms = parseOrderTimestampMs(order) || Date.now();
@@ -3867,16 +3971,27 @@ class TradeManager {
     for (const t of actives || []) {
       const tSymbol = String(t?.instrument?.tradingsymbol || "").toUpperCase();
       const tQty = Math.abs(Number(t?.qty || 0));
-      const tExitSide = String(t?.side || "").toUpperCase() === "BUY" ? "SELL" : "BUY";
+      const tExitSide =
+        String(t?.side || "").toUpperCase() === "BUY" ? "SELL" : "BUY";
       const tStatus = String(t?.status || "").toUpperCase();
       if (!symbol || symbol !== tSymbol) continue;
       if (tQty !== qty) continue;
       if (txnType !== tExitSide) continue;
-      if (![STATUS.ENTRY_FILLED, STATUS.LIVE, STATUS.GUARD_FAILED].includes(tStatus)) continue;
+      if (
+        ![STATUS.ENTRY_FILLED, STATUS.LIVE, STATUS.GUARD_FAILED].includes(
+          tStatus,
+        )
+      )
+        continue;
 
       const touchMs =
         parseOrderTimestampMs(t) ||
-        new Date(t?.slOrderStatusUpdatedAt || t?.updatedAt || t?.createdAt || Date.now()).getTime();
+        new Date(
+          t?.slOrderStatusUpdatedAt ||
+            t?.updatedAt ||
+            t?.createdAt ||
+            Date.now(),
+        ).getTime();
       const delta = Math.abs(ms - touchMs);
       if (!Number.isFinite(delta) || delta > winMs) continue;
       if (delta < bestScore) {
@@ -3892,7 +4007,9 @@ class TradeManager {
     if (!trade?.tradeId) return false;
 
     const tradeId = String(trade.tradeId);
-    const exitPrice = Number(order?.average_price || order?.price || trade?.exitPrice || 0);
+    const exitPrice = Number(
+      order?.average_price || order?.price || trade?.exitPrice || 0,
+    );
     await updateTrade(tradeId, {
       status: STATUS.CLOSED,
       exitPrice: exitPrice > 0 ? exitPrice : trade?.exitPrice,
@@ -3963,11 +4080,15 @@ class TradeManager {
         for (const oid of toCancel) {
           try {
             const id = String(oid);
-            let status = String(this._lastOrdersById.get(id)?.status || "").toUpperCase();
+            let status = String(
+              this._lastOrdersById.get(id)?.status || "",
+            ).toUpperCase();
             if (!status) {
               try {
                 const st = await this._getOrderStatus(id);
-                status = String(st?.status || st?.order?.status || "").toUpperCase();
+                status = String(
+                  st?.status || st?.order?.status || "",
+                ).toUpperCase();
               } catch {}
             }
 
@@ -4556,10 +4677,16 @@ class TradeManager {
               trade.status,
             )
           ) {
-            const flatCheck = await this._isFlatStateLikelyExitInProgress(trade);
+            const flatCheck =
+              await this._isFlatStateLikelyExitInProgress(trade);
             if (flatCheck?.benign) {
               logger.warn(
-                { tradeId, token, status: trade.status, reason: flatCheck.reason },
+                {
+                  tradeId,
+                  token,
+                  status: trade.status,
+                  reason: flatCheck.reason,
+                },
                 "[oco] broker flat observed during exit processing; skipping fatal mismatch",
               );
               continue;
@@ -4692,7 +4819,10 @@ class TradeManager {
         trade.status,
       )
     ) {
-      const flatCheck = await this._isFlatStateLikelyExitInProgress(trade, byId);
+      const flatCheck = await this._isFlatStateLikelyExitInProgress(
+        trade,
+        byId,
+      );
       if (flatCheck?.benign) {
         logger.warn(
           { tradeId, token, status: trade.status, reason: flatCheck.reason },
@@ -4986,7 +5116,8 @@ class TradeManager {
     const cutoff = ts - st.burstWindowMs;
     while (arr.length && arr[0] < cutoff) arr.shift();
 
-    if (kind === "modify") st.maxModifyBurst = Math.max(st.maxModifyBurst, arr.length);
+    if (kind === "modify")
+      st.maxModifyBurst = Math.max(st.maxModifyBurst, arr.length);
     else st.maxEvalBurst = Math.max(st.maxEvalBurst, arr.length);
 
     const maxSamples = 200;
@@ -5823,6 +5954,12 @@ class TradeManager {
 
     const terminal = [
       STATUS.LIVE,
+      STATUS.SL_PLACED,
+      STATUS.SL_OPEN,
+      STATUS.SL_CONFIRMED,
+      STATUS.PANIC_EXIT_PLACED,
+      STATUS.PANIC_EXIT_CONFIRMED,
+      STATUS.ENTRY_FILLED,
       STATUS.EXITED_TARGET,
       STATUS.EXITED_SL,
       STATUS.ENTRY_FAILED,
@@ -5912,10 +6049,190 @@ class TradeManager {
       return;
     }
 
+    // Final safety recheck before aggressive fallback (race window between exchange fill and this timer)
+    const graceMs = Math.max(
+      0,
+      Number(env.ENTRY_LIMIT_FALLBACK_GRACE_MS || 250),
+    );
+    if (graceMs > 0) {
+      await sleep(graceMs);
+
+      const againInfo = await this._getOrderStatus(entryOrderId);
+      const againStatus = String(againInfo?.status || "").toUpperCase();
+      const againOrder = againInfo?.order || {};
+      const filledAgain = Number(againOrder.filled_quantity || 0);
+      const avgAgain = Number(
+        againOrder.average_price || t.entryPrice || t.candle?.close || 0,
+      );
+
+      if (againStatus === "COMPLETE") {
+        const qty = Number(againOrder.filled_quantity || t.qty);
+        await updateTrade(tradeId, {
+          status: STATUS.ENTRY_FILLED,
+          entryPrice: avgAgain > 0 ? avgAgain : t.entryPrice,
+          qty,
+        });
+        await this._placeExitsIfMissing({
+          ...t,
+          entryPrice: avgAgain > 0 ? avgAgain : t.entryPrice,
+          qty,
+        });
+        await this._ensureExitQty(tradeId, qty);
+        this._clearEntryLimitFallbackTimer(tradeId);
+        return;
+      }
+
+      if (isDead(againStatus)) {
+        if (againStatus === "REJECTED") {
+          await updateTrade(tradeId, {
+            status: STATUS.ENTRY_FAILED,
+            closeReason: `ENTRY_${againStatus}`,
+          });
+          await this._finalizeClosed(tradeId, t.instrument_token);
+          this._clearEntryLimitFallbackTimer(tradeId);
+          return;
+        }
+        if (filledAgain > 0) {
+          await updateTrade(tradeId, {
+            status: STATUS.ENTRY_OPEN,
+            entryPrice: avgAgain > 0 ? avgAgain : t.entryPrice,
+            qty: filledAgain,
+          });
+          await this._placeExitsIfMissing({
+            ...t,
+            entryPrice: avgAgain > 0 ? avgAgain : t.entryPrice,
+            qty: filledAgain,
+          });
+          await this._ensureExitQty(tradeId, filledAgain);
+          logger.warn(
+            {
+              tradeId,
+              entryOrderId,
+              filledQty: filledAgain,
+              status: againStatus,
+            },
+            "[entry_fallback] dead status with partial fill; skipping MARKET fallback",
+          );
+          this._clearEntryLimitFallbackTimer(tradeId);
+          return;
+        }
+      }
+
+      if (filledAgain > 0) {
+        await updateTrade(tradeId, {
+          status: STATUS.ENTRY_OPEN,
+          entryPrice: avgAgain > 0 ? avgAgain : t.entryPrice,
+          qty: filledAgain,
+        });
+        await this._placeExitsIfMissing({
+          ...t,
+          entryPrice: avgAgain > 0 ? avgAgain : t.entryPrice,
+          qty: filledAgain,
+        });
+        await this._ensureExitQty(tradeId, filledAgain);
+        logger.warn(
+          { tradeId, entryOrderId, filledQty: filledAgain },
+          "[entry_fallback] partial fill detected; skipping MARKET fallback",
+        );
+        this._clearEntryLimitFallbackTimer(tradeId);
+        return;
+      }
+    }
+
     logger.warn(
       { tradeId, entryOrderId },
-      "[entry_fallback] timeout -> place MARKET then cancel LIMIT",
+      "[entry_fallback] timeout -> cancel LIMIT then (if cancelled) place MARKET",
     );
+
+    // Cancel LIMIT first, then verify CANCELLED vs late fill. Only then place MARKET.
+    try {
+      this.expectedCancelOrderIds.add(String(entryOrderId));
+      await this._safeCancelOrder(
+        env.DEFAULT_ORDER_VARIETY || "regular",
+        entryOrderId,
+        {
+          purpose: "ENTRY_LIMIT_FALLBACK_CANCEL",
+          tradeId,
+        },
+      );
+    } catch (e) {
+      // Cancel can fail if order just filled; we'll verify via history below.
+      logger.warn(
+        { tradeId, entryOrderId, e: e.message },
+        "[entry_fallback] cancel attempt failed; verifying order status",
+      );
+    }
+
+    const afterInfo = await this._checkLateFillAfterCancel(entryOrderId);
+    const afterStatus = String(afterInfo?.status || "").toUpperCase();
+    const afterOrder = afterInfo?.order || {};
+    const filledAfter = Number(afterOrder.filled_quantity || 0);
+    const avgAfter = Number(
+      afterOrder.average_price || t.entryPrice || t.candle?.close || 0,
+    );
+
+    if (afterStatus === "COMPLETE") {
+      const qty = Number(afterOrder.filled_quantity || t.qty);
+      await updateTrade(tradeId, {
+        status: STATUS.ENTRY_FILLED,
+        entryPrice: avgAfter > 0 ? avgAfter : t.entryPrice,
+        qty,
+      });
+      await this._placeExitsIfMissing({
+        ...t,
+        entryPrice: avgAfter > 0 ? avgAfter : t.entryPrice,
+        qty,
+      });
+      await this._ensureExitQty(tradeId, qty);
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    if (filledAfter > 0) {
+      await updateTrade(tradeId, {
+        status: STATUS.ENTRY_OPEN,
+        entryPrice: avgAfter > 0 ? avgAfter : t.entryPrice,
+        qty: filledAfter,
+      });
+      await this._placeExitsIfMissing({
+        ...t,
+        entryPrice: avgAfter > 0 ? avgAfter : t.entryPrice,
+        qty: filledAfter,
+      });
+      await this._ensureExitQty(tradeId, filledAfter);
+      logger.warn(
+        { tradeId, entryOrderId, filledQty: filledAfter, status: afterStatus },
+        "[entry_fallback] late/partial fill observed after cancel; skipping MARKET fallback",
+      );
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
+
+    // If cancel is still being processed, don't place MARKET yet — reschedule a short re-check.
+    if (afterStatus && afterStatus !== "CANCELLED" && !isDead(afterStatus)) {
+      const waitMs = jitterMs(
+        Number(env.ENTRY_LIMIT_FALLBACK_CANCEL_WAIT_MS || 400),
+        0.25,
+      );
+      logger.warn(
+        { tradeId, entryOrderId, status: afterStatus, waitMs },
+        "[entry_fallback] cancel not confirmed; rescheduling before MARKET",
+      );
+      this._scheduleEntryLimitFallback({
+        tradeId,
+        entryOrderId,
+        entryParams,
+        timeoutMs: waitMs,
+      });
+      return;
+    }
+
+    // Re-check trade status before placing MARKET (it may have moved to ENTRY_FILLED/LIVE in parallel)
+    const tNow = await getTrade(tradeId);
+    if (!tNow || terminal.includes(tNow.status)) {
+      this._clearEntryLimitFallbackTimer(tradeId);
+      return;
+    }
 
     const marketParams = {
       ...entryParams,
@@ -5953,24 +6270,6 @@ class TradeManager {
     });
     await this._replayOrphanUpdates(fallbackOrderId);
 
-    if (!isDead(status)) {
-      try {
-        this.expectedCancelOrderIds.add(String(entryOrderId));
-        await this._safeCancelOrder(
-          env.DEFAULT_ORDER_VARIETY || "regular",
-          entryOrderId,
-          {
-            purpose: "ENTRY_LIMIT_FALLBACK_CANCEL",
-            tradeId,
-          },
-        );
-      } catch (e) {
-        logger.warn(
-          { tradeId, entryOrderId, e: e.message },
-          "[entry_fallback] cancel failed after MARKET placement",
-        );
-      }
-    }
     this._clearEntryLimitFallbackTimer(tradeId);
   }
 
@@ -6035,7 +6334,12 @@ class TradeManager {
       try {
         const trade = await getTrade(tradeId);
         if (!trade) return;
-        if ([STATUS.EXITED_TARGET, STATUS.EXITED_SL, STATUS.CLOSED].includes(String(trade.status || ""))) return;
+        if (
+          [STATUS.EXITED_TARGET, STATUS.EXITED_SL, STATUS.CLOSED].includes(
+            String(trade.status || ""),
+          )
+        )
+          return;
 
         let status = "";
         if (typeof this.kite.getOrderHistory === "function") {
@@ -6044,22 +6348,41 @@ class TradeManager {
           status = String(last?.status || "").toUpperCase();
         }
 
-        const confirmed = ["OPEN", "TRIGGER PENDING", "COMPLETE", "PARTIAL"].includes(status);
+        const confirmed = [
+          "OPEN",
+          "TRIGGER PENDING",
+          "COMPLETE",
+          "PARTIAL",
+        ].includes(status);
         if (confirmed) {
-          await updateTrade(tradeId, { status: STATUS.SL_CONFIRMED, slConfirmedAt: new Date() });
+          await updateTrade(tradeId, {
+            status: STATUS.SL_CONFIRMED,
+            slConfirmedAt: new Date(),
+          });
           return;
         }
 
         const token = Number(instrumentToken || trade.instrument_token);
-        const cooldownMin = Math.max(1, Number(env.SL_SLA_BREACH_COOLDOWN_MIN || 5));
+        const cooldownMin = Math.max(
+          1,
+          Number(env.SL_SLA_BREACH_COOLDOWN_MIN || 5),
+        );
         if (Number.isFinite(token) && token > 0 && this.risk?.setCooldown) {
           this.risk.setCooldown(token, cooldownMin * 60, "SL_SLA_BREACH");
         }
 
-        logger.error({ tradeId, slOrderId, status, slaMs, token }, "[trade] SL guarantee SLA breached -> panic exit");
-        await this._panicExit(trade, "SL_SLA_BREACH", { allowWhenHalted: true });
+        logger.error(
+          { tradeId, slOrderId, status, slaMs, token },
+          "[trade] SL guarantee SLA breached -> panic exit",
+        );
+        await this._panicExit(trade, "SL_SLA_BREACH", {
+          allowWhenHalted: true,
+        });
       } catch (e) {
-        logger.warn({ tradeId, slOrderId, e: e?.message || String(e) }, "[trade] SL SLA watchdog failed");
+        logger.warn(
+          { tradeId, slOrderId, e: e?.message || String(e) },
+          "[trade] SL SLA watchdog failed",
+        );
       }
     }, slaMs);
   }
@@ -6701,7 +7024,10 @@ class TradeManager {
     );
     const isIndexUnderlying =
       String(baseInstrument?.segment || "").toUpperCase() === "INDICES";
-    if (isIndexUnderlying && String(signal?.strategyId || "") === "volume_spike") {
+    if (
+      isIndexUnderlying &&
+      String(signal?.strategyId || "") === "volume_spike"
+    ) {
       logger.info(
         { token: signal?.instrument_token, strategyId: signal?.strategyId },
         "[trade] blocked (volume_spike disabled for index underlyings)",
@@ -6803,8 +7129,13 @@ class TradeManager {
       if (Number.isFinite(strikeRefToken) && strikeRefToken > 0) {
         strikeRefLtp = Number(this.lastPriceByToken.get(strikeRefToken));
         if (!(strikeRefLtp > 0)) {
-          const strikeRefInstr = await ensureInstrument(this.kite, strikeRefToken);
-          strikeRefLtp = Number(await this._getLtp(strikeRefToken, strikeRefInstr));
+          const strikeRefInstr = await ensureInstrument(
+            this.kite,
+            strikeRefToken,
+          );
+          strikeRefLtp = Number(
+            await this._getLtp(strikeRefToken, strikeRefInstr),
+          );
         }
       }
 
@@ -6812,7 +7143,9 @@ class TradeManager {
         (await this._getLtp(underlyingToken, underInstr)) ||
         Number(s.candle?.close);
       const routeLtp =
-        Number.isFinite(strikeRefLtp) && strikeRefLtp > 0 ? strikeRefLtp : underLtp;
+        Number.isFinite(strikeRefLtp) && strikeRefLtp > 0
+          ? strikeRefLtp
+          : underLtp;
 
       if (typeof this.runtimeAddTokens === "function") {
         try {
@@ -6882,9 +7215,13 @@ class TradeManager {
         const alt = (picked?.meta?.topCandidates || []).find(
           (c) =>
             Number(c?.instrument_token || 0) > 0 &&
-            Number(c?.health_score || 0) >= Number(env.OPT_HEALTH_SCORE_MIN || 45),
+            Number(c?.health_score || 0) >=
+              Number(env.OPT_HEALTH_SCORE_MIN || 45),
         );
-        if (alt && Number(alt.instrument_token) !== Number(picked.instrument_token)) {
+        if (
+          alt &&
+          Number(alt.instrument_token) !== Number(picked.instrument_token)
+        ) {
           picked.instrument_token = Number(alt.instrument_token);
           picked.tradingsymbol = alt.tradingsymbol || picked.tradingsymbol;
           picked.exchange = alt.exchange || picked.exchange;
@@ -6899,15 +7236,15 @@ class TradeManager {
             "[options] switched to healthier alternate contract before entry",
           );
         } else {
-        logger.info(
-          {
-            token: picked.instrument_token,
-            reason: liq.reason,
-            meta: liq.meta,
-          },
-          "[trade] blocked (option liquidity recheck)",
-        );
-        return;
+          logger.info(
+            {
+              token: picked.instrument_token,
+              reason: liq.reason,
+              meta: liq.meta,
+            },
+            "[trade] blocked (option liquidity recheck)",
+          );
+          return;
         }
       }
 
@@ -7058,7 +7395,12 @@ class TradeManager {
           meta: { conf, minConf },
         });
         logger.info(
-          { token: s.instrument_token, conf, minConf, postRoute: !!s.option_meta },
+          {
+            token: s.instrument_token,
+            conf,
+            minConf,
+            postRoute: !!s.option_meta,
+          },
           "[trade] blocked (low confidence post-route)",
         );
         return;
@@ -7126,7 +7468,11 @@ class TradeManager {
         : Number(policy?.maxSpreadBps ?? env.MAX_SPREAD_BPS ?? 15),
     });
     if (!sp.ok) {
-      if (String(sp.reason || "").toUpperCase().includes("SPREAD")) {
+      if (
+        String(sp.reason || "")
+          .toUpperCase()
+          .includes("SPREAD")
+      ) {
         this._pushCircuitEvent("spreadSpikes");
       }
       logger.info(
@@ -7158,7 +7504,11 @@ class TradeManager {
         .trim();
       const stopMode = stopModeRaw === "PCT" ? "PREMIUM_PCT" : stopModeRaw;
 
-      if (stopMode === "POINTS" || stopMode === "PREMIUM_POINTS" || stopMode === "PRICE") {
+      if (
+        stopMode === "POINTS" ||
+        stopMode === "PREMIUM_POINTS" ||
+        stopMode === "PRICE"
+      ) {
         const pts = Number(env.OPT_STOP_POINTS || env.OPT_SL_POINTS || 0);
         if (Number.isFinite(pts) && pts > 0) {
           const raw = Number(expectedEntryPrice) - pts;
@@ -7212,7 +7562,9 @@ class TradeManager {
     }
 
     if (s.option_meta) {
-      const slMode = String(env.OPT_SL_MODE || env.OPT_STOP_MODE || "PREMIUM_PCT").toUpperCase();
+      const slMode = String(
+        env.OPT_SL_MODE || env.OPT_STOP_MODE || "PREMIUM_PCT",
+      ).toUpperCase();
       if (slMode === "UNDERLYING_ATR") {
         const fit = optionStopLossFromUnderlyingATR({
           side,
@@ -8123,9 +8475,14 @@ class TradeManager {
         entryOrderId,
         instrument,
         side,
-        basePrice: Number(entryParams.price || expectedEntryPrice || entryGuess),
+        basePrice: Number(
+          entryParams.price || expectedEntryPrice || entryGuess,
+        ),
       }).catch((e) => {
-        logger.warn({ tradeId, e: e?.message || String(e) }, "[entry_ladder] failed");
+        logger.warn(
+          { tradeId, e: e?.message || String(e) },
+          "[entry_ladder] failed",
+        );
       });
     }
 
@@ -10612,7 +10969,12 @@ class TradeManager {
       exitSlippageInrWorse,
       closeReason: "TARGET_HIT",
       exitReason: "TARGET_HIT",
-      exitOrderId: String(targetOrder?.order_id || targetOrder?.orderId || trade?.targetOrderId || ""),
+      exitOrderId: String(
+        targetOrder?.order_id ||
+          targetOrder?.orderId ||
+          trade?.targetOrderId ||
+          "",
+      ),
       exitOrderRole: "TARGET",
     });
     alert("info", "🏁 TARGET HIT", { tradeId, exitPrice }).catch(() => {});
@@ -10699,7 +11061,9 @@ class TradeManager {
       exitSlippageInrWorse,
       closeReason: "SL_HIT",
       exitReason: "SL_HIT",
-      exitOrderId: String(slOrder?.order_id || slOrder?.orderId || trade?.slOrderId || ""),
+      exitOrderId: String(
+        slOrder?.order_id || slOrder?.orderId || trade?.slOrderId || "",
+      ),
       exitOrderRole: "SL",
     });
     alert("warn", "🛑 SL HIT", { tradeId, exitPrice }).catch(() => {});
