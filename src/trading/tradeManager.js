@@ -4062,6 +4062,7 @@ class TradeManager {
       exitReason: reason,
       brokerSquareoffOrderId: String(order?.order_id || "") || null,
       brokerSquareoffAt: new Date(),
+      exitAt: new Date(),
       closedAt: new Date(),
     });
 
@@ -4528,6 +4529,8 @@ class TradeManager {
             targetOrderId: null,
             entryPrice: avgPrice || null,
             exitPrice: null,
+            decisionAt: new Date(),
+            entryAt: new Date(),
             recoveryReason: "RECOVERY_ADOPTED_OPEN_POSITION",
             recoveredAt: new Date(),
           });
@@ -4752,6 +4755,7 @@ class TradeManager {
               status: STATUS.CLOSED,
               closeReason: "OCO_BROKER_POSITION_FLAT",
               exitReason: "RECONCILE_EXIT",
+              exitAt: new Date(),
               closedAt: new Date(),
             });
             await this._finalizeClosed(tradeId, token);
@@ -4921,6 +4925,7 @@ class TradeManager {
         status: STATUS.CLOSED,
         closeReason: "BROKER_POSITION_FLAT_MANUAL_EXIT",
         exitReason: "RECONCILE_EXIT",
+        exitAt: new Date(),
         closedAt: new Date(),
       });
       await this._finalizeClosed(tradeId, token);
@@ -4941,6 +4946,7 @@ class TradeManager {
             closeReason:
               (trade.closeReason || "GUARD_FAILED") + " | PANIC_FILLED",
             exitReason: "PANIC_EXIT",
+            exitAt: new Date(),
             closedAt: new Date(),
           });
           await this._bookRealizedPnl(tradeId);
@@ -8495,6 +8501,19 @@ class TradeManager {
       entryFilledAt: null,
       timeStopAt: null,
       quoteAtEntry,
+      marketContextAtEntry: {
+        spread: Number.isFinite(Number(quoteAtEntry?.bps))
+          ? Number(quoteAtEntry?.bps)
+          : null,
+        ivPercentile: Number.isFinite(Number(s?.option_meta?.iv_pts))
+          ? Number(s.option_meta.iv_pts)
+          : null,
+        atr: Number.isFinite(Number(reg?.meta?.atr))
+          ? Number(reg.meta.atr)
+          : null,
+        regimeTag: reg?.meta?.regime || s?.regime || null,
+        trendState: reg?.meta?.multiTf?.trend || null,
+      },
       expectedEntryPrice,
       regimeMeta: reg?.meta || null,
       costMeta: edge?.meta || null,
@@ -8524,6 +8543,7 @@ class TradeManager {
       closeReason: null,
       targetReplaceCount: 0,
       product: String(env.DEFAULT_PRODUCT || "MIS").toUpperCase(),
+      decisionAt: new Date(),
     };
 
     await insertTrade(trade);
@@ -8772,6 +8792,7 @@ class TradeManager {
           exitPrice: exitPrice > 0 ? exitPrice : trade.exitPrice,
           closeReason: (trade.closeReason || "PANIC_EXIT") + " | FILLED",
           exitReason: "PANIC_EXIT",
+          exitAt: new Date(),
           closedAt: new Date(),
         });
 
@@ -8921,6 +8942,13 @@ class TradeManager {
         );
         const slipBps =
           expected > 0 ? ((avg - expected) / expected) * 10000 : null;
+        const slipInr = worseSlippageInr({
+          side: trade.side,
+          expected,
+          actual: avg,
+          qty: filledQty,
+          leg: "ENTRY",
+        });
         const slipAbs = slipBps == null ? null : Math.abs(slipBps);
         const entryType = String(
           trade.entryOrderType || env.ENTRY_ORDER_TYPE || "MARKET",
@@ -8972,7 +9000,9 @@ class TradeManager {
           entryPrice: avg,
           qty: filledQty,
           entrySlippageBps: slipBps,
+          entrySlippageInrWorse: slipInr,
           entryFilledAt: new Date(),
+          entryAt: new Date(),
           entryFinalized: true,
           ...this._eventPatch("ENTRY_FILLED", {
             avg,
@@ -11132,6 +11162,7 @@ class TradeManager {
       exitSlippageInrWorse,
       closeReason: "TARGET_HIT",
       exitReason: "TARGET_HIT",
+      exitAt: new Date(),
       exitOrderId: String(
         targetOrder?.order_id ||
           targetOrder?.orderId ||
@@ -11227,6 +11258,7 @@ class TradeManager {
       exitSlippageInrWorse,
       closeReason: "SL_HIT",
       exitReason: "SL_HIT",
+      exitAt: new Date(),
       exitOrderId: String(
         slOrder?.order_id || slOrder?.orderId || trade?.slOrderId || "",
       ),
@@ -11441,6 +11473,14 @@ class TradeManager {
       ? grossPnlInr - estCostInr
       : null;
 
+    const entrySlippage = Number(t.entrySlippageInrWorse || 0);
+    const exitSlippage = Number(t.exitSlippageInrWorse || 0);
+    const brokerage = Number(costMeta?.brokerage || 0);
+    const taxes =
+      (Number(costMeta?.turnover || 0) * Number(costMeta?.variableBps || 0)) /
+      10000;
+    const feesTotal = brokerage + taxes;
+
     // Persist on the trade for post-analysis.
     try {
       await updateTrade(tradeId, {
@@ -11453,6 +11493,13 @@ class TradeManager {
         feeMultiple,
         feeMultipleExecOrders: execOrders,
         feeMultipleMeta: costMeta,
+        costPayload: {
+          entrySlippage: Number.isFinite(entrySlippage) ? entrySlippage : null,
+          exitSlippage: Number.isFinite(exitSlippage) ? exitSlippage : null,
+          brokerage: Number.isFinite(brokerage) ? brokerage : null,
+          taxes: Number.isFinite(taxes) ? taxes : null,
+          feesTotal: Number.isFinite(feesTotal) ? feesTotal : null,
+        },
       });
     } catch {}
 
