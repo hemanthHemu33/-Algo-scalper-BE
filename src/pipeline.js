@@ -365,6 +365,17 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
         const live = candleBuilder.getCurrentCandle(tok, intervalMin);
         if (!live?.ts) continue;
 
+        // Keep tick-confirmed signals inside configured market session,
+        // same as close-confirmed candle path.
+        if (
+          !isCandleWithinMarketSession({
+            ts: live.ts,
+            interval_min: intervalMin,
+          })
+        ) {
+          continue;
+        }
+
         if (
           String(env.ALLOW_SYNTHETIC_SIGNALS || "false") !== "true" &&
           (live.synthetic || (live.source && live.source !== "live"))

@@ -315,7 +315,11 @@ function applyMinGreenExitRules({
     if (!Number.isFinite(prevPeak) || peakLtp !== prevPeak) {
       tradePatch.peakLtp = peakLtp;
     }
-    if (Number.isFinite(trailSl) && (!Number.isFinite(Number(trade?.trailSl)) || trailSl !== trade?.trailSl)) {
+    const curTrailSl = Number(trade?.trailSl);
+    if (
+      Number.isFinite(trailSl) &&
+      (!Number.isFinite(curTrailSl) || Math.abs(trailSl - curTrailSl) >= tick / 2)
+    ) {
       tradePatch.trailSl = trailSl;
     }
 
@@ -404,7 +408,7 @@ function applyMinGreenExitRules({
   }
 
   const desiredStopLoss = newSlRounded;
-  const finalStopLoss = shouldMoveSL
+  let finalStopLoss = shouldMoveSL
     ? roundToTick(
         side === "BUY"
           ? desiredStopLoss + triggerBufferTicks * tick
@@ -413,6 +417,17 @@ function applyMinGreenExitRules({
         side === "BUY" ? "up" : "down",
       )
     : null;
+
+  // Keep post-buffer trigger broker-valid relative to live LTP.
+  if (shouldMoveSL && Number.isFinite(ltp) && Number.isFinite(finalStopLoss)) {
+    if (side === "BUY") {
+      finalStopLoss = Math.min(finalStopLoss, ltp - tick);
+      finalStopLoss = roundToTick(finalStopLoss, tick, "down");
+    } else {
+      finalStopLoss = Math.max(finalStopLoss, ltp + tick);
+      finalStopLoss = roundToTick(finalStopLoss, tick, "up");
+    }
+  }
 
   if (!shouldMoveSL) {
     skipReasons.push(`sl_move_below_step (move=${Number(slMove || 0).toFixed(2)}, step=${Number(step || 0).toFixed(2)})`);
