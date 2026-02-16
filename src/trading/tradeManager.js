@@ -132,7 +132,10 @@ const ORDER_STATUS_RANK = Object.freeze({
 });
 
 function orderStatusRank(status) {
-  const s = String(status || "").toUpperCase();
+  const s = String(status || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "_");
   return ORDER_STATUS_RANK[s] || 0;
 }
 
