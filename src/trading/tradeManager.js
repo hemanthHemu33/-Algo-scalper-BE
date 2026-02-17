@@ -5344,7 +5344,15 @@ class TradeManager {
       if (plan?.action?.exitNow) {
         this._dynExitCadenceStats.planExitNow += 1;
         const exitReason = String(plan?.action?.reason || "DYN_EXIT_ACTION");
-        const isTimeStop = exitReason.startsWith("TIME_STOP");
+        const timeStopReasonMap = {
+          TIME_STOP: "LEGACY",
+          TIME_STOP_NO_PROGRESS: "NO_PROGRESS",
+          TIME_STOP_MAX_HOLD: "MAX_HOLD",
+        };
+        const isTimeStop = Object.prototype.hasOwnProperty.call(
+          timeStopReasonMap,
+          exitReason,
+        );
         const patch = {
           ...(plan?.tradePatch && Object.keys(plan.tradePatch).length
             ? plan.tradePatch
@@ -5355,24 +5363,32 @@ class TradeManager {
             patch,
             this._eventPatch("TIME_STOP_TRIGGERED", {
               tradeId,
-              timeStopKind: plan?.meta?.timeStopKind || null,
+              timeStopKind:
+                plan?.meta?.timeStopKind || timeStopReasonMap[exitReason] || null,
               holdMin: plan?.meta?.holdMin,
               timeStopAtMs: plan?.meta?.timeStopAtMs,
               pnlInr: plan?.meta?.pnlInr,
               pnlR: plan?.meta?.pnlR,
+              pnlPriceR: plan?.meta?.pnlPriceR,
               peakPnlInr: plan?.meta?.peakPnlInr,
               peakPnlR: plan?.meta?.peakPnlR,
+              peakPriceR: plan?.meta?.peakPriceR,
+              mfeR: plan?.meta?.mfeR,
             }),
           );
           alert("warn", `Time stop triggered -> exit (${exitReason})`, {
             tradeId,
-            timeStopKind: plan?.meta?.timeStopKind || null,
+            timeStopKind:
+              plan?.meta?.timeStopKind || timeStopReasonMap[exitReason] || null,
             holdMin: plan?.meta?.holdMin,
             timeStopAtMs: plan?.meta?.timeStopAtMs,
             pnlInr: plan?.meta?.pnlInr,
             pnlR: plan?.meta?.pnlR,
+            pnlPriceR: plan?.meta?.pnlPriceR,
             peakPnlInr: plan?.meta?.peakPnlInr,
             peakPnlR: plan?.meta?.peakPnlR,
+            peakPriceR: plan?.meta?.peakPriceR,
+            mfeR: plan?.meta?.mfeR,
           }).catch(() => {});
           logger.warn(
             { tradeId, reason: exitReason, meta: plan?.meta || null },
