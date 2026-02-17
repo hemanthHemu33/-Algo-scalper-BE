@@ -554,6 +554,8 @@ const schema = z.object({
   TIME_STOP_MIN: z.coerce.number().default(5),
   TIME_STOP_NO_PROGRESS_MIN: z.coerce.number().default(0),
   TIME_STOP_NO_PROGRESS_MFE_R: z.coerce.number().default(0.2),
+  TIME_STOP_NO_PROGRESS_REQUIRE_UL_CONFIRM: z.string().default("true"),
+  TIME_STOP_NO_PROGRESS_UL_BPS: z.coerce.number().default(12),
   TIME_STOP_NO_PROGRESS_UNDERLYING_CONFIRM: z.string().default("false"),
   TIME_STOP_NO_PROGRESS_UNDERLYING_MFE_BPS: z.coerce.number().default(8),
   TIME_STOP_NO_PROGRESS_UNDERLYING_STRICT_DATA: z.string().default("false"),
