@@ -1160,6 +1160,7 @@ class TradeManager {
 
   async _loadActiveTradeId() {
     const actives = await getActiveTrades();
+    await this._restoreDynamicExitState(actives);
     if (actives.length) {
       const latest = actives.sort(
         (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0),
@@ -1170,6 +1171,47 @@ class TradeManager {
         { tradeId: latest.tradeId, status: latest.status },
         "[reconcile] found active trade in DB",
       );
+    }
+  }
+
+  async _restoreDynamicExitState(actives = []) {
+    for (const trade of actives || []) {
+      const tradeId = String(trade?.tradeId || "");
+      if (!tradeId) continue;
+
+      const patch = {};
+      if (!Object.prototype.hasOwnProperty.call(trade, "peakLtp")) {
+        patch.peakLtp = null;
+      }
+      if (!Object.prototype.hasOwnProperty.call(trade, "peakPnlInr")) {
+        patch.peakPnlInr = null;
+      }
+      if (!Object.prototype.hasOwnProperty.call(trade, "beLocked")) {
+        patch.beLocked = false;
+      }
+      if (!Object.prototype.hasOwnProperty.call(trade, "trailLocked")) {
+        patch.trailLocked = false;
+      }
+      if (!Object.prototype.hasOwnProperty.call(trade, "timeStopTriggeredAt")) {
+        patch.timeStopTriggeredAt = null;
+      }
+
+      if (Object.keys(patch).length) {
+        try {
+          await updateTrade(tradeId, patch);
+          Object.assign(trade, patch);
+        } catch (e) {
+          logger.warn(
+            { tradeId, e: e?.message || String(e), patchKeys: Object.keys(patch) },
+            "[reconcile] failed restoring dynamic exit defaults",
+          );
+        }
+      }
+
+      const peakLtp = Number(trade?.peakLtp || NaN);
+      if (Number.isFinite(peakLtp) && peakLtp > 0) {
+        this._dynPeakLtpByTrade.set(tradeId, peakLtp);
+      }
     }
   }
 
@@ -4663,6 +4705,7 @@ class TradeManager {
 
     // 3) Fetch active trades first
     const actives = await getActiveTrades();
+    await this._restoreDynamicExitState(actives);
     await this._persistLiveOrderSnapshotsForTrades(actives, byId, "reconcile");
 
     this._syncRiskFromPositions(posQtyByToken, actives);
