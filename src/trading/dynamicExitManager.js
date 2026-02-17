@@ -188,8 +188,30 @@ function applyMinGreenExitRules({
 
   const pnlInr = unrealizedPnlInr({ side, entry, ltp, qty });
   const riskPerTradeInr = Number(trade?.riskInr || env.RISK_PER_TRADE_INR || 0);
+  const pnlR =
+    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
+      ? pnlInr / riskPerTradeInr
+      : null;
+  const prevPeakPnlInr = Number(trade?.peakPnlInr || NaN);
+  const peakPnlInr = Number.isFinite(prevPeakPnlInr)
+    ? Math.max(prevPeakPnlInr, pnlInr)
+    : pnlInr;
+  const peakPnlR =
+    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
+      ? peakPnlInr / riskPerTradeInr
+      : null;
+  if (!Number.isFinite(prevPeakPnlInr) || Math.abs(peakPnlInr - prevPeakPnlInr) >= Math.max(1, tick * qty)) {
+    tradePatch.peakPnlInr = peakPnlInr;
+  }
 
   const timeStopMin = Number(env.TIME_STOP_MIN || 0);
+  const noProgressMin = Number(env.TIME_STOP_NO_PROGRESS_MIN || 0);
+  const noProgressMfeR = Number(env.TIME_STOP_NO_PROGRESS_MFE_R || 0.2);
+  const maxHoldMin = Number(env.TIME_STOP_MAX_HOLD_MIN || 0);
+  const maxHoldSkipIfPnlR = Number(env.TIME_STOP_MAX_HOLD_SKIP_IF_PNL_R || 0.8);
+  const proTimeStopsEnabled =
+    (Number.isFinite(noProgressMin) && noProgressMin > 0) ||
+    (Number.isFinite(maxHoldMin) && maxHoldMin > 0);
   const entryTs =
     tsFrom(trade?.entryFilledAt) ||
     tsFrom(trade?.createdAt || trade?.updatedAt) ||
@@ -201,6 +223,7 @@ function applyMinGreenExitRules({
       : null;
 
   if (
+    !proTimeStopsEnabled &&
     Number.isFinite(timeStopAtMs) &&
     now >= timeStopAtMs &&
     pnlInr < minGreenInr
@@ -218,6 +241,70 @@ function applyMinGreenExitRules({
         timeStopAtMs,
         pnlInr,
         minGreenInr,
+        timeStopKind: "LEGACY",
+        holdMin,
+        peakPnlInr,
+        peakPnlR,
+      },
+    };
+  }
+
+  if (
+    proTimeStopsEnabled &&
+    Number.isFinite(noProgressMin) &&
+    noProgressMin > 0 &&
+    holdMin >= noProgressMin &&
+    Number.isFinite(noProgressMfeR) &&
+    Number.isFinite(peakPnlR) &&
+    peakPnlR < noProgressMfeR
+  ) {
+    return {
+      ...basePlan,
+      ok: true,
+      action: { exitNow: true, reason: "TIME_STOP_NO_PROGRESS" },
+      tradePatch: {
+        ...tradePatch,
+        timeStopTriggeredAt: new Date(now),
+      },
+      meta: {
+        ...(basePlan?.meta || {}),
+        timeStopKind: "NO_PROGRESS",
+        holdMin,
+        noProgressMin,
+        noProgressMfeR,
+        peakPnlInr,
+        peakPnlR,
+        pnlInr,
+        pnlR,
+      },
+    };
+  }
+
+  if (
+    proTimeStopsEnabled &&
+    Number.isFinite(maxHoldMin) &&
+    maxHoldMin > 0 &&
+    holdMin >= maxHoldMin &&
+    (!Number.isFinite(pnlR) || pnlR < maxHoldSkipIfPnlR)
+  ) {
+    return {
+      ...basePlan,
+      ok: true,
+      action: { exitNow: true, reason: "TIME_STOP_MAX_HOLD" },
+      tradePatch: {
+        ...tradePatch,
+        timeStopTriggeredAt: new Date(now),
+      },
+      meta: {
+        ...(basePlan?.meta || {}),
+        timeStopKind: "MAX_HOLD",
+        holdMin,
+        maxHoldMin,
+        maxHoldSkipIfPnlR,
+        pnlInr,
+        pnlR,
+        peakPnlInr,
+        peakPnlR,
       },
     };
   }
@@ -266,6 +353,8 @@ function applyMinGreenExitRules({
 
   const trailGapPreBePct = Number(env.TRAIL_GAP_PRE_BE_PCT || 0.08);
   const trailGapPostBePct = Number(env.TRAIL_GAP_POST_BE_PCT || 0.04);
+  const trailTightenR = Number(env.TRAIL_TIGHTEN_R || 1.5);
+  const trailGapPostBePctTight = Number(env.TRAIL_GAP_POST_BE_PCT_TIGHT || trailGapPostBePct);
   const trailGapMinPts = Number(env.TRAIL_GAP_MIN_PTS || 2);
   const trailGapMaxPts = Number(env.TRAIL_GAP_MAX_PTS || 10);
   const beBufferTicks = Number(env.BE_BUFFER_TICKS || env.DYN_BE_BUFFER_TICKS || 1);
@@ -286,6 +375,28 @@ function applyMinGreenExitRules({
     }
   }
 
+  const profitLockEnabled = String(env.PROFIT_LOCK_ENABLED || "false") === "true";
+  const profitLockR = Number(env.PROFIT_LOCK_R || 1.0);
+  const profitLockKeepR = Number(env.PROFIT_LOCK_KEEP_R || 0.25);
+  const profitLockMinInr = Number(env.PROFIT_LOCK_MIN_INR || 0);
+  const profitLockArmed =
+    profitLockEnabled && Number.isFinite(peakPnlR) && peakPnlR >= profitLockR;
+  if (profitLockArmed && !trade?.profitLockArmedAt) {
+    tradePatch.profitLockArmedAt = new Date(now);
+  }
+  if (profitLockArmed && Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0 && qty > 0) {
+    const lockInr = Math.max(profitLockMinInr, profitLockKeepR * riskPerTradeInr);
+    if (Number.isFinite(lockInr) && lockInr > 0) {
+      const lockPts = lockInr / qty;
+      const lockSlRaw = side === "BUY" ? entry + lockPts : entry - lockPts;
+      const lockSl = roundToTick(lockSlRaw, tick, side === "BUY" ? "up" : "down");
+      if (side === "BUY") newSL = Math.max(newSL, lockSl);
+      else newSL = Math.min(newSL, lockSl);
+      tradePatch.profitLockInr = lockInr;
+      tradePatch.profitLockR = profitLockKeepR;
+    }
+  }
+
   let trailGap = null;
 
   if (
@@ -299,7 +410,15 @@ function applyMinGreenExitRules({
     } else {
       peakLtp = Number.isFinite(prevPeak) ? Math.min(prevPeak, ltp) : ltp;
     }
-    const gapPct = beLockedNow ? trailGapPostBePct : trailGapPreBePct;
+    const shouldTightenTrail =
+      Number.isFinite(peakPnlR) &&
+      Number.isFinite(trailTightenR) &&
+      peakPnlR >= trailTightenR;
+    const gapPct = beLockedNow
+      ? shouldTightenTrail
+        ? trailGapPostBePctTight
+        : trailGapPostBePct
+      : trailGapPreBePct;
     const rawGap = clamp(peakLtp * gapPct, trailGapMinPts, trailGapMaxPts);
     trailGap = roundToTick(rawGap, tick, "nearest");
     if (!(Number.isFinite(trailGap) && trailGap > 0)) {
@@ -443,6 +562,9 @@ function applyMinGreenExitRules({
       pnlInr,
       minGreenInr,
       minGreenPts,
+      pnlR,
+      peakPnlInr,
+      peakPnlR,
       beLockAt,
       beArmEpsInr,
       trailGap,
@@ -463,6 +585,12 @@ function applyMinGreenExitRules({
       skipReason: skipReasons.join(" | ") || null,
       holdMin,
       allowWiden,
+      profitLockArmed,
+      profitLockR,
+      profitLockKeepR,
+      profitLockMinInr,
+      trailTightenR,
+      trailGapPostBePctTight,
       widenMult: Number.isFinite(widenMult) ? widenMult : null,
       maxRiskInr: Number.isFinite(maxRiskInr) ? maxRiskInr : null,
       maxRiskPts: Number.isFinite(maxRiskPts) ? maxRiskPts : null,
@@ -530,8 +658,10 @@ function optionExitFallback({
   const holdMin = Math.max(0, (now - refTs) / (60 * 1000));
 
   // ===== Time-based exit (hard stop) =====
+  const globalMaxHold = Number(env.TIME_STOP_MAX_HOLD_MIN || 0);
+  const proMaxHoldEnabled = Number.isFinite(globalMaxHold) && globalMaxHold > 0;
   const maxHold = Number(env.OPT_EXIT_MAX_HOLD_MIN || 25);
-  if (Number.isFinite(maxHold) && maxHold > 0 && holdMin >= maxHold) {
+  if (!proMaxHoldEnabled && Number.isFinite(maxHold) && maxHold > 0 && holdMin >= maxHold) {
     return {
       ok: true,
       action: { exitNow: true, reason: `OPT_TIME_EXIT (>=${maxHold}m)` },

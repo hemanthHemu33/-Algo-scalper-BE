@@ -5343,34 +5343,48 @@ class TradeManager {
 
       if (plan?.action?.exitNow) {
         this._dynExitCadenceStats.planExitNow += 1;
-        if (plan?.tradePatch && Object.keys(plan.tradePatch).length) {
-          const patch = { ...plan.tradePatch };
-          if (plan.action.reason === "TIME_STOP") {
-            Object.assign(
-              patch,
-              this._eventPatch("TIME_STOP_TRIGGERED", {
-                tradeId,
-                timeStopAtMs: plan?.meta?.timeStopAtMs,
-                pnlInr: plan?.meta?.pnlInr,
-                minGreenInr: plan?.meta?.minGreenInr,
-              }),
-            );
-            alert("warn", "Time stop triggered -> exit", {
+        const exitReason = String(plan?.action?.reason || "DYN_EXIT_ACTION");
+        const isTimeStop = exitReason.startsWith("TIME_STOP");
+        const patch = {
+          ...(plan?.tradePatch && Object.keys(plan.tradePatch).length
+            ? plan.tradePatch
+            : {}),
+        };
+        if (isTimeStop) {
+          Object.assign(
+            patch,
+            this._eventPatch("TIME_STOP_TRIGGERED", {
               tradeId,
+              timeStopKind: plan?.meta?.timeStopKind || null,
+              holdMin: plan?.meta?.holdMin,
               timeStopAtMs: plan?.meta?.timeStopAtMs,
               pnlInr: plan?.meta?.pnlInr,
-              minGreenInr: plan?.meta?.minGreenInr,
-            }).catch(() => {});
-            logger.warn(
-              { tradeId, meta: plan?.meta || null },
-              "[dyn_exit] time stop triggered",
-            );
-          }
+              pnlR: plan?.meta?.pnlR,
+              peakPnlInr: plan?.meta?.peakPnlInr,
+              peakPnlR: plan?.meta?.peakPnlR,
+            }),
+          );
+          alert("warn", `Time stop triggered -> exit (${exitReason})`, {
+            tradeId,
+            timeStopKind: plan?.meta?.timeStopKind || null,
+            holdMin: plan?.meta?.holdMin,
+            timeStopAtMs: plan?.meta?.timeStopAtMs,
+            pnlInr: plan?.meta?.pnlInr,
+            pnlR: plan?.meta?.pnlR,
+            peakPnlInr: plan?.meta?.peakPnlInr,
+            peakPnlR: plan?.meta?.peakPnlR,
+          }).catch(() => {});
+          logger.warn(
+            { tradeId, reason: exitReason, meta: plan?.meta || null },
+            "[dyn_exit] time stop triggered",
+          );
+        }
+        if (Object.keys(patch).length) {
           try {
             await updateTrade(tradeId, patch);
           } catch {}
         }
-        await this._panicExit(trade, plan.action.reason || "DYN_EXIT_ACTION");
+        await this._panicExit(trade, exitReason);
         return;
       }
 
@@ -9093,8 +9107,11 @@ class TradeManager {
         });
 
         const timeStopMin = Number(env.TIME_STOP_MIN || 0);
+        const proTimeStopsEnabled =
+          Number(env.TIME_STOP_NO_PROGRESS_MIN || 0) > 0 ||
+          Number(env.TIME_STOP_MAX_HOLD_MIN || 0) > 0;
         const timeStopAt =
-          Number.isFinite(timeStopMin) && timeStopMin > 0
+          !proTimeStopsEnabled && Number.isFinite(timeStopMin) && timeStopMin > 0
             ? new Date(Date.now() + timeStopMin * 60 * 1000)
             : null;
 
@@ -9210,8 +9227,11 @@ class TradeManager {
           riskInr: Number(env.RISK_PER_TRADE_INR || 0),
         });
         const timeStopMin = Number(env.TIME_STOP_MIN || 0);
+        const proTimeStopsEnabled =
+          Number(env.TIME_STOP_NO_PROGRESS_MIN || 0) > 0 ||
+          Number(env.TIME_STOP_MAX_HOLD_MIN || 0) > 0;
         const timeStopAt =
-          Number.isFinite(timeStopMin) && timeStopMin > 0
+          !proTimeStopsEnabled && Number.isFinite(timeStopMin) && timeStopMin > 0
             ? new Date(Date.now() + timeStopMin * 60 * 1000)
             : null;
         logger.info(
