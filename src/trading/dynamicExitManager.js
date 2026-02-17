@@ -174,6 +174,7 @@ function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
 function applyMinGreenExitRules({
   trade,
   ltp,
+  underlyingLtp,
   now,
   env,
   basePlan,
@@ -224,8 +225,20 @@ function applyMinGreenExitRules({
   const timeStopMin = Number(env.TIME_STOP_MIN || 0);
   const noProgressMin = Number(env.TIME_STOP_NO_PROGRESS_MIN || 0);
   const noProgressMfeR = Number(env.TIME_STOP_NO_PROGRESS_MFE_R || 0.2);
+  const noProgressUnderlyingConfirm =
+    String(env.TIME_STOP_NO_PROGRESS_UNDERLYING_CONFIRM || "false") === "true";
+  const noProgressUnderlyingMfeBps = Number(
+    env.TIME_STOP_NO_PROGRESS_UNDERLYING_MFE_BPS || 8,
+  );
+  const noProgressUnderlyingStrictData =
+    String(env.TIME_STOP_NO_PROGRESS_UNDERLYING_STRICT_DATA || "false") === "true";
   const maxHoldMin = Number(env.TIME_STOP_MAX_HOLD_MIN || 0);
   const maxHoldSkipIfPnlR = Number(env.TIME_STOP_MAX_HOLD_SKIP_IF_PNL_R || 0.8);
+  const maxHoldSkipIfPeakPnlR = Number(
+    env.TIME_STOP_MAX_HOLD_SKIP_IF_PEAK_PNL_R || 1.0,
+  );
+  const maxHoldSkipIfLocked =
+    String(env.TIME_STOP_MAX_HOLD_SKIP_IF_LOCKED || "true") !== "false";
   const proTimeStopsEnabled =
     (Number.isFinite(noProgressMin) && noProgressMin > 0) ||
     (Number.isFinite(maxHoldMin) && maxHoldMin > 0);
@@ -238,8 +251,56 @@ function applyMinGreenExitRules({
     Number.isFinite(timeStopMin) && timeStopMin > 0
       ? entryTs + timeStopMin * 60 * 1000
       : null;
+  const timeStopLatched = Boolean(trade?.timeStopTriggeredAt);
+
+  const beArmR = Number(env.BE_ARM_R || 0.6);
+  const trailArmR = Number(env.TRAIL_ARM_R || 1.0);
+  const pnlStepInr = Number.isFinite(qty) && qty > 0 && Number.isFinite(tick) && tick > 0
+    ? qty * tick
+    : 0;
+  const beLockAt =
+    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
+      ? beArmR * riskPerTradeInr
+      : Number(env.BE_LOCK_AT_PROFIT_INR || 0);
+  const trailStartInr =
+    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
+      ? trailArmR * riskPerTradeInr
+      : Number(env.DYN_TRAIL_START_PROFIT_INR || 0);
+  const beArmEpsInr = pnlStepInr;
+  const trailArmEpsInr = pnlStepInr;
+
+  const beLockedForMaxHold =
+    Boolean(tradePatch.beLocked || trade?.beLocked) ||
+    meetsThreshold(pnlInr, beLockAt, beArmEpsInr);
+  const trailLockedForMaxHold =
+    Boolean(tradePatch.trailLocked || trade?.trailLocked) ||
+    meetsThreshold(pnlInr, trailStartInr, trailArmEpsInr);
+
+  const underlyingEntry = Number(trade?.underlying_ltp || 0);
+  const underlyingSide = String(trade?.underlying_side || side).toUpperCase();
+  const underlyingMoveBps =
+    Number.isFinite(underlyingEntry) &&
+    underlyingEntry > 0 &&
+    Number.isFinite(underlyingLtp) &&
+    underlyingLtp > 0
+      ? (underlyingSide === "SELL"
+          ? ((underlyingEntry - underlyingLtp) / underlyingEntry) * 10000
+          : ((underlyingLtp - underlyingEntry) / underlyingEntry) * 10000)
+      : null;
+  const prevPeakUnderlyingMoveBps = Number(trade?.peakUnderlyingMoveBps || NaN);
+  const peakUnderlyingMoveBps = Number.isFinite(prevPeakUnderlyingMoveBps)
+    ? Math.max(prevPeakUnderlyingMoveBps, Number(underlyingMoveBps || NaN))
+    : underlyingMoveBps;
+  if (
+    Number.isFinite(peakUnderlyingMoveBps) &&
+    (!Number.isFinite(prevPeakUnderlyingMoveBps) ||
+      Math.abs(peakUnderlyingMoveBps - prevPeakUnderlyingMoveBps) >= 0.5)
+  ) {
+    tradePatch.peakUnderlyingMoveBps = peakUnderlyingMoveBps;
+  }
 
   if (
+    !timeStopLatched &&
     !proTimeStopsEnabled &&
     Number.isFinite(timeStopAtMs) &&
     now >= timeStopAtMs &&
@@ -267,13 +328,19 @@ function applyMinGreenExitRules({
   }
 
   if (
+    !timeStopLatched &&
     proTimeStopsEnabled &&
     Number.isFinite(noProgressMin) &&
     noProgressMin > 0 &&
     holdMin >= noProgressMin &&
     Number.isFinite(noProgressMfeR) &&
     Number.isFinite(mfeR) &&
-    mfeR < noProgressMfeR
+    mfeR < noProgressMfeR &&
+    (!noProgressUnderlyingConfirm ||
+      (Number.isFinite(noProgressUnderlyingMfeBps) &&
+        Number.isFinite(peakUnderlyingMoveBps)
+          ? peakUnderlyingMoveBps < noProgressUnderlyingMfeBps
+          : !noProgressUnderlyingStrictData))
   ) {
     return {
       ...basePlan,
@@ -289,7 +356,12 @@ function applyMinGreenExitRules({
         holdMin,
         noProgressMin,
         noProgressMfeR,
+        noProgressUnderlyingConfirm,
+        noProgressUnderlyingMfeBps,
+        noProgressUnderlyingStrictData,
         mfeR,
+        underlyingMoveBps,
+        peakUnderlyingMoveBps,
         peakPnlInr,
         peakPnlR,
         peakPriceR,
@@ -301,11 +373,14 @@ function applyMinGreenExitRules({
   }
 
   if (
+    !timeStopLatched &&
     proTimeStopsEnabled &&
     Number.isFinite(maxHoldMin) &&
     maxHoldMin > 0 &&
     holdMin >= maxHoldMin &&
-    (!Number.isFinite(pnlRForRules) || pnlRForRules < maxHoldSkipIfPnlR)
+    (!Number.isFinite(pnlRForRules) || pnlRForRules < maxHoldSkipIfPnlR) &&
+    (!Number.isFinite(peakPnlR) || peakPnlR < maxHoldSkipIfPeakPnlR) &&
+    (!maxHoldSkipIfLocked || (!beLockedForMaxHold && !trailLockedForMaxHold))
   ) {
     return {
       ...basePlan,
@@ -321,6 +396,8 @@ function applyMinGreenExitRules({
         holdMin,
         maxHoldMin,
         maxHoldSkipIfPnlR,
+        maxHoldSkipIfPeakPnlR,
+        maxHoldSkipIfLocked,
         pnlInr,
         pnlR,
         pnlPriceR,
@@ -335,22 +412,6 @@ function applyMinGreenExitRules({
   let beLockHit = Boolean(trade?.beLocked);
   let trailHit = Boolean(trade?.trailLocked);
   const skipReasons = [];
-
-  const beArmR = Number(env.BE_ARM_R || 0.6);
-  const trailArmR = Number(env.TRAIL_ARM_R || 1.0);
-  const pnlStepInr = Number.isFinite(qty) && qty > 0 && Number.isFinite(tick) && tick > 0
-    ? qty * tick
-    : 0;
-  const beLockAt =
-    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
-      ? beArmR * riskPerTradeInr
-      : Number(env.BE_LOCK_AT_PROFIT_INR || 0);
-  const trailStartInr =
-    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
-      ? trailArmR * riskPerTradeInr
-      : Number(env.DYN_TRAIL_START_PROFIT_INR || 0);
-  const beArmEpsInr = pnlStepInr;
-  const trailArmEpsInr = pnlStepInr;
 
   if (meetsThreshold(pnlInr, beLockAt, beArmEpsInr)) {
     beLockHit = true;
@@ -1129,6 +1190,7 @@ function computeDynamicExitPlan({
   return applyMinGreenExitRules({
     trade,
     ltp,
+    underlyingLtp,
     now,
     env,
     basePlan,

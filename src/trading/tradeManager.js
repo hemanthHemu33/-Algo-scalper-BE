@@ -345,6 +345,7 @@ class TradeManager {
     // PANIC exit watchdog (tradeId -> timeout)
     this._panicExitTimers = new Map();
     this._panicExitRetryCount = new Map();
+    this._timeStopEscalationAt = new Map();
 
     // Reconcile debouncer (order-update driven)
     this._reconcileTimer = null;
@@ -4201,63 +4202,98 @@ class TradeManager {
       const qty = Math.abs(netQty);
       const exitProduct = this._activeTradeProduct(fresh);
 
+      const isTimeStopReason =
+        !!opts.timeStop || String(reason || "").toUpperCase().startsWith("TIME_STOP");
+      const preferLimit =
+        !!opts.preferLimit ||
+        (isTimeStopReason && String(env.TIME_STOP_EXIT_PREFER_LIMIT || "true") !== "false");
+      const allowLimitFallback =
+        String(env.PANIC_EXIT_LIMIT_FALLBACK_ENABLED || "true") !== "false";
+      const allowMarketFallback =
+        !isTimeStopReason ||
+        String(env.TIME_STOP_EXIT_ALLOW_MARKET_FALLBACK || "true") !== "false";
+
       logger.warn(
-        { tradeId, reason, exitSide, qty },
-        "[panic] placing MARKET exit",
+        { tradeId, reason, exitSide, qty, isTimeStopReason, preferLimit },
+        "[panic] placing exit",
       );
       alert("warn", `PANIC EXIT: ${reason}`, { tradeId }).catch(() => {});
 
       let exitOrderId = null;
+      const attemptLimit = async (marketError = "MARKET_SKIPPED") => {
+        if (!allowLimitFallback || exitOrderId) return;
+        const fb = await this._panicExitFallbackLimit({
+          tradeId,
+          instrument,
+          exitSide,
+          qty,
+          reason,
+          marketError,
+          product: exitProduct,
+        });
+        exitOrderId = fb?.orderId || null;
+      };
 
-      // 1) Prefer MARKET for fastest exit, but it can be blocked for some F&O instruments
-      //    (e.g., illiquid contracts / stock options restrictions).
-      try {
-        const r = await this._safePlaceOrder(
-          env.DEFAULT_ORDER_VARIETY,
-          {
-            exchange: instrument.exchange,
-            tradingsymbol: instrument.tradingsymbol,
-            transaction_type: exitSide,
-            quantity: qty,
-            product: exitProduct,
-            order_type: "MARKET",
-            validity: "DAY",
-            tag: makeTag(tradeId, "PANIC_EXIT"),
-          },
-          { purpose: "PANIC_EXIT", tradeId },
-        );
-        exitOrderId = r?.orderId || null;
-      } catch (e) {
-        const msg = String(e?.message || e);
-        logger.error(
-          { tradeId, reason, exitSide, qty, e: msg },
-          "[panic] MARKET exit failed; attempting LIMIT fallback",
-        );
+      if (preferLimit) {
+        try {
+          await attemptLimit("TIME_STOP_CONTROLLED_LIMIT");
+        } catch (e) {
+          logger.error(
+            { tradeId, reason, e: String(e?.message || e) },
+            "[panic] preferred LIMIT exit failed",
+          );
+        }
+      }
 
-        const allowFallback =
-          String(env.PANIC_EXIT_LIMIT_FALLBACK_ENABLED || "true") !== "false";
+      const canUseMarket =
+        !isTimeStopReason ||
+        (await this._allowTimeStopMarketExit({
+          tradeId,
+          instrument,
+          exitSide,
+        }));
 
-        if (allowFallback) {
-          try {
-            const fb = await this._panicExitFallbackLimit({
-              tradeId,
-              instrument,
-              exitSide,
-              qty,
-              reason,
-              marketError: msg,
+      if (!exitOrderId && allowMarketFallback && canUseMarket) {
+        try {
+          const r = await this._safePlaceOrder(
+            env.DEFAULT_ORDER_VARIETY,
+            {
+              exchange: instrument.exchange,
+              tradingsymbol: instrument.tradingsymbol,
+              transaction_type: exitSide,
+              quantity: qty,
               product: exitProduct,
-            });
-            exitOrderId = fb?.orderId || null;
+              order_type: "MARKET",
+              validity: "DAY",
+              tag: makeTag(tradeId, "PANIC_EXIT"),
+            },
+            { purpose: "PANIC_EXIT", tradeId },
+          );
+          exitOrderId = r?.orderId || null;
+        } catch (e) {
+          const msg = String(e?.message || e);
+          logger.error(
+            { tradeId, reason, exitSide, qty, e: msg },
+            "[panic] MARKET exit failed; attempting LIMIT fallback",
+          );
+          try {
+            await attemptLimit(msg);
           } catch (e2) {
             logger.error(
               { tradeId, reason, e: String(e2?.message || e2) },
               "[panic] LIMIT fallback failed",
             );
           }
+          if (!exitOrderId) throw e;
         }
+      }
 
-        if (!exitOrderId) throw e;
+      if (!exitOrderId && allowLimitFallback) {
+        await attemptLimit("MARKET_DISABLED_OR_BLOCKED");
+      }
+
+      if (!exitOrderId) {
+        throw new Error("panic_exit_not_placed");
       }
 
       if (exitOrderId) {
@@ -4284,6 +4320,48 @@ class TradeManager {
       }
     } catch (e) {
       logger.error({ tradeId, e: e.message }, "[panic] exit failed");
+    }
+  }
+
+  async _allowTimeStopMarketExit({ tradeId, instrument, exitSide }) {
+    try {
+      if (!this.kite || typeof this.kite.getQuote !== "function") return false;
+      const ex = instrument?.exchange || env.DEFAULT_EXCHANGE || "NSE";
+      const sym = instrument?.tradingsymbol;
+      const key = `${String(ex).toUpperCase()}:${String(sym).toUpperCase()}`;
+      const resp = await this.kite.getQuote([key]);
+      const q = resp?.[key] || {};
+      const bid = Number(q?.depth?.buy?.[0]?.price || 0);
+      const ask = Number(q?.depth?.sell?.[0]?.price || 0);
+      const ltp = Number(q?.last_price || 0);
+      const ref = Number.isFinite(ltp) && ltp > 0 ? ltp : exitSide === "SELL" ? bid : ask;
+      const spreadBps =
+        Number.isFinite(ref) &&
+        ref > 0 &&
+        Number.isFinite(bid) &&
+        bid > 0 &&
+        Number.isFinite(ask) &&
+        ask > 0
+          ? ((ask - bid) / ref) * 10000
+          : Infinity;
+      const maxSpreadBps = Math.max(
+        1,
+        Number(env.TIME_STOP_EXIT_MARKET_MAX_SPREAD_BPS || 45),
+      );
+      const ok = spreadBps <= maxSpreadBps;
+      if (!ok) {
+        logger.warn(
+          { tradeId, spreadBps, maxSpreadBps, bid, ask, ltp },
+          "[panic] time-stop MARKET blocked by spread guard",
+        );
+      }
+      return ok;
+    } catch (e) {
+      logger.warn(
+        { tradeId, e: String(e?.message || e) },
+        "[panic] time-stop MARKET guard failed; blocking MARKET",
+      );
+      return false;
     }
   }
 
@@ -5309,6 +5387,27 @@ class TradeManager {
         }
       }
 
+      const timeStopLatched = Boolean(trade?.timeStopTriggeredAt);
+      if (timeStopLatched && !trade?.panicExitOrderId) {
+        const escCooldownMs = Math.max(
+          500,
+          Number(env.TIME_STOP_LATCH_ESCALATE_COOLDOWN_MS || 8000),
+        );
+        const lastEscAt = Number(this._timeStopEscalationAt.get(String(tradeId)) || 0);
+        if (now - lastEscAt >= escCooldownMs) {
+          this._timeStopEscalationAt.set(String(tradeId), now);
+          logger.warn(
+            { tradeId, reason: "TIME_STOP_LATCH_ESCALATION" },
+            "[dyn_exit] time-stop already latched; escalating panic exit",
+          );
+          await this._panicExit(trade, "TIME_STOP_LATCH_ESCALATION", {
+            timeStop: true,
+            preferLimit: true,
+          });
+        }
+        return;
+      }
+
       const peakFromTick = Number(this._dynPeakLtpByTrade.get(tradeId) || NaN);
       const tradeForPlan = Number.isFinite(peakFromTick)
         ? { ...trade, peakLtp: peakFromTick }
@@ -5400,7 +5499,10 @@ class TradeManager {
             await updateTrade(tradeId, patch);
           } catch {}
         }
-        await this._panicExit(trade, exitReason);
+        await this._panicExit(trade, exitReason, {
+          timeStop: isTimeStop,
+          preferLimit: isTimeStop,
+        });
         return;
       }
 
