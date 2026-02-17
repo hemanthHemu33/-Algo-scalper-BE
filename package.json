@@ -11,7 +11,8 @@
     "replay:signals": "node scripts/replay-signals.js",
     "health:critical": "node scripts/health-critical.js",
     "bt:run": "node scripts/bt_run.js",
-    "bt:prepare-options": "node scripts/bt_prepare_option_universe.js"
+    "bt:prepare-options": "node scripts/bt_prepare_option_universe.js",
+    "test:dynexit": "node scripts/dyn_exit_scenarios.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
