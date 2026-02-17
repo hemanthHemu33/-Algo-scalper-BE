@@ -559,6 +559,7 @@ const schema = z.object({
   TIME_STOP_NO_PROGRESS_UNDERLYING_STRICT_DATA: z.string().default("false"),
   TIME_STOP_MAX_HOLD_MIN: z.coerce.number().default(0),
   TIME_STOP_MAX_HOLD_SKIP_IF_PNL_R: z.coerce.number().default(0.8),
+  TIME_STOP_MAX_HOLD_SKIP_IF_PEAK_R: z.coerce.number().default(1.0),
   TIME_STOP_MAX_HOLD_SKIP_IF_PEAK_PNL_R: z.coerce.number().default(1.0),
   TIME_STOP_MAX_HOLD_SKIP_IF_LOCKED: z.string().default("true"),
   TIME_STOP_EXIT_PREFER_LIMIT: z.string().default("true"),

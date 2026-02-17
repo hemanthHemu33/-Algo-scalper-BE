@@ -234,8 +234,8 @@ function applyMinGreenExitRules({
     String(env.TIME_STOP_NO_PROGRESS_UNDERLYING_STRICT_DATA || "false") === "true";
   const maxHoldMin = Number(env.TIME_STOP_MAX_HOLD_MIN || 0);
   const maxHoldSkipIfPnlR = Number(env.TIME_STOP_MAX_HOLD_SKIP_IF_PNL_R || 0.8);
-  const maxHoldSkipIfPeakPnlR = Number(
-    env.TIME_STOP_MAX_HOLD_SKIP_IF_PEAK_PNL_R || 1.0,
+  const maxHoldSkipIfPeakR = Number(
+    env.TIME_STOP_MAX_HOLD_SKIP_IF_PEAK_R || env.TIME_STOP_MAX_HOLD_SKIP_IF_PEAK_PNL_R || 1.0,
   );
   const maxHoldSkipIfLocked =
     String(env.TIME_STOP_MAX_HOLD_SKIP_IF_LOCKED || "true") !== "false";
@@ -372,16 +372,42 @@ function applyMinGreenExitRules({
     };
   }
 
-  if (
+  const maxHoldActive =
     !timeStopLatched &&
     proTimeStopsEnabled &&
     Number.isFinite(maxHoldMin) &&
     maxHoldMin > 0 &&
-    holdMin >= maxHoldMin &&
-    (!Number.isFinite(pnlRForRules) || pnlRForRules < maxHoldSkipIfPnlR) &&
-    (!Number.isFinite(peakPnlR) || peakPnlR < maxHoldSkipIfPeakPnlR) &&
-    (!maxHoldSkipIfLocked || (!beLockedForMaxHold && !trailLockedForMaxHold))
-  ) {
+    holdMin >= maxHoldMin;
+
+  if (maxHoldActive) {
+    let maxHoldSkipReason = null;
+    if (Number.isFinite(pnlRForRules) && pnlRForRules >= maxHoldSkipIfPnlR) {
+      maxHoldSkipReason = "PNL_R";
+    } else if (Number.isFinite(peakPnlR) && peakPnlR >= maxHoldSkipIfPeakR) {
+      maxHoldSkipReason = "PEAK_R";
+    } else if (maxHoldSkipIfLocked && (beLockedForMaxHold || trailLockedForMaxHold)) {
+      maxHoldSkipReason = "LOCKED";
+    }
+
+    if (maxHoldSkipReason) {
+      return {
+        ...basePlan,
+        meta: {
+          ...(basePlan?.meta || {}),
+          maxHoldSkipReason,
+          maxHoldMin,
+          maxHoldSkipIfPnlR,
+          maxHoldSkipIfPeakR,
+          maxHoldSkipIfLocked,
+          holdMin,
+          pnlRForRules,
+          peakPnlR,
+          beLockedForMaxHold,
+          trailLockedForMaxHold,
+        },
+      };
+    }
+
     return {
       ...basePlan,
       ok: true,
@@ -396,7 +422,7 @@ function applyMinGreenExitRules({
         holdMin,
         maxHoldMin,
         maxHoldSkipIfPnlR,
-        maxHoldSkipIfPeakPnlR,
+        maxHoldSkipIfPeakR,
         maxHoldSkipIfLocked,
         pnlInr,
         pnlR,
