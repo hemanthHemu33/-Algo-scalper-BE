@@ -346,6 +346,7 @@ class TradeManager {
     this._panicExitTimers = new Map();
     this._panicExitRetryCount = new Map();
     this._timeStopEscalationAt = new Map();
+    this._timeStopFallbackTimers = new Map();
 
     // Reconcile debouncer (order-update driven)
     this._reconcileTimer = null;
@@ -2454,6 +2455,151 @@ class TradeManager {
     this._panicExitTimers.delete(id);
   }
 
+  _clearTimeStopFallback(tradeId) {
+    const id = String(tradeId || "");
+    if (!id) return;
+    const timer = this._timeStopFallbackTimers.get(id);
+    if (timer) clearTimeout(timer);
+    this._timeStopFallbackTimers.delete(id);
+  }
+
+  _scheduleTimeStopPanicFallback({ tradeId, reason }) {
+    const id = String(tradeId || "");
+    if (!id) return;
+
+    const timeoutMs = Math.max(
+      1000,
+      Number(env.PANIC_EXIT_FILL_TIMEOUT_MS || 2500),
+    );
+    this._clearTimeStopFallback(id);
+
+    const timer = setTimeout(() => {
+      this._timeStopPanicFallback({ tradeId: id, reason }).catch((e) => {
+        logger.error(
+          { tradeId: id, err: e?.message || String(e) },
+          "[time_stop] panic fallback failed",
+        );
+      });
+    }, timeoutMs);
+    timer.unref?.();
+    this._timeStopFallbackTimers.set(id, timer);
+  }
+
+  async _timeStopPanicFallback({ tradeId, reason }) {
+    const id = String(tradeId || "");
+    if (!id) return;
+
+    const fresh = await getTrade(id);
+    if (!fresh) {
+      this._clearTimeStopFallback(id);
+      return;
+    }
+
+    const terminal = new Set([
+      STATUS.EXITED_TARGET,
+      STATUS.EXITED_SL,
+      STATUS.ENTRY_FAILED,
+      STATUS.ENTRY_CANCELLED,
+      STATUS.CLOSED,
+    ]);
+    if (terminal.has(fresh.status)) {
+      this._clearTimeStopFallback(id);
+      return;
+    }
+
+    let hasPosition = false;
+    try {
+      const token = Number(fresh.instrument_token);
+      const positions = await this.kite.getPositions();
+      const net = positions?.net || positions?.day || [];
+      const p = Array.isArray(net)
+        ? net.find((x) => Number(x.instrument_token) === token)
+        : null;
+      const q = Number(p?.quantity ?? p?.net_quantity ?? 0);
+      hasPosition = Number.isFinite(q) && q !== 0;
+    } catch {
+      hasPosition = true;
+    }
+
+    if (!hasPosition) {
+      this._clearTimeStopFallback(id);
+      return;
+    }
+
+    logger.warn(
+      { tradeId: id, reason },
+      "[time_stop] smart LIMIT pending; escalating to panic",
+    );
+    await this._panicExit(fresh, `${reason || "TIME_STOP"}_PANIC_FALLBACK`, {
+      timeStop: true,
+      force: true,
+      preferLimit: false,
+    });
+    this._clearTimeStopFallback(id);
+  }
+
+  async _timeStopExit(trade, reason) {
+    const policy = String(env.TIME_STOP_EXIT_POLICY || "SMART").toUpperCase();
+    if (policy === "PANIC") {
+      await this._panicExit(trade, reason, { timeStop: true, preferLimit: true });
+      return;
+    }
+
+    const fresh = (await getTrade(trade?.tradeId)) || trade;
+    const tradeId = fresh?.tradeId;
+    if (!tradeId) return;
+    if (fresh?.panicExitOrderId) return;
+
+    const instrument = fresh.instrument;
+    const side = String(fresh?.side || "").toUpperCase();
+    const exitSide = side === "SELL" ? "BUY" : "SELL";
+    const qty = Math.abs(Number(fresh?.qty || 0));
+    if (!Number.isFinite(qty) || qty < 1) {
+      await this._panicExit(fresh, reason, { timeStop: true, preferLimit: true });
+      return;
+    }
+
+    try {
+      const fb = await this._panicExitFallbackLimit({
+        tradeId,
+        instrument,
+        exitSide,
+        qty,
+        reason,
+        marketError: "TIME_STOP_SMART_LIMIT",
+        product: this._activeTradeProduct(fresh),
+        bufferTicks: Number(env.TIME_STOP_EXIT_LIMIT_BUFFER_TICKS || 2),
+        maxBps: Number(env.TIME_STOP_EXIT_LIMIT_MAX_BPS || 200),
+        orderTag: "TIME_STOP_EXIT",
+      });
+
+      const exitOrderId = fb?.orderId || null;
+      if (!exitOrderId) {
+        throw new Error("time_stop_smart_limit_not_placed");
+      }
+
+      await updateTrade(tradeId, {
+        status: STATUS.PANIC_EXIT_PLACED,
+        panicExitOrderId: exitOrderId,
+        panicExitPlacedAt: new Date(),
+        closeReason: `TIME_STOP_EXIT_SMART_PLACED | ${reason}`,
+      });
+      await linkOrder({
+        order_id: exitOrderId,
+        tradeId,
+        role: "PANIC_EXIT",
+      });
+      await this._replayOrphanUpdates(exitOrderId);
+      this._scheduleTimeStopPanicFallback({ tradeId, reason });
+    } catch (e) {
+      logger.warn(
+        { tradeId, reason, e: String(e?.message || e) },
+        "[time_stop] smart exit failed; using panic exit",
+      );
+      await this._panicExit(fresh, reason, { timeStop: true, preferLimit: true });
+    }
+  }
+
   _schedulePanicExitWatch({
     tradeId,
     orderId,
@@ -4093,7 +4239,7 @@ class TradeManager {
 
       // prevent repeated panic exits
       const fresh = (await getTrade(tradeId)) || trade;
-      if (fresh?.panicExitOrderId) {
+      if (fresh?.panicExitOrderId && !opts.force) {
         logger.warn(
           { tradeId, panicExitOrderId: fresh.panicExitOrderId },
           "[panic] already placed",
@@ -4111,6 +4257,7 @@ class TradeManager {
       try {
         const variety = String(env.DEFAULT_ORDER_VARIETY || "regular");
         const toCancel = [
+          ...(opts.force ? [fresh.panicExitOrderId] : []),
           fresh.entryOrderId,
           fresh.slOrderId,
           fresh.targetOrderId,
@@ -4309,6 +4456,7 @@ class TradeManager {
           role: "PANIC_EXIT",
         });
         await this._replayOrphanUpdates(exitOrderId);
+        this._clearTimeStopFallback(tradeId);
         this._schedulePanicExitWatch({
           tradeId,
           orderId: exitOrderId,
@@ -4373,6 +4521,9 @@ class TradeManager {
     reason,
     marketError,
     product = null,
+    bufferTicks = null,
+    maxBps = null,
+    orderTag = "PANIC_EXIT",
   }) {
     if (!this.kite || typeof this.kite.getQuote !== "function") {
       throw new Error("no_getQuote_for_panic_fallback");
@@ -4385,9 +4536,14 @@ class TradeManager {
     const tick = Number(instrument?.tick_size || 0.05);
     const bufTicks = Math.max(
       1,
-      Number(env.PANIC_EXIT_LIMIT_BUFFER_TICKS || 2),
+      Number(
+        bufferTicks == null ? env.PANIC_EXIT_LIMIT_BUFFER_TICKS || 2 : bufferTicks,
+      ),
     );
-    const maxBps = Math.max(50, Number(env.PANIC_EXIT_LIMIT_MAX_BPS || 250));
+    const maxBpsCap = Math.max(
+      50,
+      Number(maxBps == null ? env.PANIC_EXIT_LIMIT_MAX_BPS || 250 : maxBps),
+    );
 
     const resp = await this.kite.getQuote([key]);
     const q = resp?.[key];
@@ -4415,7 +4571,7 @@ class TradeManager {
     let price = exitSide === "SELL" ? pxBase - buf : pxBase + buf;
 
     // Guard against crazy prices (cap by maxBps vs base).
-    const cap = (pxBase * maxBps) / 10000;
+    const cap = (pxBase * maxBpsCap) / 10000;
     if (exitSide === "SELL") price = Math.max(pxBase - cap, price);
     else price = Math.min(pxBase + cap, price);
 
@@ -4455,7 +4611,7 @@ class TradeManager {
         order_type: "LIMIT",
         price,
         validity: "DAY",
-        tag: makeTag(tradeId, "PANIC_EXIT"),
+        tag: makeTag(tradeId, orderTag),
       },
       { purpose: "PANIC_EXIT_LIMIT_FALLBACK", tradeId },
     );
@@ -5400,10 +5556,7 @@ class TradeManager {
             { tradeId, reason: "TIME_STOP_LATCH_ESCALATION" },
             "[dyn_exit] time-stop already latched; escalating panic exit",
           );
-          await this._panicExit(trade, "TIME_STOP_LATCH_ESCALATION", {
-            timeStop: true,
-            preferLimit: true,
-          });
+          await this._timeStopExit(trade, "TIME_STOP_LATCH_ESCALATION");
         }
         return;
       }
@@ -5511,10 +5664,11 @@ class TradeManager {
             await updateTrade(tradeId, patch);
           } catch {}
         }
-        await this._panicExit(trade, exitReason, {
-          timeStop: isTimeStop,
-          preferLimit: isTimeStop,
-        });
+        if (isTimeStop) await this._timeStopExit(trade, exitReason);
+        else
+          await this._panicExit(trade, exitReason, {
+            timeStop: false,
+          });
         return;
       }
 
