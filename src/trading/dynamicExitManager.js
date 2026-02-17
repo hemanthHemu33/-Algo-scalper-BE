@@ -312,7 +312,9 @@ function applyMinGreenExitRules({
       action: { exitNow: true, reason: "TIME_STOP" },
       tradePatch: {
         ...tradePatch,
-        timeStopTriggeredAt: new Date(now),
+        ...(trade?.timeStopTriggeredAt
+          ? {}
+          : { timeStopTriggeredAt: new Date(now) }),
       },
       meta: {
         ...(basePlan?.meta || {}),
@@ -348,7 +350,9 @@ function applyMinGreenExitRules({
       action: { exitNow: true, reason: "TIME_STOP_NO_PROGRESS" },
       tradePatch: {
         ...tradePatch,
-        timeStopTriggeredAt: new Date(now),
+        ...(trade?.timeStopTriggeredAt
+          ? {}
+          : { timeStopTriggeredAt: new Date(now) }),
       },
       meta: {
         ...(basePlan?.meta || {}),
@@ -414,7 +418,9 @@ function applyMinGreenExitRules({
       action: { exitNow: true, reason: "TIME_STOP_MAX_HOLD" },
       tradePatch: {
         ...tradePatch,
-        timeStopTriggeredAt: new Date(now),
+        ...(trade?.timeStopTriggeredAt
+          ? {}
+          : { timeStopTriggeredAt: new Date(now) }),
       },
       meta: {
         ...(basePlan?.meta || {}),
