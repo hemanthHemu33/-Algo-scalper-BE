@@ -226,12 +226,16 @@ function applyMinGreenExitRules({
   const noProgressMin = Number(env.TIME_STOP_NO_PROGRESS_MIN || 0);
   const noProgressMfeR = Number(env.TIME_STOP_NO_PROGRESS_MFE_R || 0.2);
   const noProgressUnderlyingConfirm =
-    String(env.TIME_STOP_NO_PROGRESS_UNDERLYING_CONFIRM || "false") === "true";
-  const noProgressUnderlyingMfeBps = Number(
-    env.TIME_STOP_NO_PROGRESS_UNDERLYING_MFE_BPS || 8,
+    String(
+      env.TIME_STOP_NO_PROGRESS_REQUIRE_UL_CONFIRM ||
+        env.TIME_STOP_NO_PROGRESS_UNDERLYING_CONFIRM ||
+        "true",
+    ) === "true";
+  const noProgressUnderlyingBps = Number(
+    env.TIME_STOP_NO_PROGRESS_UL_BPS ||
+      env.TIME_STOP_NO_PROGRESS_UNDERLYING_MFE_BPS ||
+      12,
   );
-  const noProgressUnderlyingStrictData =
-    String(env.TIME_STOP_NO_PROGRESS_UNDERLYING_STRICT_DATA || "false") === "true";
   const maxHoldMin = Number(env.TIME_STOP_MAX_HOLD_MIN || 0);
   const maxHoldSkipIfPnlR = Number(env.TIME_STOP_MAX_HOLD_SKIP_IF_PNL_R || 0.8);
   const maxHoldSkipIfPeakR = Number(
@@ -276,21 +280,14 @@ function applyMinGreenExitRules({
     Boolean(tradePatch.trailLocked || trade?.trailLocked) ||
     meetsThreshold(pnlInr, trailStartInr, trailArmEpsInr);
 
-  const underlyingEntry = Number(trade?.underlying_ltp || 0);
-  const underlyingSide = String(trade?.underlying_side || side).toUpperCase();
-  const underlyingMoveBps =
-    Number.isFinite(underlyingEntry) &&
-    underlyingEntry > 0 &&
-    Number.isFinite(underlyingLtp) &&
-    underlyingLtp > 0
-      ? (underlyingSide === "SELL"
-          ? ((underlyingEntry - underlyingLtp) / underlyingEntry) * 10000
-          : ((underlyingLtp - underlyingEntry) / underlyingEntry) * 10000)
-      : null;
+  const underlyingMoveBpsNow = underlyingMoveBps({ trade, underlyingLtp });
+  const absUnderlyingMoveBps = Number.isFinite(underlyingMoveBpsNow)
+    ? Math.abs(underlyingMoveBpsNow)
+    : null;
   const prevPeakUnderlyingMoveBps = Number(trade?.peakUnderlyingMoveBps || NaN);
   const peakUnderlyingMoveBps = Number.isFinite(prevPeakUnderlyingMoveBps)
-    ? Math.max(prevPeakUnderlyingMoveBps, Number(underlyingMoveBps || NaN))
-    : underlyingMoveBps;
+    ? Math.max(prevPeakUnderlyingMoveBps, Number(absUnderlyingMoveBps || NaN))
+    : absUnderlyingMoveBps;
   if (
     Number.isFinite(peakUnderlyingMoveBps) &&
     (!Number.isFinite(prevPeakUnderlyingMoveBps) ||
@@ -339,10 +336,9 @@ function applyMinGreenExitRules({
     Number.isFinite(mfeR) &&
     mfeR < noProgressMfeR &&
     (!noProgressUnderlyingConfirm ||
-      (Number.isFinite(noProgressUnderlyingMfeBps) &&
-        Number.isFinite(peakUnderlyingMoveBps)
-          ? peakUnderlyingMoveBps < noProgressUnderlyingMfeBps
-          : !noProgressUnderlyingStrictData))
+      !Number.isFinite(noProgressUnderlyingBps) ||
+      !Number.isFinite(absUnderlyingMoveBps) ||
+      absUnderlyingMoveBps < noProgressUnderlyingBps)
   ) {
     return {
       ...basePlan,
@@ -361,10 +357,10 @@ function applyMinGreenExitRules({
         noProgressMin,
         noProgressMfeR,
         noProgressUnderlyingConfirm,
-        noProgressUnderlyingMfeBps,
-        noProgressUnderlyingStrictData,
+        noProgressUnderlyingBps,
         mfeR,
-        underlyingMoveBps,
+        underlyingMoveBps: underlyingMoveBpsNow,
+        absUnderlyingMoveBps,
         peakUnderlyingMoveBps,
         peakPnlInr,
         peakPnlR,
