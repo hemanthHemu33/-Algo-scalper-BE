@@ -11764,7 +11764,22 @@ class TradeManager {
     this._dynExitFailBackoffUntil.delete(tradeId);
     this._dynPeakLtpByTrade.delete(tradeId);
     this._clearVirtualTarget(tradeId);
-    this.risk.markTradeClosed(Number(instrument_token));
+    const qty = Number(t?.qty || 0);
+    const entry = Number(t?.entryPrice || 0);
+    const exit = Number(t?.exitPrice || 0);
+    const pnl =
+      qty > 0 && entry > 0 && exit > 0
+        ? String(t?.side || "BUY").toUpperCase() === "BUY"
+          ? (exit - entry) * qty
+          : (entry - exit) * qty
+        : null;
+
+    this.risk.markTradeClosed(Number(instrument_token), {
+      status: t?.status,
+      closeReason: t?.closeReason,
+      exitReason: t?.exitReason,
+      pnl,
+    });
   }
 
   async setKillSwitch(enabled, reason) {
