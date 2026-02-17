@@ -78,6 +78,15 @@ function profitR({ side, entry, ltp, risk }) {
   return side === "BUY" ? (ltp - entry) / risk : (entry - ltp) / risk;
 }
 
+function bestPeakLtp({ trade, ltp, side }) {
+  const dbPeak = Number(trade?.peakLtp || NaN);
+  if (Number.isFinite(dbPeak)) {
+    if (side === "BUY") return Number.isFinite(ltp) ? Math.max(dbPeak, ltp) : dbPeak;
+    if (side === "SELL") return Number.isFinite(ltp) ? Math.min(dbPeak, ltp) : dbPeak;
+  }
+  return Number.isFinite(ltp) ? ltp : null;
+}
+
 function profitPct({ side, entry, ltp }) {
   if (
     !Number.isFinite(entry) ||
@@ -192,6 +201,8 @@ function applyMinGreenExitRules({
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
       ? pnlInr / riskPerTradeInr
       : null;
+  const priceRisk = Math.abs(entry - sl0);
+  const pnlPriceR = profitR({ side, entry, ltp, risk: priceRisk });
   const prevPeakPnlInr = Number(trade?.peakPnlInr || NaN);
   const peakPnlInr = Number.isFinite(prevPeakPnlInr)
     ? Math.max(prevPeakPnlInr, pnlInr)
@@ -200,6 +211,12 @@ function applyMinGreenExitRules({
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
       ? peakPnlInr / riskPerTradeInr
       : null;
+  const peakLtpNow = bestPeakLtp({ trade, ltp, side });
+  const peakPriceR = Number.isFinite(peakLtpNow)
+    ? profitR({ side, entry, ltp: peakLtpNow, risk: priceRisk })
+    : null;
+  const mfeR = Number.isFinite(peakPnlR) ? peakPnlR : peakPriceR;
+  const pnlRForRules = Number.isFinite(pnlR) ? pnlR : pnlPriceR;
   if (!Number.isFinite(prevPeakPnlInr) || Math.abs(peakPnlInr - prevPeakPnlInr) >= Math.max(1, tick * qty)) {
     tradePatch.peakPnlInr = peakPnlInr;
   }
@@ -255,8 +272,8 @@ function applyMinGreenExitRules({
     noProgressMin > 0 &&
     holdMin >= noProgressMin &&
     Number.isFinite(noProgressMfeR) &&
-    Number.isFinite(peakPnlR) &&
-    peakPnlR < noProgressMfeR
+    Number.isFinite(mfeR) &&
+    mfeR < noProgressMfeR
   ) {
     return {
       ...basePlan,
@@ -272,10 +289,13 @@ function applyMinGreenExitRules({
         holdMin,
         noProgressMin,
         noProgressMfeR,
+        mfeR,
         peakPnlInr,
         peakPnlR,
+        peakPriceR,
         pnlInr,
         pnlR,
+        pnlPriceR,
       },
     };
   }
@@ -285,7 +305,7 @@ function applyMinGreenExitRules({
     Number.isFinite(maxHoldMin) &&
     maxHoldMin > 0 &&
     holdMin >= maxHoldMin &&
-    (!Number.isFinite(pnlR) || pnlR < maxHoldSkipIfPnlR)
+    (!Number.isFinite(pnlRForRules) || pnlRForRules < maxHoldSkipIfPnlR)
   ) {
     return {
       ...basePlan,
@@ -303,8 +323,11 @@ function applyMinGreenExitRules({
         maxHoldSkipIfPnlR,
         pnlInr,
         pnlR,
+        pnlPriceR,
+        pnlRForRules,
         peakPnlInr,
         peakPnlR,
+        peakPriceR,
       },
     };
   }
@@ -380,7 +403,7 @@ function applyMinGreenExitRules({
   const profitLockKeepR = Number(env.PROFIT_LOCK_KEEP_R || 0.25);
   const profitLockMinInr = Number(env.PROFIT_LOCK_MIN_INR || 0);
   const profitLockArmed =
-    profitLockEnabled && Number.isFinite(peakPnlR) && peakPnlR >= profitLockR;
+    profitLockEnabled && Number.isFinite(mfeR) && mfeR >= profitLockR;
   if (profitLockArmed && !trade?.profitLockArmedAt) {
     tradePatch.profitLockArmedAt = new Date(now);
   }
@@ -563,8 +586,12 @@ function applyMinGreenExitRules({
       minGreenInr,
       minGreenPts,
       pnlR,
+      pnlPriceR,
+      pnlRForRules,
       peakPnlInr,
       peakPnlR,
+      peakPriceR,
+      mfeR,
       beLockAt,
       beArmEpsInr,
       trailGap,
