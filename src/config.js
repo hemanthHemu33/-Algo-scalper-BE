@@ -547,9 +547,19 @@ const schema = z.object({
   TRAIL_GAP_PREMIUM_POINTS: z.coerce.number().default(8),
   TRAIL_GAP_PRE_BE_PCT: z.coerce.number().default(0.08),
   TRAIL_GAP_POST_BE_PCT: z.coerce.number().default(0.04),
+  TRAIL_GAP_POST_BE_PCT_TIGHT: z.coerce.number().default(0.03),
   TRAIL_GAP_MIN_PTS: z.coerce.number().default(2),
   TRAIL_GAP_MAX_PTS: z.coerce.number().default(10),
+  TRAIL_TIGHTEN_R: z.coerce.number().default(1.5),
   TIME_STOP_MIN: z.coerce.number().default(5),
+  TIME_STOP_NO_PROGRESS_MIN: z.coerce.number().default(0),
+  TIME_STOP_NO_PROGRESS_MFE_R: z.coerce.number().default(0.2),
+  TIME_STOP_MAX_HOLD_MIN: z.coerce.number().default(0),
+  TIME_STOP_MAX_HOLD_SKIP_IF_PNL_R: z.coerce.number().default(0.8),
+  PROFIT_LOCK_ENABLED: z.string().default("false"),
+  PROFIT_LOCK_R: z.coerce.number().default(1.0),
+  PROFIT_LOCK_KEEP_R: z.coerce.number().default(0.25),
+  PROFIT_LOCK_MIN_INR: z.coerce.number().default(0),
   EXIT_LOOP_MS: z.coerce.number().default(1500),
   STALE_TICK_MS: z.coerce.number().default(3000),
 
@@ -1087,10 +1097,17 @@ function validateProfileCombos() {
 
   const optTpEnabled = String(env.OPT_TP_ENABLED || "false") === "true";
   const timeStopMin = Number(env.TIME_STOP_MIN || 0);
+  const noProgressMin = Number(env.TIME_STOP_NO_PROGRESS_MIN || 0);
+  const maxHoldMin = Number(env.TIME_STOP_MAX_HOLD_MIN || 0);
+  const proTimeStopsEnabled =
+    (Number.isFinite(noProgressMin) && noProgressMin > 0) ||
+    (Number.isFinite(maxHoldMin) && maxHoldMin > 0);
   if (!optTpEnabled && (!Number.isFinite(timeStopMin) || timeStopMin <= 0)) {
-    failOrWarn(
-      "[config] Unsafe combo: OPT_TP_ENABLED=false requires a positive TIME_STOP_MIN to avoid lingering positions.",
-    );
+    if (!proTimeStopsEnabled) {
+      failOrWarn(
+        "[config] Unsafe combo: OPT_TP_ENABLED=false requires TIME_STOP_MIN>0 or pro time-stops (TIME_STOP_NO_PROGRESS_MIN/TIME_STOP_MAX_HOLD_MIN) to avoid lingering positions.",
+      );
+    }
   }
 
   const dtePreferMin = Number(env.OPT_DTE_PREFER_MIN ?? 1);
