@@ -183,9 +183,60 @@ class RiskEngine {
     this._emitStateChange();
   }
 
-  markTradeClosed(token) {
+  _resolveCooldownSeconds(reasonMeta = {}) {
+    const defaultCooldown = Number(
+      env.SYMBOL_COOLDOWN_DEFAULT_SEC || env.SYMBOL_COOLDOWN_SECONDS || 180,
+    );
+
+    const status = String(reasonMeta?.status || "").trim().toUpperCase();
+    const closeReason = String(reasonMeta?.closeReason || "")
+      .trim()
+      .toUpperCase();
+    const exitReason = String(reasonMeta?.exitReason || "")
+      .trim()
+      .toUpperCase();
+
+    const reasonText = `${closeReason} ${exitReason}`;
+    const hasAnyReason = !!(status || closeReason || exitReason);
+
+    const isStopLoss =
+      status === "EXITED_SL" ||
+      closeReason.includes("SL") ||
+      exitReason.includes("SL");
+    if (isStopLoss) {
+      return Number(env.SYMBOL_COOLDOWN_AFTER_SL_SEC || defaultCooldown);
+    }
+
+    const isTimeStop = reasonText.includes("TIME_STOP");
+    if (isTimeStop) {
+      return Number(
+        env.SYMBOL_COOLDOWN_AFTER_TIME_STOP_SEC || defaultCooldown,
+      );
+    }
+
+    const pnl = Number(reasonMeta?.pnl);
+    const hasPnl = Number.isFinite(pnl);
+    const isProfitReason =
+      status === "EXITED_TARGET" ||
+      reasonText.includes("TARGET") ||
+      reasonText.includes("TP") ||
+      (hasPnl && pnl > 0);
+    if (isProfitReason) {
+      return Number(
+        env.SYMBOL_COOLDOWN_AFTER_PROFIT_SEC || defaultCooldown,
+      );
+    }
+
+    if (!hasAnyReason || !hasPnl) {
+      return defaultCooldown;
+    }
+
+    return defaultCooldown;
+  }
+
+  markTradeClosed(token, reasonMeta = {}) {
     this.openPositions.delete(Number(token));
-    const cooldown = Number(env.SYMBOL_COOLDOWN_SECONDS || 180);
+    const cooldown = this._resolveCooldownSeconds(reasonMeta);
     this.cooldownUntil.set(Number(token), this.clock.nowMs() + cooldown * 1000);
     this._emitStateChange();
   }
