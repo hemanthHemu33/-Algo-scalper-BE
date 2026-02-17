@@ -565,6 +565,8 @@ const schema = z.object({
   TIME_STOP_EXIT_PREFER_LIMIT: z.string().default("true"),
   TIME_STOP_EXIT_ALLOW_MARKET_FALLBACK: z.string().default("true"),
   TIME_STOP_EXIT_MARKET_MAX_SPREAD_BPS: z.coerce.number().default(45),
+  TIME_STOP_LATCH_MIN: z.coerce.number().default(3),
+  TIME_STOP_ALERT_DEDUP_MIN: z.coerce.number().default(10),
   TIME_STOP_LATCH_ESCALATE_COOLDOWN_MS: z.coerce.number().default(8000),
   PROFIT_LOCK_ENABLED: z.string().default("false"),
   PROFIT_LOCK_R: z.coerce.number().default(1.0),
