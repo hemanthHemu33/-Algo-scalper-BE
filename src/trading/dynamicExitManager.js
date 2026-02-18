@@ -129,15 +129,12 @@ function computeTargetFromRisk({ side, entry, risk, rr, tick }) {
 function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
   const qty = Number(trade.qty || trade.initialQty || 0);
   const mult = Number(env.DYN_BE_COST_MULT || 1.0);
-  const bufTicks = Number(env.DYN_BE_BUFFER_TICKS || 1);
-  const buffer = bufTicks * tick;
 
-  // Fallback: just buffer ticks beyond entry
+  // Fallback: breakeven defaults to entry when qty/entry is unavailable.
   if (!Number.isFinite(entry) || entry <= 0 || !(qty > 0)) {
-    const raw = side === "BUY" ? entry + buffer : entry - buffer;
     return {
-      be: roundToTick(raw, tick, side === "BUY" ? "up" : "down"),
-      meta: { qty, buffer, mult, note: "no_qty_or_entry" },
+      be: roundToTick(entry, tick, side === "BUY" ? "up" : "down"),
+      meta: { qty, mult, note: "no_qty_or_entry" },
     };
   }
 
@@ -154,8 +151,8 @@ function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
 
   const raw =
     side === "BUY"
-      ? entry + mult * costPerShare + buffer
-      : entry - (mult * costPerShare + buffer);
+      ? entry + mult * costPerShare
+      : entry - mult * costPerShare;
 
   const be = roundToTick(raw, tick, side === "BUY" ? "up" : "down");
   return {
@@ -165,7 +162,6 @@ function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
       estCostInr,
       costPerShare,
       mult,
-      buffer,
       costMeta: meta || null,
     },
   };
