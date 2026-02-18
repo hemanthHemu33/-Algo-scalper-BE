@@ -129,6 +129,7 @@ function computeTargetFromRisk({ side, entry, risk, rr, tick }) {
 function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
   const qty = Number(trade.qty || trade.initialQty || 0);
   const mult = Number(env.DYN_BE_COST_MULT || 1.0);
+  const spreadBps = Number(trade?.quoteAtEntry?.bps || 0);
 
   // Fallback: breakeven defaults to entry when qty/entry is unavailable.
   if (!Number.isFinite(entry) || entry <= 0 || !(qty > 0)) {
@@ -141,7 +142,7 @@ function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
   const { estCostInr, meta } = estimateRoundTripCostInr({
     entryPrice: entry,
     qty,
-    spreadBps: 0,
+    spreadBps,
     env,
     instrument: trade?.instrument || null,
   });
@@ -161,6 +162,7 @@ function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
       qty,
       estCostInr,
       costPerShare,
+      spreadBps,
       mult,
       costMeta: meta || null,
     },
