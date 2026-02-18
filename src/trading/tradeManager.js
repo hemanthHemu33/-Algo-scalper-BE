@@ -5564,7 +5564,7 @@ class TradeManager {
         candles = [];
       }
       // For OPT trades we may not have full candle history immediately; exit model can fall back.
-      let underlyingLtp = null;
+      let underlyingLtp;
       const uTok = Number(trade.underlying_token || 0);
       if (Number.isFinite(uTok) && uTok > 0 && uTok !== token) {
         const cachedU = this.lastPriceByToken.get(uTok);
@@ -5615,7 +5615,7 @@ class TradeManager {
         candles,
         nowTs: now,
         env,
-        underlyingLtp: Number.isFinite(underlyingLtp) ? underlyingLtp : null,
+        underlyingLtp: Number.isFinite(underlyingLtp) ? underlyingLtp : undefined,
       });
       if (!plan?.ok) {
         this._dynExitCadenceStats.evalNoPlan += 1;

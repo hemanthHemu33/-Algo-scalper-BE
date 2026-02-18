@@ -24,6 +24,7 @@ function clamp(n, lo, hi) {
 }
 
 function safeNum(v, fb = null) {
+  if (v == null) return fb;
   const n = Number(v);
   return Number.isFinite(n) ? n : fb;
 }
