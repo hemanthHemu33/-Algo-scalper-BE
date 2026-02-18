@@ -2,6 +2,7 @@ const { DateTime } = require("luxon");
 const { env } = require("../config");
 const { roundToTick } = require("./priceUtils");
 const { rollingVWAP, atr, maxHigh, minLow } = require("../strategy/utils");
+const { normalizeTickSize } = require("../utils/tickSize");
 
 function safeNum(x) {
   const n = Number(x);
@@ -107,7 +108,14 @@ function planRunnerTarget({ trade, candles }) {
   const side = String(trade?.side || "").toUpperCase();
   const entry = safeNum(trade?.entryPrice || trade?.candle?.close);
   const baseSL = safeNum(trade?.initialStopLoss || trade?.stopLoss);
-  const tick = safeNum(trade?.instrument?.tick_size) || 0.05;
+  const tick = normalizeTickSize(trade?.instrument?.tick_size);
+  if (!Number.isFinite(tick)) {
+    return {
+      price: null,
+      mode: "NONE",
+      meta: { reason: "NO_TICK_SIZE" },
+    };
+  }
 
   if (!entry || !baseSL) {
     return {

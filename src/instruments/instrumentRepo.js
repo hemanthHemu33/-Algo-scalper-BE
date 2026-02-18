@@ -1,4 +1,5 @@
 const { env } = require("../config");
+const { normalizeTickSize } = require("../utils/tickSize");
 const { logger } = require("../logger");
 const { getDb } = require("../db");
 const { alert } = require("../alerts/alertService");
@@ -139,7 +140,7 @@ async function ensureInstrument(kite, instrument_token) {
     instrument_token: tok,
     exchange: row.exchange || usedEx,
     tradingsymbol: row.tradingsymbol,
-    tick_size: Number(row.tick_size || 0.05),
+    tick_size: normalizeTickSize(row.tick_size),
     lot_size: Number(row.lot_size || 1),
     freeze_qty: Number(row.freeze_qty || row.freeze_quantity || 0) || null,
     segment: row.segment,
@@ -223,7 +224,7 @@ async function ensureInstrumentBySymbol(kite, symbol) {
     instrument_token: Number(row.instrument_token),
     exchange: row.exchange,
     tradingsymbol: row.tradingsymbol,
-    tick_size: Number(row.tick_size || 0.05),
+    tick_size: normalizeTickSize(row.tick_size),
     lot_size: Number(row.lot_size || 1),
     freeze_qty: Number(row.freeze_qty || row.freeze_quantity || 0) || null,
     segment: row.segment,
@@ -267,7 +268,7 @@ async function preloadInstrumentsByToken(kite, tokens = []) {
           instrument_token: tok,
           exchange: row.exchange || ex,
           tradingsymbol: row.tradingsymbol,
-          tick_size: Number(row.tick_size || 0.05),
+          tick_size: normalizeTickSize(row.tick_size),
           lot_size: Number(row.lot_size || 1),
           freeze_qty: Number(row.freeze_qty || row.freeze_quantity || 0) || null,
           segment: row.segment,

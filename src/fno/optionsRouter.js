@@ -1,5 +1,6 @@
 const { DateTime } = require("luxon");
 const { env } = require("../config");
+const { normalizeTickSize } = require("../utils/tickSize");
 const { logger } = require("../logger");
 const {
   isQuoteGuardBreakerOpen,
@@ -1198,7 +1199,7 @@ async function pickOptionContractForSignal({
     tradingsymbol: best.row.tradingsymbol,
     segment: best.row.segment,
     lot_size: Number(best.row.lot_size || 1),
-    tick_size: Number(best.row.tick_size || 0.05),
+    tick_size: normalizeTickSize(best.row.tick_size),
     strike: Number(best.row.strike),
     pickedAt: new Date().toISOString(),
 

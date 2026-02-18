@@ -1,5 +1,6 @@
 const { DateTime } = require("luxon");
 const { env } = require("../config");
+const { normalizeTickSize } = require("../utils/tickSize");
 const { logger } = require("../logger");
 const { isExpiryAllowed } = require("./expiryPolicy");
 const {
@@ -125,7 +126,7 @@ async function pickNearestFuture(kite, underlying, exchanges, nowMs = Date.now()
         segment: best.segment,
         expiry: best.expiry,
         lot_size: Number(best.lot_size || 1),
-        tick_size: Number(best.tick_size || 0.05),
+        tick_size: normalizeTickSize(best.tick_size),
       };
     }
   }
@@ -176,7 +177,7 @@ async function pickSpotIndexToken(kite, underlying) {
     segment: best.segment,
     expiry: null,
     lot_size: 1,
-    tick_size: Number(best.tick_size || 0.05),
+    tick_size: normalizeTickSize(best.tick_size),
   };
 }
 

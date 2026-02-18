@@ -1,5 +1,6 @@
 const { DateTime } = require("luxon");
 const { buildPremiumAwareOptionPlan } = require("./optionPremiumPlanner");
+const { normalizeTickSize } = require("../utils/tickSize");
 
 /**
  * Pro-style plan builder:
@@ -23,7 +24,8 @@ function safeNum(v, fallback = null) {
 }
 
 function roundToTick(price, tick, mode = "nearest") {
-  const t = safeNum(tick, 0.05) || 0.05;
+  const t = normalizeTickSize(tick);
+  if (!Number.isFinite(t)) return Number(price);
   const p = Number(price);
   if (!Number.isFinite(p)) return p;
   const steps = p / t;
@@ -440,7 +442,8 @@ function buildTradePlan({
     if (!Number.isFinite(premEntry) || premEntry <= 0)
       return { ok: false, reason: "bad_premium_entry" };
 
-    const t = safeNum(premiumTick, 0.05);
+    const t = normalizeTickSize(premiumTick);
+    if (!Number.isFinite(t)) return { ok: false, reason: "NO_TICK_SIZE" };
 
     // ----------------------------
     // 1) Underlying -> premium map (fallback / reference)

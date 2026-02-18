@@ -7,6 +7,7 @@ const {
   getQuoteGuardStats,
 } = require("../kite/quoteGuard");
 const { computeGreeksFromMarket } = require("./greeks");
+const { normalizeTickSize } = require("../utils/tickSize");
 
 // Very small in-memory cache (TTL ms). Designed for intraday routing:
 // - cache quote snapshots for a small strike band around ATM
@@ -223,7 +224,7 @@ async function getOptionChainSnapshot({
       expiry: r0.expiry,
       strike: Number(K),
       lot_size: Number(r0.lot_size || 1),
-      tick_size: Number(r0.tick_size || 0.05),
+      tick_size: normalizeTickSize(r0.tick_size),
       ltp: Number.isFinite(ltp) ? ltp : null,
       bid: Number.isFinite(buyP) ? buyP : null,
       ask: Number.isFinite(sellP) ? sellP : null,
