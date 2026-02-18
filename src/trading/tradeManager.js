@@ -7406,7 +7406,7 @@ class TradeManager {
     minTicks,
     maxPct,
   }) {
-    const tick = Number(instrument.tick_size || 0.05);
+    const tick = Number(instrument?.tick_size || 0.05);
     const slDist = Math.abs(Number(entryGuess) - Number(stopLoss));
     const ticks = tick > 0 ? slDist / tick : slDist;
 
@@ -8173,9 +8173,11 @@ class TradeManager {
           planMeta = plan.meta;
 
           // Re-check SL sanity after plan override
-          const slGate2 = this._qualityGateStopLoss({
+          const slGate2 = await this._qualityGateStopLoss({
             entryGuess,
             stopLoss,
+            side,
+            instrument,
             maxPct: s.option_meta
               ? Number(env.OPT_MAX_SL_PCT || 35)
               : Number(env.MAX_SL_PCT || 1.2),
