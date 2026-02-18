@@ -475,6 +475,7 @@ function applyMinGreenExitRules({
 
   // Latched behaviour: once armed, these states must remain active until trade closes.
   const beLockedNow = Boolean(tradePatch.beLocked || trade?.beLocked || beLockHit);
+  const beJustLockedNow = Boolean(beLockedNow && !trade?.beLocked);
   const trailLockedNow = Boolean(tradePatch.trailLocked || trade?.trailLocked || trailHit);
 
   const allowTrail = beLockedNow || trailLockedNow || trade?.tp1Done;
@@ -663,7 +664,12 @@ function applyMinGreenExitRules({
   const curSlRounded = roundToTick(curSL, tick, side === "BUY" ? "down" : "up");
   const newSlRounded = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
   const slMove = side === "BUY" ? newSlRounded - curSlRounded : curSlRounded - newSlRounded;
-  const shouldMoveSL = Number.isFinite(slMove) && slMove >= step;
+  const curSlBelowBeFloor =
+    Number.isFinite(curSlRounded) &&
+    Number.isFinite(beFloor) &&
+    (side === "BUY" ? curSlRounded < beFloor : curSlRounded > beFloor);
+  const forceBePriorityMove = Boolean(beJustLockedNow && curSlBelowBeFloor);
+  const shouldMoveSL = (Number.isFinite(slMove) && slMove >= step) || forceBePriorityMove;
 
   if (!beLockedNow) {
     if (!(Number.isFinite(beLockAt) && beLockAt > 0)) skipReasons.push("be_lock_disabled");
@@ -708,7 +714,9 @@ function applyMinGreenExitRules({
     }
   }
 
-  if (!shouldMoveSL) {
+  if (forceBePriorityMove) {
+    skipReasons.push("be_priority_sl_move");
+  } else if (!shouldMoveSL) {
     skipReasons.push(`sl_move_below_step (move=${Number(slMove || 0).toFixed(2)}, step=${Number(step || 0).toFixed(2)})`);
   }
 
