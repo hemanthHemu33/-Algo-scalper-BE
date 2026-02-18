@@ -207,10 +207,11 @@ function applyMinGreenExitRules({
   const peakPnlFromPriceInr = Number.isFinite(peakLtpNow)
     ? unrealizedPnlInr({ side, entry, ltp: peakLtpNow, qty })
     : null;
+  const finiteOrNaN = (v) => (Number.isFinite(v) ? Number(v) : NaN);
   const prevPeakPnlInr = Number(trade?.peakPnlInr || NaN);
   const peakPnlInr = Number.isFinite(prevPeakPnlInr)
-    ? Math.max(prevPeakPnlInr, pnlInr, Number(peakPnlFromPriceInr || NaN))
-    : Math.max(pnlInr, Number(peakPnlFromPriceInr || NaN));
+    ? Math.max(prevPeakPnlInr, pnlInr, finiteOrNaN(peakPnlFromPriceInr))
+    : Math.max(pnlInr, finiteOrNaN(peakPnlFromPriceInr));
   const peakPnlR =
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
       ? peakPnlInr / riskPerTradeInr
@@ -218,7 +219,7 @@ function applyMinGreenExitRules({
   const peakPriceR = Number.isFinite(peakLtpNow)
     ? profitR({ side, entry, ltp: peakLtpNow, risk: priceRisk })
     : null;
-  const mfeR = Math.max(Number(peakPnlR || NaN), Number(peakPriceR || NaN));
+  const mfeR = Math.max(finiteOrNaN(peakPnlR), finiteOrNaN(peakPriceR));
   const peakRForRules = Number.isFinite(mfeR)
     ? mfeR
     : Number.isFinite(peakPnlR)

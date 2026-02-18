@@ -100,6 +100,24 @@ const scenarios = [
     },
   },
   {
+    name: 'no-progress still triggers when peak price R is exactly 0',
+    run: () => {
+      const trade = makeTrade();
+      const env = makeEnv();
+      const plan = computeDynamicExitPlan({
+        trade,
+        ltp: 100,
+        underlyingLtp: 20000,
+        nowTs: BASE_NOW + 6 * 60_000,
+        env,
+        candles: [],
+      });
+      assert.equal(plan.ok, true);
+      assert.equal(plan.action?.reason, 'TIME_STOP_NO_PROGRESS');
+      assert.equal(plan.meta?.mfeR, 0);
+    },
+  },
+  {
     name: 'no-progress skipped (premium no move but UL moved)',
     run: () => {
       const trade = makeTrade();
