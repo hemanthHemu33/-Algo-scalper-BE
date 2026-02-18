@@ -790,11 +790,11 @@ function premiumVolPct(candles, lookback = 20) {
 }
 
 function underlyingMoveBps({ trade, underlyingLtp }) {
-  const uNow = safeNum(underlyingLtp);
   const uEntry = safeNum(
     trade?.underlying_ltp || trade?.option_meta?.underlyingLtp,
   );
-  if (!Number.isFinite(uNow) || !Number.isFinite(uEntry) || uEntry <= 0)
+  const uNow = safeNum(underlyingLtp);
+  if (!(uEntry > 0) || !(uNow > 0))
     return null;
   return ((uNow - uEntry) / uEntry) * 10000;
 }
@@ -1054,7 +1054,7 @@ function computeDynamicExitPlan({
   candles,
   nowTs,
   env,
-  underlyingLtp = null,
+  underlyingLtp = undefined,
 }) {
   const side = String(trade?.side || "").toUpperCase();
   const tick = Number(trade?.instrument?.tick_size || 0.05);
