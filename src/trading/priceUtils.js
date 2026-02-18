@@ -13,7 +13,7 @@ function tickDecimals(tickSize) {
 
 function roundToTick(price, tickSize, mode = "nearest") {
   const p = Number(price);
-  const t = Number(tickSize || 0.05);
+  const t = Number(tickSize);
   if (!Number.isFinite(p) || !Number.isFinite(t) || t <= 0) return p;
 
   const q = p / t;

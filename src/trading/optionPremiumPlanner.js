@@ -1,4 +1,5 @@
 const { roundToTick } = require("./priceUtils");
+const { normalizeTickSize } = require("../utils/tickSize");
 
 function clamp(n, lo, hi) {
   const x = Number(n);
@@ -74,11 +75,11 @@ function buildPremiumAwareOptionPlan({
 }) {
   const s = String(side || "BUY").toUpperCase();
   const e = Number(entryPremium);
-  const tick = Number(premiumTick || 0.05);
+  const tick = normalizeTickSize(premiumTick);
   const rrMinN = Number(rrMin || 1.1);
 
   if (!Number.isFinite(e) || e <= 0 || !Number.isFinite(tick) || tick <= 0) {
-    return { ok: false, reason: "BAD_ENTRY_OR_TICK" };
+    return { ok: false, reason: !Number.isFinite(e) || e <= 0 ? "BAD_ENTRY" : "NO_TICK_SIZE" };
   }
 
   const lookback = Number(
