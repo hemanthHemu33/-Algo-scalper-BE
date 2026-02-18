@@ -204,19 +204,27 @@ function applyMinGreenExitRules({
       : null;
   const priceRisk = Math.abs(entry - sl0);
   const pnlPriceR = profitR({ side, entry, ltp, risk: priceRisk });
+  const peakLtpNow = bestPeakLtp({ trade, ltp, side });
+  const peakPnlFromPriceInr = Number.isFinite(peakLtpNow)
+    ? unrealizedPnlInr({ side, entry, ltp: peakLtpNow, qty })
+    : null;
   const prevPeakPnlInr = Number(trade?.peakPnlInr || NaN);
   const peakPnlInr = Number.isFinite(prevPeakPnlInr)
-    ? Math.max(prevPeakPnlInr, pnlInr)
-    : pnlInr;
+    ? Math.max(prevPeakPnlInr, pnlInr, Number(peakPnlFromPriceInr || NaN))
+    : Math.max(pnlInr, Number(peakPnlFromPriceInr || NaN));
   const peakPnlR =
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
       ? peakPnlInr / riskPerTradeInr
       : null;
-  const peakLtpNow = bestPeakLtp({ trade, ltp, side });
   const peakPriceR = Number.isFinite(peakLtpNow)
     ? profitR({ side, entry, ltp: peakLtpNow, risk: priceRisk })
     : null;
-  const mfeR = Number.isFinite(peakPnlR) ? peakPnlR : peakPriceR;
+  const mfeR = Math.max(Number(peakPnlR || NaN), Number(peakPriceR || NaN));
+  const peakRForRules = Number.isFinite(mfeR)
+    ? mfeR
+    : Number.isFinite(peakPnlR)
+      ? peakPnlR
+      : peakPriceR;
   const pnlRForRules = Number.isFinite(pnlR) ? pnlR : pnlPriceR;
   if (!Number.isFinite(prevPeakPnlInr) || Math.abs(peakPnlInr - prevPeakPnlInr) >= Math.max(1, tick * qty)) {
     tradePatch.peakPnlInr = peakPnlInr;
@@ -383,7 +391,7 @@ function applyMinGreenExitRules({
     let maxHoldSkipReason = null;
     if (Number.isFinite(pnlRForRules) && pnlRForRules >= maxHoldSkipIfPnlR) {
       maxHoldSkipReason = "PNL_R";
-    } else if (Number.isFinite(peakPnlR) && peakPnlR >= maxHoldSkipIfPeakR) {
+    } else if (Number.isFinite(peakRForRules) && peakRForRules >= maxHoldSkipIfPeakR) {
       maxHoldSkipReason = "PEAK_R";
     } else if (maxHoldSkipIfLocked && (beLockedForMaxHold || trailLockedForMaxHold)) {
       maxHoldSkipReason = "LOCKED";
@@ -402,6 +410,7 @@ function applyMinGreenExitRules({
           holdMin,
           pnlRForRules,
           peakPnlR,
+          peakRForRules,
           beLockedForMaxHold,
           trailLockedForMaxHold,
         },
@@ -432,6 +441,7 @@ function applyMinGreenExitRules({
         pnlRForRules,
         peakPnlInr,
         peakPnlR,
+        peakRForRules,
         peakPriceR,
       },
     };
@@ -523,9 +533,9 @@ function applyMinGreenExitRules({
       peakLtp = Number.isFinite(prevPeak) ? Math.min(prevPeak, ltp) : ltp;
     }
     const shouldTightenTrail =
-      Number.isFinite(peakPnlR) &&
+      Number.isFinite(peakRForRules) &&
       Number.isFinite(trailTightenR) &&
-      peakPnlR >= trailTightenR;
+      peakRForRules >= trailTightenR;
     const gapPct = beLockedNow
       ? shouldTightenTrail
         ? trailGapPostBePctTight
