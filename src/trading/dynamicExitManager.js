@@ -266,14 +266,24 @@ function applyMinGreenExitRules({
   const timeStopLatched = Boolean(trade?.timeStopTriggeredAt);
 
   const beArmR = Number(env.BE_ARM_R || 0.6);
+  const beArmCostMult = Number(env.BE_ARM_COST_MULT || 2.0);
   const trailArmR = Number(env.TRAIL_ARM_R || 1.0);
   const pnlStepInr = Number.isFinite(qty) && qty > 0 && Number.isFinite(tick) && tick > 0
     ? qty * tick
     : 0;
-  const beLockAt =
-    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
-      ? beArmR * riskPerTradeInr
-      : Number(env.BE_LOCK_AT_PROFIT_INR || 0);
+  const estCostInr = Number(basePlan?.meta?.trueBEMeta?.estCostInr || NaN);
+  const beLockAtFromR =
+    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0 ? beArmR * riskPerTradeInr : null;
+  const beLockAtFromCost =
+    Number.isFinite(estCostInr) && estCostInr > 0 && Number.isFinite(beArmCostMult) && beArmCostMult > 0
+      ? beArmCostMult * estCostInr
+      : null;
+  const beLockAtFallback = Number(env.BE_LOCK_AT_PROFIT_INR || 0);
+  const beLockAt = Math.max(
+    Number.isFinite(beLockAtFromR) ? beLockAtFromR : 0,
+    Number.isFinite(beLockAtFromCost) ? beLockAtFromCost : 0,
+    Number.isFinite(beLockAtFallback) ? beLockAtFallback : 0,
+  );
   const trailStartInr =
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
       ? trailArmR * riskPerTradeInr
@@ -484,6 +494,7 @@ function applyMinGreenExitRules({
 
   const trueBE = Number(basePlan?.meta?.trueBE || NaN);
   let beFloor = null;
+  let beProfitLockFloor = null;
   if (beLockedNow && Number.isFinite(trueBE)) {
     const raw = side === "BUY" ? trueBE + beBufferTicks * tick : trueBE - beBufferTicks * tick;
     beFloor = roundToTick(raw, tick, side === "BUY" ? "up" : "down");
@@ -494,6 +505,37 @@ function applyMinGreenExitRules({
     }
     if (!trade?.beLockedAtPrice) {
       tradePatch.beLockedAtPrice = beFloor;
+    }
+  }
+
+  if (beLockedNow && Number.isFinite(entry) && Number.isFinite(qty) && qty > 0) {
+    const beLockKeepR = Number(env.BE_PROFIT_LOCK_KEEP_R || env.PROFIT_LOCK_KEEP_R || 0.25);
+    const beLockCostMult = Number(env.BE_PROFIT_LOCK_COST_MULT || env.PROFIT_LOCK_COST_MULT || 1.0);
+    const beLockMinInr = Number(env.BE_PROFIT_LOCK_MIN_INR || env.PROFIT_LOCK_MIN_INR || 0);
+    const lockByR =
+      Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0 && Number.isFinite(beLockKeepR) && beLockKeepR > 0
+        ? beLockKeepR * riskPerTradeInr
+        : 0;
+    const lockByCost =
+      Number.isFinite(estCostInr) && estCostInr > 0 && Number.isFinite(beLockCostMult) && beLockCostMult > 0
+        ? beLockCostMult * estCostInr
+        : 0;
+    const lockInr = Math.max(lockByR, lockByCost, Number.isFinite(beLockMinInr) ? beLockMinInr : 0);
+    if (Number.isFinite(lockInr) && lockInr > 0) {
+      const lockPts = lockInr / qty;
+      const raw = side === "BUY" ? entry + lockPts : entry - lockPts;
+      beProfitLockFloor = roundToTick(raw, tick, side === "BUY" ? "up" : "down");
+      if (side === "BUY") {
+        newSL = Math.max(newSL, beProfitLockFloor);
+      } else {
+        newSL = Math.min(newSL, beProfitLockFloor);
+      }
+      tradePatch.beProfitLockInr = lockInr;
+      tradePatch.beProfitLockKeepR = beLockKeepR;
+      tradePatch.beProfitLockCostMult = beLockCostMult;
+      if (!trade?.beLockedAtPrice) {
+        tradePatch.beLockedAtPrice = beProfitLockFloor;
+      }
     }
   }
 
@@ -692,6 +734,9 @@ function applyMinGreenExitRules({
       peakPriceR,
       mfeR,
       beLockAt,
+      beLockAtFromR: Number.isFinite(beLockAtFromR) ? beLockAtFromR : null,
+      beLockAtFromCost: Number.isFinite(beLockAtFromCost) ? beLockAtFromCost : null,
+      beArmCostMult,
       beArmEpsInr,
       trailGap,
       trailStartInr: Number.isFinite(trailStartInr) ? trailStartInr : null,
@@ -704,6 +749,8 @@ function applyMinGreenExitRules({
       riskPerTradeInr,
       trueBE: Number.isFinite(trueBE) ? trueBE : null,
       beFloor,
+      beProfitLockFloor,
+      estCostInr: Number.isFinite(estCostInr) ? estCostInr : null,
       desiredStopLoss,
       finalStopLoss,
       triggerBufferTicks,
