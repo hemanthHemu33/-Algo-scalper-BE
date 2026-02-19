@@ -244,6 +244,11 @@ function applyMinGreenExitRules({
         env.TIME_STOP_NO_PROGRESS_UNDERLYING_CONFIRM ||
         "true",
     ) === "true";
+  const noProgressUnderlyingMode = String(
+    env.TIME_STOP_NO_PROGRESS_UL_MODE || "STRICT",
+  )
+    .trim()
+    .toUpperCase();
   const noProgressUnderlyingBps = Number(
     env.TIME_STOP_NO_PROGRESS_UL_BPS ||
       env.TIME_STOP_NO_PROGRESS_UNDERLYING_MFE_BPS ||
@@ -315,7 +320,9 @@ function applyMinGreenExitRules({
   const noProgressUnderlyingSatisfied =
     !noProgressUnderlyingConfirm ||
     !Number.isFinite(noProgressUnderlyingBps) ||
-    (hasUnderlyingMove && absUnderlyingMoveBps < noProgressUnderlyingBps);
+    (hasUnderlyingMove && absUnderlyingMoveBps < noProgressUnderlyingBps) ||
+    (!hasUnderlyingMove &&
+      noProgressUnderlyingMode === "PRICE_ONLY_ON_UNKNOWN");
   if (
     Number.isFinite(peakUnderlyingMoveBps) &&
     (!Number.isFinite(prevPeakUnderlyingMoveBps) ||
@@ -388,6 +395,7 @@ function applyMinGreenExitRules({
             ? "KNOWN"
             : "UNKNOWN"
           : "BYPASSED",
+        noProgressUnderlyingMode,
         mfeR,
         underlyingMoveBps: underlyingMoveBpsNow,
         absUnderlyingMoveBps,
@@ -470,6 +478,9 @@ function applyMinGreenExitRules({
   }
 
   let beLockHit = Boolean(trade?.beLocked);
+  const beAppliedAtTs = tsFrom(trade?.beAppliedAt);
+  const beAppliedStopLoss = toFiniteOrNaN(trade?.beAppliedStopLoss);
+  let beApplied = Number.isFinite(beAppliedAtTs) && Number.isFinite(beAppliedStopLoss);
   let trailHit = Boolean(trade?.trailLocked);
   const skipReasons = [];
 
@@ -519,6 +530,15 @@ function applyMinGreenExitRules({
     if (!trade?.beLockedAtPrice) {
       tradePatch.beLockedAtPrice = beFloor;
     }
+  }
+
+  if (
+    !beApplied &&
+    beLockedNow &&
+    Number.isFinite(curSL) &&
+    Number.isFinite(beFloor)
+  ) {
+    beApplied = side === "BUY" ? curSL >= beFloor : curSL <= beFloor;
   }
 
   if (beLockedNow && Number.isFinite(entry) && Number.isFinite(qty) && qty > 0) {
@@ -684,7 +704,7 @@ function applyMinGreenExitRules({
     Number.isFinite(curSlRounded) &&
     Number.isFinite(beFloor) &&
     (side === "BUY" ? curSlRounded < beFloor : curSlRounded > beFloor);
-  const forceBePriorityMove = Boolean(beJustLockedNow && curSlBelowBeFloor);
+  const forceBePriorityMove = Boolean(!beApplied && beLockedNow && curSlBelowBeFloor);
   const shouldMoveSL = (Number.isFinite(slMove) && slMove >= step) || forceBePriorityMove;
 
   if (!beLockedNow) {

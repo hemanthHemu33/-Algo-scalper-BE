@@ -134,6 +134,25 @@ const scenarios = [
     },
   },
   {
+    name: 'no-progress supports price-only mode when UL is unknown',
+    run: () => {
+      const trade = makeTrade();
+      const env = makeEnv({ TIME_STOP_NO_PROGRESS_UL_MODE: 'PRICE_ONLY_ON_UNKNOWN' });
+      const plan = computeDynamicExitPlan({
+        trade,
+        ltp: 100.1,
+        underlyingLtp: null,
+        nowTs: BASE_NOW + 6 * 60_000,
+        env,
+        candles: [],
+      });
+      assert.equal(plan.ok, true);
+      assert.equal(plan.action?.reason, 'TIME_STOP_NO_PROGRESS');
+      assert.equal(plan.meta?.noProgressUnderlyingStatus, 'UNKNOWN');
+      assert.equal(plan.meta?.noProgressUnderlyingMode, 'PRICE_ONLY_ON_UNKNOWN');
+    },
+  },
+  {
     name: 'max-hold triggers on low current pnl',
     run: () => {
       const trade = makeTrade();
@@ -170,6 +189,34 @@ const scenarios = [
       assert.equal(plan.ok, true);
       assert.equal(Boolean(plan.action?.exitNow), false);
       assert.equal(plan.meta?.maxHoldSkipReason, 'PEAK_R');
+    },
+  },
+  {
+    name: 'be-priority SL move remains forced until BE is broker-applied',
+    run: () => {
+      const trade = makeTrade({
+        beLocked: true,
+        beAppliedAt: null,
+        stopLoss: 95,
+        slTrigger: 95,
+      });
+      const env = makeEnv({
+        BE_ARM_R: 0.1,
+        DYN_STEP_TICKS_PRE_BE: 1000,
+        DYN_STEP_TICKS_POST_BE: 1000,
+      });
+      const plan = computeDynamicExitPlan({
+        trade,
+        ltp: 106,
+        underlyingLtp: 20004,
+        nowTs: BASE_NOW + 3 * 60_000,
+        env,
+        candles: [],
+      });
+      assert.equal(plan.ok, true);
+      assert.equal(plan.meta?.skipReason?.includes('be_priority_sl_move'), true);
+      assert.equal(Number(plan.sl?.stopLoss) > Number(trade.stopLoss), true);
+      assert.equal(Number(plan.meta?.desiredStopLoss) >= Number(plan.meta?.beFloor || 0), true);
     },
   },
   {
