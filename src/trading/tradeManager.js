@@ -1195,6 +1195,15 @@ class TradeManager {
       if (!Object.prototype.hasOwnProperty.call(trade, "beLocked")) {
         patch.beLocked = false;
       }
+      if (!Object.prototype.hasOwnProperty.call(trade, "beAppliedAt")) {
+        patch.beAppliedAt = null;
+      }
+      if (!Object.prototype.hasOwnProperty.call(trade, "beAppliedStopLoss")) {
+        patch.beAppliedStopLoss = null;
+      }
+      if (!Object.prototype.hasOwnProperty.call(trade, "beApplyFails")) {
+        patch.beApplyFails = 0;
+      }
       if (!Object.prototype.hasOwnProperty.call(trade, "trailLocked")) {
         patch.trailLocked = false;
       }
@@ -5826,14 +5835,36 @@ class TradeManager {
             );
             const appliedLimit =
               retryMeta?.appliedPatch?.price ?? nextLimitPrice;
+            const beFloor = Number(plan?.meta?.beFloor);
+            const beLockedNow = Boolean(plan?.tradePatch?.beLocked || trade?.beLocked);
+            const beAppliedNow =
+              beLockedNow &&
+              Number.isFinite(beFloor) &&
+              (String(trade?.side || "").toUpperCase() === "BUY"
+                ? appliedTrigger >= beFloor
+                : appliedTrigger <= beFloor);
+            const nextBeApplyFails = beAppliedNow
+              ? 0
+              : Math.max(0, Number(trade?.beApplyFails ?? 0)) + 1;
             await updateTrade(tradeId, {
               stopLoss: appliedTrigger,
               slTrigger: appliedTrigger,
               ...(appliedLimit != null ? { slLimitPrice: appliedLimit } : {}),
+              ...(beAppliedNow
+                ? {
+                    beAppliedAt: new Date(),
+                    beAppliedStopLoss: appliedTrigger,
+                    beApplyFails: 0,
+                  }
+                : beLockedNow
+                  ? { beApplyFails: nextBeApplyFails }
+                  : {}),
               ...this._eventPatch("SL_TRAILED", {
                 tradeId,
                 stopLoss: appliedTrigger,
                 trailSl: plan?.tradePatch?.trailSl ?? trade?.trailSl,
+                beFloor: Number.isFinite(beFloor) ? beFloor : null,
+                beAppliedNow,
               }),
             });
             try {
@@ -5874,6 +5905,13 @@ class TradeManager {
 
             // Treat rate-limit / transient broker errors as soft-failures.
             // Pro behavior: backoff but keep trailing alive (do NOT permanently disable).
+            if (Boolean(plan?.tradePatch?.beLocked || trade?.beLocked)) {
+              const nextBeApplyFails = Math.max(0, Number(trade?.beApplyFails ?? 0)) + 1;
+              try {
+                await updateTrade(tradeId, { beApplyFails: nextBeApplyFails });
+              } catch {}
+            }
+
             const msg = String(e?.message || e || "");
             const low = msg.toLowerCase();
             const isRateLimit =
@@ -8848,6 +8886,9 @@ class TradeManager {
       initialStopLoss: stopLoss,
       slTrigger: stopLoss,
       beLocked: false,
+      beAppliedAt: null,
+      beAppliedStopLoss: null,
+      beApplyFails: 0,
       peakLtp: null,
       trailSl: null,
       entryFilledAt: null,
