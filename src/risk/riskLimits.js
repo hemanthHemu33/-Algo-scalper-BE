@@ -7,14 +7,10 @@ const DOC_ID = "active";
 function defaultLimits() {
   const dailyLossCap = Number(env.DAILY_MAX_LOSS_INR ?? 0);
   const maxOpenTrades = Number(env.MAX_OPEN_POSITIONS ?? 1);
-  const maxTradesPerDay = Number(env.MAX_TRADES_PER_DAY ?? 0);
   return {
     dailyLossCapInr: Number.isFinite(dailyLossCap) ? dailyLossCap : null,
     maxDrawdownInr: Number(env.RISK_MAX_DRAWDOWN_INR ?? dailyLossCap * 2 ?? 0),
     maxOpenTrades: Number.isFinite(maxOpenTrades) ? maxOpenTrades : null,
-    maxTradesPerDay: Number.isFinite(maxTradesPerDay)
-      ? maxTradesPerDay
-      : null,
     maxPerSymbolExposureInr: Number(
       env.RISK_MAX_EXPOSURE_PER_SYMBOL_INR ?? 0,
     ),
@@ -36,12 +32,15 @@ async function getRiskLimits() {
 
   const doc = await db.collection(COLLECTION).findOne({ _id: DOC_ID });
   if (!doc) return { source: "default", limits: defaultLimits() };
-  return { source: "db", limits: { ...defaultLimits(), ...doc.limits } };
+  const merged = { ...defaultLimits(), ...doc.limits };
+  delete merged.maxTradesPerDay;
+  return { source: "db", limits: merged };
 }
 
 async function setRiskLimits(patch) {
   const db = getDb();
   const clean = { ...defaultLimits(), ...(patch || {}) };
+  delete clean.maxTradesPerDay;
   await db
     .collection(COLLECTION)
     .updateOne(
