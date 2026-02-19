@@ -110,7 +110,7 @@ async function buildChargesByOrderIdFromCsvText(csvText) {
       continue;
     }
 
-    const prev = Number(chargesByOrderId.get(orderId) || 0);
+    const prev = Number(chargesByOrderId.get(orderId) ?? 0);
     chargesByOrderId.set(orderId, prev + charges);
   }
 
@@ -135,7 +135,7 @@ async function reconcileChargesFromFiles({ files = [], label = null } = {}) {
     const out = await buildChargesByOrderIdFromCsvText(txt);
 
     for (const [orderId, ch] of out.chargesByOrderId.entries()) {
-      const prev = Number(allCharges.get(orderId) || 0);
+      const prev = Number(allCharges.get(orderId) ?? 0);
       allCharges.set(orderId, prev + Number(ch));
     }
 
@@ -179,7 +179,7 @@ async function reconcileChargesFromFiles({ files = [], label = null } = {}) {
     linkedOrderSet.add(oid);
     const tid = String(l.tradeId || "");
     if (!tid) continue;
-    const ch = Number(allCharges.get(oid) || 0);
+    const ch = Number(allCharges.get(oid) ?? 0);
     const prev = tradeCharges.get(tid) || { actualChargesInr: 0, orderIds: [] };
     prev.actualChargesInr += ch;
     prev.orderIds.push(oid);
@@ -211,13 +211,13 @@ async function reconcileChargesFromFiles({ files = [], label = null } = {}) {
     const t = tradeById.get(String(tradeId));
     if (!t) continue;
 
-    const actual = Number(agg.actualChargesInr || 0);
+    const actual = Number(agg.actualChargesInr ?? 0);
     if (!Number.isFinite(actual) || actual < 0) continue;
 
-    const entry = Number(t.entryPrice || 0);
-    const qty = Number(t.initialQty || 0);
-    const spreadBps = Number(t.spreadBpsUsed || 0);
-    const execOrders = Number(t.feeMultipleExecOrders || env.EXPECTED_EXECUTED_ORDERS || 2);
+    const entry = Number(t.entryPrice ?? 0);
+    const qty = Number(t.initialQty ?? 0);
+    const spreadBps = Number(t.spreadBpsUsed ?? 0);
+    const execOrders = Number(t.feeMultipleExecOrders ?? env.EXPECTED_EXECUTED_ORDERS ?? 2);
 
     if (!(entry > 0) || !(qty > 0)) continue;
 
@@ -229,7 +229,7 @@ async function reconcileChargesFromFiles({ files = [], label = null } = {}) {
       env: { ...env, EXPECTED_EXECUTED_ORDERS: execOrders, COST_CALIBRATION_ENABLED: "false" },
       disableCalibration: true,
     });
-    const baseEst = Number(base?.estCostInr || 0);
+    const baseEst = Number(base?.estCostInr ?? 0);
     if (!(baseEst > 0)) continue;
 
     const segKey = up(base?.meta?.segmentKey || "UNKNOWN");

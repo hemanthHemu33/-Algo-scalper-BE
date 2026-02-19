@@ -103,41 +103,41 @@ class AdaptiveOptimizer {
     this._enabled = String(env.OPTIMIZER_ENABLED || "true") === "true";
 
     // Rolling stats
-    this._lookbackN = Number(env.OPT_LOOKBACK_N || 60);
+    this._lookbackN = Number(env.OPT_LOOKBACK_N ?? 60);
 
     // Min samples before a key can be auto-blocked
     this._minSamplesKey = Number(
-      env.OPT_MIN_SAMPLES_KEY || env.OPT_MIN_SAMPLES || 20,
+      env.OPT_MIN_SAMPLES_KEY ?? env.OPT_MIN_SAMPLES ?? 20,
     );
     this._minSamplesStrategy = Number(
-      env.OPT_MIN_SAMPLES_STRATEGY || env.OPT_MIN_SAMPLES || 20,
+      env.OPT_MIN_SAMPLES_STRATEGY ?? env.OPT_MIN_SAMPLES ?? 20,
     );
 
     // Threshold: avg feeMultiple must be >= this to stay eligible
-    this._feeMultipleMin = Number(env.OPT_BLOCK_FEE_MULTIPLE_AVG_MIN || 3);
+    this._feeMultipleMin = Number(env.OPT_BLOCK_FEE_MULTIPLE_AVG_MIN ?? 3);
 
     // Block duration (minutes)
-    this._blockTtlMin = Number(env.OPT_BLOCK_TTL_MIN || 120);
+    this._blockTtlMin = Number(env.OPT_BLOCK_TTL_MIN ?? 120);
 
     // De-weighting (soft control)
     this._deweightEnabled =
       String(env.OPT_DEWEIGHT_ENABLED || "true") === "true";
-    this._deMinSamples = Number(env.OPT_DEWEIGHT_MIN_SAMPLES || 5);
-    this._deConfMin = Number(env.OPT_DEWEIGHT_CONF_MIN || 0.5);
-    this._deQtyMin = Number(env.OPT_DEWEIGHT_QTY_MIN || 0.5);
+    this._deMinSamples = Number(env.OPT_DEWEIGHT_MIN_SAMPLES ?? 5);
+    this._deConfMin = Number(env.OPT_DEWEIGHT_CONF_MIN ?? 0.5);
+    this._deQtyMin = Number(env.OPT_DEWEIGHT_QTY_MIN ?? 0.5);
 
     // Spread-aware penalties (entry spreads are already filtered elsewhere if enabled)
-    this._spreadPenaltyBps = Number(env.OPT_SPREAD_PENALTY_BPS || 25);
-    this._spreadBlockBps = Number(env.OPT_SPREAD_BLOCK_BPS || 60);
+    this._spreadPenaltyBps = Number(env.OPT_SPREAD_PENALTY_BPS ?? 25);
+    this._spreadBlockBps = Number(env.OPT_SPREAD_BLOCK_BPS ?? 60);
     this._spreadPenaltyConfMult = Number(
-      env.OPT_SPREAD_PENALTY_CONF_MULT || 0.9,
+      env.OPT_SPREAD_PENALTY_CONF_MULT ?? 0.9,
     );
     this._spreadBlockEnabled =
       String(env.OPT_SPREAD_BLOCK_ENABLED || "false") === "true";
 
     // RR floors
-    this._rrTrendMin = Number(env.RR_TREND_MIN || 1.5);
-    this._rrWideSpreadMin = Number(env.RR_WIDE_SPREAD_MIN || 1.8);
+    this._rrTrendMin = Number(env.RR_TREND_MIN ?? 1.5);
+    this._rrWideSpreadMin = Number(env.RR_WIDE_SPREAD_MIN ?? 1.8);
 
     // Buckets
     this._bucketOpenEnd = String(env.OPT_BUCKET_OPEN_END || "10:00");
@@ -147,8 +147,8 @@ class AdaptiveOptimizer {
 
     // Persistent optimizer state (pro: fast restart, stable self-pruning)
     this._persistEnabled = optimizerStateEnabled();
-    this._stateFlushSec = Number(env.OPT_STATE_FLUSH_SEC || 15);
-    this._stateMaxKeys = Number(env.OPT_STATE_MAX_KEYS || 1500);
+    this._stateFlushSec = Number(env.OPT_STATE_FLUSH_SEC ?? 15);
+    this._stateMaxKeys = Number(env.OPT_STATE_MAX_KEYS ?? 1500);
     this._stateDirty = false;
     this._stateTimer = null;
     this._stateLoaded = false;
@@ -183,7 +183,7 @@ class AdaptiveOptimizer {
     if (!this._persistEnabled) return;
     if (this._stateTimer) return;
 
-    const sec = Number(this._stateFlushSec || 0);
+    const sec = Number(this._stateFlushSec ?? 0);
     if (!(sec > 0)) return;
 
     this._stateTimer = setInterval(() => {
@@ -764,7 +764,7 @@ class AdaptiveOptimizer {
       return { ok: false, reason: "db_not_ready" };
     }
 
-    const days = Number(env.OPT_BOOTSTRAP_DAYS || 7);
+    const days = Number(env.OPT_BOOTSTRAP_DAYS ?? 7);
     const since = DateTime.now()
       .setZone(tz())
       .minus({ days: Math.max(1, days) })

@@ -54,7 +54,7 @@ function _expiryTimeYears(expiryISO, env, nowMs) {
 
   const diffSec = exp.diff(now, "seconds").seconds;
   // Clamp to small positive to avoid div-by-zero / negative T.
-  const sec = Math.max(60, Number(diffSec || 0));
+  const sec = Math.max(60, Number(diffSec ?? 0));
   return sec / (365 * 24 * 60 * 60);
 }
 
@@ -95,7 +95,7 @@ async function getOptionChainSnapshot({
   });
 
   const cached = _cache.get(key);
-  const now = Number(nowMs || _now());
+  const now = Number(nowMs ?? _now());
   if (cached && now - cached.ts <= cached.ttlMs) {
     return { ok: true, fromCache: true, key, snapshot: cached.data };
   }
@@ -167,7 +167,7 @@ async function getOptionChainSnapshot({
       Number.isFinite(spreadBpsChange) && spreadBpsChange > 0 ? spreadBpsChange : 0;
 
     const volVelocity =
-      Number.isFinite(volume) && Number.isFinite(prev?.volume) && now > Number(prev?.ts || 0)
+      Number.isFinite(volume) && Number.isFinite(prev?.volume) && now > Number(prev?.ts ?? 0)
         ? Math.max(0, ((volume - prev.volume) / Math.max(1, now - prev.ts)) * 1000)
         : null;
 
@@ -223,7 +223,7 @@ async function getOptionChainSnapshot({
       segment: r0.segment,
       expiry: r0.expiry,
       strike: Number(K),
-      lot_size: Number(r0.lot_size || 1),
+      lot_size: Number(r0.lot_size ?? 1),
       tick_size: normalizeTickSize(r0.tick_size),
       ltp: Number.isFinite(ltp) ? ltp : null,
       bid: Number.isFinite(buyP) ? buyP : null,
@@ -258,7 +258,7 @@ async function getOptionChainSnapshot({
     const oiScore = Number.isFinite(oi) && oi > 0 ? Math.min(20, Math.log(oi + 1)) : 0;
     const volScore = Number.isFinite(volVelocity) ? Math.min(20, volVelocity / 5) : 0;
     const spreadPenalty = Number.isFinite(bps) ? Math.min(35, Math.max(0, bps / 2)) : 35;
-    const flickerPenalty = Math.min(20, Number(bookFlicker || 0) * 5 + Math.max(0, spreadTrendBad / 3));
+    const flickerPenalty = Math.min(20, Number(bookFlicker ?? 0) * 5 + Math.max(0, spreadTrendBad / 3));
     const impactPenalty = Number.isFinite(impactCostBps) ? Math.min(15, Math.max(0, impactCostBps / 2)) : 10;
     row.health_score = Math.max(0, Math.min(100, 55 + oiScore + volScore - spreadPenalty - flickerPenalty - impactPenalty));
 
@@ -278,7 +278,7 @@ async function getOptionChainSnapshot({
 
   const snapshot = {
     ts: now,
-    ttlMs: Number(ttlMs || 1500),
+    ttlMs: Number(ttlMs ?? 1500),
     underlying: String(underlying || "").toUpperCase(),
     optType: String(optType || "").toUpperCase(),
     expiryISO: String(expiryISO || "").slice(0, 10),
@@ -302,7 +302,7 @@ async function getOptionChainSnapshot({
     rows,
   };
 
-  const ttl = Math.max(250, Number(ttlMs || 1500));
+  const ttl = Math.max(250, Number(ttlMs ?? 1500));
   _cache.set(key, { ts: now, ttlMs: ttl, data: snapshot });
 
   const keyShort = `${snapshot.underlying}|${snapshot.optType}|${snapshot.expiryISO}`;

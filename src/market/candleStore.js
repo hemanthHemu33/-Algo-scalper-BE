@@ -47,7 +47,7 @@ function ttlDaysForInterval(intervalMin) {
   const m = _getTtlMap();
   if (m.has(Number(intervalMin))) return Number(m.get(Number(intervalMin)));
 
-  const defDays = Number(env.CANDLE_TTL_DEFAULT_DAYS || 90);
+  const defDays = Number(env.CANDLE_TTL_DEFAULT_DAYS ?? 90);
   if (!Number.isFinite(defDays) || defDays <= 0) return null;
   return defDays;
 }
@@ -68,7 +68,7 @@ async function ensureTtlIndex(col, expireAfterSeconds) {
   // Any ts:1 index conflicts with TTL index (even if non-TTL).
   const tsAsc = indexes.find((i) => i?.key && i.key.ts === 1);
   if (tsAsc) {
-    const current = Number(tsAsc.expireAfterSeconds || 0);
+    const current = Number(tsAsc.expireAfterSeconds ?? 0);
     const hasTTL = Number.isFinite(current) && current > 0;
 
     // Already correct TTL index → keep.

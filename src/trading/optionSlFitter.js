@@ -19,7 +19,7 @@ function fitStopLossToLotRiskCap({
   const e = Number(entry);
   const sl = Number(stopLoss);
   const lotSize = Number(lot);
-  const tick = Number(tickSize || 0);
+  const tick = Number(tickSize ?? 0);
   const cap = Number(capInr);
   const minTicksN = Number(minTicks);
 
@@ -133,7 +133,7 @@ function computeTargetFromRR({ side, entry, stopLoss, rr, tickSize }) {
   const e = Number(entry);
   const sl = Number(stopLoss);
   const rrN = Number(rr);
-  const tick = Number(tickSize || 0);
+  const tick = Number(tickSize ?? 0);
 
   if (!Number.isFinite(e) || !Number.isFinite(sl) || !Number.isFinite(rrN) || rrN <= 0) {
     return null;

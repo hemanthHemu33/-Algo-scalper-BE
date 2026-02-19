@@ -8,7 +8,7 @@ function clamp(n, lo, hi) {
 }
 
 function computePremiumVolPct(candles, lookback) {
-  const n = Math.max(5, Number(lookback || 20));
+  const n = Math.max(5, Number(lookback ?? 20));
   if (!Array.isArray(candles) || candles.length < n + 2) return null;
 
   const slice = candles.slice(-n);
@@ -34,7 +34,7 @@ function computePremiumVolPct(candles, lookback) {
 }
 
 function atrLast(candles, period) {
-  const p = Math.max(5, Number(period || 14));
+  const p = Math.max(5, Number(period ?? 14));
   if (!Array.isArray(candles) || candles.length < p + 2) return null;
 
   const slice = candles.slice(-(p + 1));
@@ -76,37 +76,37 @@ function buildPremiumAwareOptionPlan({
   const s = String(side || "BUY").toUpperCase();
   const e = Number(entryPremium);
   const tick = normalizeTickSize(premiumTick);
-  const rrMinN = Number(rrMin || 1.1);
+  const rrMinN = Number(rrMin ?? 1.1);
 
   if (!Number.isFinite(e) || e <= 0 || !Number.isFinite(tick) || tick <= 0) {
     return { ok: false, reason: !Number.isFinite(e) || e <= 0 ? "BAD_ENTRY" : "NO_TICK_SIZE" };
   }
 
   const lookback = Number(
-    env?.OPT_PLAN_VOL_LOOKBACK || env?.OPT_EXIT_VOL_LOOKBACK || 20,
+    env?.OPT_PLAN_VOL_LOOKBACK ?? env?.OPT_EXIT_VOL_LOOKBACK ?? 20,
   );
   const volRef = Number(
-    env?.OPT_PLAN_VOL_REF_PCT || env?.OPT_EXIT_VOL_REF_PCT || 6,
+    env?.OPT_PLAN_VOL_REF_PCT ?? env?.OPT_EXIT_VOL_REF_PCT ?? 6,
   );
   const baseSlPct = Number(
-    env?.OPT_PLAN_BASE_SL_PCT || env?.OPT_EXIT_BASE_SL_PCT || 18,
+    env?.OPT_PLAN_BASE_SL_PCT ?? env?.OPT_EXIT_BASE_SL_PCT ?? 18,
   );
   const baseTpPct = Number(
-    env?.OPT_PLAN_BASE_TARGET_PCT || env?.OPT_EXIT_BASE_TARGET_PCT || 35,
+    env?.OPT_PLAN_BASE_TARGET_PCT ?? env?.OPT_EXIT_BASE_TARGET_PCT ?? 35,
   );
   const minSlPct = Number(
-    env?.OPT_PLAN_MIN_SL_PCT || env?.OPT_EXIT_MIN_SL_PCT || 8,
+    env?.OPT_PLAN_MIN_SL_PCT ?? env?.OPT_EXIT_MIN_SL_PCT ?? 8,
   );
   const maxSlPct = Number(
-    env?.OPT_PLAN_MAX_SL_PCT || env?.OPT_EXIT_MAX_SL_PCT || 35,
+    env?.OPT_PLAN_MAX_SL_PCT ?? env?.OPT_EXIT_MAX_SL_PCT ?? 35,
   );
 
-  const widenMin = Number(env?.OPT_EXIT_WIDEN_FACTOR_MIN || 0.75);
-  const widenMax = Number(env?.OPT_EXIT_WIDEN_FACTOR_MAX || 1.8);
+  const widenMin = Number(env?.OPT_EXIT_WIDEN_FACTOR_MIN ?? 0.75);
+  const widenMax = Number(env?.OPT_EXIT_WIDEN_FACTOR_MAX ?? 1.8);
 
-  const atrPeriod = Number(env?.OPT_PLAN_PREM_ATR_PERIOD || 14);
-  const atrK = Number(env?.OPT_PLAN_PREM_ATR_K || 1.2);
-  const atrM = Number(env?.OPT_PLAN_PREM_ATR_M || 2.0);
+  const atrPeriod = Number(env?.OPT_PLAN_PREM_ATR_PERIOD ?? 14);
+  const atrK = Number(env?.OPT_PLAN_PREM_ATR_K ?? 1.2);
+  const atrM = Number(env?.OPT_PLAN_PREM_ATR_M ?? 2.0);
 
   const premVolPct = computePremiumVolPct(premiumCandles, lookback);
   const atrPrem = atrLast(premiumCandles, atrPeriod);
@@ -137,7 +137,7 @@ function buildPremiumAwareOptionPlan({
   const tpPct = clamp(baseTpPct * volFactor * (1 - near * 0.05), 10, 90);
 
   // Spread padding: prevent SL/TP sitting inside microstructure noise.
-  const bps = Math.abs(Number(optionMeta?.bps || 0));
+  const bps = Math.abs(Number(optionMeta?.bps ?? 0));
   const spreadAbs = Number.isFinite(bps) && bps > 0 ? (e * bps) / 10000 : 0;
   const spreadPadAbs = Math.max(2 * tick, spreadAbs * 1.25);
 

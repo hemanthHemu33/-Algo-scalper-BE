@@ -209,7 +209,7 @@ async function buildCriticalHealthSnapshot() {
     checks.push({ ok: true, code: "KILL_SWITCH_OFF" });
   }
 
-  const breakerUntil = Number(quoteGuard?.breakerOpenUntil || 0);
+  const breakerUntil = Number(quoteGuard?.breakerOpenUntil ?? 0);
   const breakerOpen = breakerUntil > Date.now();
   if (env.CRITICAL_HEALTH_FAIL_ON_QUOTE_BREAKER && breakerOpen) {
     checks.push({
@@ -242,9 +242,9 @@ async function buildCriticalHealthSnapshot() {
 async function buildTelemetrySnapshot() {
   const snapshot = telemetry.snapshot();
   const isEmpty =
-    Number(snapshot.candidatesTotal || 0) === 0 &&
-    Number(snapshot.decisionsTotal || 0) === 0 &&
-    Number(snapshot.blockedTotal || 0) === 0;
+    Number(snapshot.candidatesTotal ?? 0) === 0 &&
+    Number(snapshot.decisionsTotal ?? 0) === 0 &&
+    Number(snapshot.blockedTotal ?? 0) === 0;
 
   if (!isEmpty) {
     return { ok: true, source: "memory", data: snapshot };
@@ -368,7 +368,7 @@ function attachSocketServer(httpServer) {
     const includeLiveCharts =
       String(env.WS_CHART_INCLUDE_LIVE || "true") === "true";
     const defaultSnapshotIntervalMs = Number(
-      env.WS_ADMIN_SNAPSHOT_INTERVAL_MS || 5000,
+      env.WS_ADMIN_SNAPSHOT_INTERVAL_MS ?? 5000,
     );
 
     // ---- helpers
@@ -666,9 +666,9 @@ function attachSocketServer(httpServer) {
       emitIfChanged("health:critical", "health:critical", snap);
     };
 
-    const tradesRecentLimit = Number(env.WS_TRADES_RECENT_LIMIT || 10);
+    const tradesRecentLimit = Number(env.WS_TRADES_RECENT_LIMIT ?? 10);
     const tradesRecentIntervalMs = Number(
-      env.WS_TRADES_RECENT_INTERVAL_MS || defaultSnapshotIntervalMs,
+      env.WS_TRADES_RECENT_INTERVAL_MS ?? defaultSnapshotIntervalMs,
     );
 
     const bootstrapSnapshots = () => {
@@ -699,12 +699,12 @@ function attachSocketServer(httpServer) {
 
     startTimer(
       "status",
-      Number(env.WS_STATUS_INTERVAL_MS || 2000),
+      Number(env.WS_STATUS_INTERVAL_MS ?? 2000),
       sendStatus,
     );
     startTimer(
       "subs",
-      Number(env.WS_SUBS_INTERVAL_MS || 5000),
+      Number(env.WS_SUBS_INTERVAL_MS ?? 5000),
       sendSubs,
     );
     startTimer("trades:recent", tradesRecentIntervalMs, () =>
@@ -823,7 +823,7 @@ function attachSocketServer(httpServer) {
     // ---- events from client (FE -> BE)
 
     socket.on("status:subscribe", (payload = {}) => {
-      const intervalMs = Number(payload.intervalMs || env.WS_STATUS_INTERVAL_MS || 2000);
+      const intervalMs = Number(payload.intervalMs ?? env.WS_STATUS_INTERVAL_MS ?? 2000);
       sendStatus().catch(() => {});
       startTimer("status", intervalMs, sendStatus);
     });
@@ -837,7 +837,7 @@ function attachSocketServer(httpServer) {
     });
 
     socket.on("subs:subscribe", (payload = {}) => {
-      const intervalMs = Number(payload.intervalMs || env.WS_SUBS_INTERVAL_MS || 5000);
+      const intervalMs = Number(payload.intervalMs ?? env.WS_SUBS_INTERVAL_MS ?? 5000);
       sendSubs().catch(() => {});
       startTimer("subs", intervalMs, sendSubs);
     });
@@ -851,8 +851,8 @@ function attachSocketServer(httpServer) {
     });
 
     socket.on("trades:subscribe", async (payload = {}) => {
-      const intervalMs = Number(payload.intervalMs || env.WS_TRADES_INTERVAL_MS || 2000);
-      const limit = Number(payload.limit || 50);
+      const intervalMs = Number(payload.intervalMs ?? env.WS_TRADES_INTERVAL_MS ?? 2000);
+      const limit = Number(payload.limit ?? 50);
       const rows = await sendTradesSnapshot(limit);
       const mostRecent = rows[0];
       const cursor = mostRecent
@@ -872,8 +872,8 @@ function attachSocketServer(httpServer) {
     socket.on("chart:subscribe", async (payload = {}) => {
       const chartId = String(payload.chartId || "");
       const token = Number(payload.token);
-      const intervalMin = Number(payload.intervalMin || 1);
-      const limitRaw = Number(payload.limit || 300);
+      const intervalMin = Number(payload.intervalMin ?? 1);
+      const limitRaw = Number(payload.limit ?? 300);
       const limit = Number.isFinite(limitRaw) ? Math.min(2000, Math.max(10, limitRaw)) : 300;
 
       if (!chartId) {
@@ -904,7 +904,7 @@ function attachSocketServer(httpServer) {
 
       // Start global chart polling if not already
       if (!timers.get("charts")) {
-        const intervalMs = Number(env.WS_CHART_INTERVAL_MS || 1000);
+        const intervalMs = Number(env.WS_CHART_INTERVAL_MS ?? 1000);
         startTimer("charts", intervalMs, pollCharts);
       }
     });

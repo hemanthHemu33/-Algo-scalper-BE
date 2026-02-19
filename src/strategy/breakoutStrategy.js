@@ -18,7 +18,7 @@ function breakoutStrategy({ candles, lookback = 20, volMult = 1.2, volLookback =
 
   const curClose = Number(cur.close);
   const prevClose = Number(candles[n - 2].close);
-  const curVol = Number(cur.volume || 0);
+  const curVol = Number(cur.volume ?? 0);
 
   const av = avgVolume(candles, volLookback);
   if (!Number.isFinite(av) || av <= 0) return null;

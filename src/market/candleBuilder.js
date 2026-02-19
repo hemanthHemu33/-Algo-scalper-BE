@@ -133,7 +133,7 @@ class CandleBuilder {
           c.synthetic = false;
 
           // If it was just a placeholder (volume 0), reset OHLC to the real first tick
-          if (Number(c.volume || 0) === 0) {
+          if (Number(c.volume ?? 0) === 0) {
             c.open = price;
             c.high = price;
             c.low = price;
@@ -191,7 +191,7 @@ class CandleBuilder {
         });
 
         // create next bucket candle (synthetic placeholder)
-        const lastClose = Number(c.close || 0);
+        const lastClose = Number(c.close ?? 0);
         const next = newCandle(
           c.instrument_token,
           intervalMin,
@@ -223,7 +223,7 @@ function newCandle(token, intervalMin, ts, price, volume) {
     high: price,
     low: price,
     close: price,
-    volume: Number(volume || 0),
+    volume: Number(volume ?? 0),
     source: "live",
     synthetic: false,
   };

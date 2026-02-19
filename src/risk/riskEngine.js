@@ -88,7 +88,7 @@ class RiskEngine {
   }
 
   setTradesToday(n) {
-    this.tradesToday = Math.max(0, Number(n || 0));
+    this.tradesToday = Math.max(0, Number(n ?? 0));
     this._emitStateChange();
   }
   setOpenPosition(token, pos) {
@@ -100,7 +100,7 @@ class RiskEngine {
     this._emitStateChange();
   }
   setCooldown(token, seconds, reason) {
-    const sec = Math.max(0, Number(seconds || 0));
+    const sec = Math.max(0, Number(seconds ?? 0));
     if (!Number.isFinite(sec) || sec <= 0) return;
     this.cooldownUntil.set(Number(token), this.clock.nowMs() + sec * 1000);
     this._emitStateChange();
@@ -152,18 +152,18 @@ class RiskEngine {
       return { ok: false, reason: "after_entry_cutoff" };
     }
 
-    if (this.consecutiveFailures >= Number(env.MAX_CONSECUTIVE_FAILURES || 3)) {
+    if (this.consecutiveFailures >= Number(env.MAX_CONSECUTIVE_FAILURES ?? 3)) {
       return { ok: false, reason: "too_many_failures" };
     }
 
     if (this.kill) return { ok: false, reason: "kill_switch" };
     const maxTradesPerDay = Number(
-      (this.limits?.maxTradesPerDay ?? env.MAX_TRADES_PER_DAY) || 8,
+      (this.limits?.maxTradesPerDay ?? env.MAX_TRADES_PER_DAY) ?? 8,
     );
     if (Number.isFinite(maxTradesPerDay) && this.tradesToday >= maxTradesPerDay)
       return { ok: false, reason: "max_trades_day" };
     const maxOpenTrades = Number(
-      (this.limits?.maxOpenTrades ?? env.MAX_OPEN_POSITIONS) || 1,
+      (this.limits?.maxOpenTrades ?? env.MAX_OPEN_POSITIONS) ?? 1,
     );
     if (
       Number.isFinite(maxOpenTrades) &&
@@ -185,7 +185,7 @@ class RiskEngine {
 
   _resolveCooldownSeconds(reasonMeta = {}) {
     const defaultCooldown = Number(
-      env.SYMBOL_COOLDOWN_DEFAULT_SEC || env.SYMBOL_COOLDOWN_SECONDS || 180,
+      env.SYMBOL_COOLDOWN_DEFAULT_SEC ?? env.SYMBOL_COOLDOWN_SECONDS ?? 180,
     );
 
     const status = String(reasonMeta?.status || "").trim().toUpperCase();
@@ -204,13 +204,13 @@ class RiskEngine {
       closeReason.includes("SL") ||
       exitReason.includes("SL");
     if (isStopLoss) {
-      return Number(env.SYMBOL_COOLDOWN_AFTER_SL_SEC || defaultCooldown);
+      return Number(env.SYMBOL_COOLDOWN_AFTER_SL_SEC ?? defaultCooldown);
     }
 
     const isTimeStop = reasonText.includes("TIME_STOP");
     if (isTimeStop) {
       return Number(
-        env.SYMBOL_COOLDOWN_AFTER_TIME_STOP_SEC || defaultCooldown,
+        env.SYMBOL_COOLDOWN_AFTER_TIME_STOP_SEC ?? defaultCooldown,
       );
     }
 
@@ -223,7 +223,7 @@ class RiskEngine {
       (hasPnl && pnl > 0);
     if (isProfitReason) {
       return Number(
-        env.SYMBOL_COOLDOWN_AFTER_PROFIT_SEC || defaultCooldown,
+        env.SYMBOL_COOLDOWN_AFTER_PROFIT_SEC ?? defaultCooldown,
       );
     }
 
@@ -243,7 +243,7 @@ class RiskEngine {
 
   markFailure(reason) {
     this.consecutiveFailures += 1;
-    if (this.consecutiveFailures >= Number(env.MAX_CONSECUTIVE_FAILURES || 3)) {
+    if (this.consecutiveFailures >= Number(env.MAX_CONSECUTIVE_FAILURES ?? 3)) {
       this.kill = true;
       this._emitStateChange();
       return { killed: true, reason: reason || "failure_limit" };
@@ -261,9 +261,9 @@ class RiskEngine {
     const riskInr = Number(
       Number.isFinite(Number(riskInrOverride))
         ? riskInrOverride
-        : env.RISK_PER_TRADE_INR || 250,
+        : env.RISK_PER_TRADE_INR ?? 250,
     );
-    const lot = Math.max(1, Number(lotSize || 1));
+    const lot = Math.max(1, Number(lotSize ?? 1));
     const slPts = Math.max(0.05, Math.abs(Number(entryPrice) - Number(stopLoss)));
     const slipPts = Math.max(0, Number(expectedSlippagePts ?? env.EXPECTED_SLIPPAGE_POINTS ?? 0));
     const feesPerLot = Math.max(0, Number(feePerLotInr ?? env.EXPECTED_FEES_PER_LOT_INR ?? 0));

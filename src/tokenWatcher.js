@@ -105,7 +105,7 @@ async function watchLatestToken({ onToken }) {
   }
 
   // Polling fallback: keeps working even if change streams are not supported
-  const pollMs = Math.max(5000, Number(env.TOKEN_POLL_INTERVAL_MS || 30000));
+  const pollMs = Math.max(5000, Number(env.TOKEN_POLL_INTERVAL_MS ?? 30000));
   const interval = setInterval(() => {
     refreshAndNotify("poll").catch(() => {});
   }, pollMs);

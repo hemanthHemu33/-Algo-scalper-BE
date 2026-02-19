@@ -34,7 +34,7 @@ function toDate(v) {
 }
 
 function roundToStep(price, step) {
-  const s = Math.max(1, Number(step || 1));
+  const s = Math.max(1, Number(step ?? 1));
   return Math.round(Number(price) / s) * s;
 }
 
@@ -58,8 +58,8 @@ async function maybeSyncNfoInstruments({ db, kite, optionType }) {
             instrument_token: Number(r.instrument_token),
             exchange: r.exchange,
             tradingsymbol: r.tradingsymbol,
-            tick_size: Number(r.tick_size || 0.05),
-            lot_size: Number(r.lot_size || 1),
+            tick_size: Number(r.tick_size ?? 0.05),
+            lot_size: Number(r.lot_size ?? 1),
             segment: r.segment,
             instrument_type: r.instrument_type,
             name: r.name,
@@ -106,7 +106,7 @@ async function backfillTokenRange({ kite, intervalMin, token, from, to }) {
     high: Number(x.high),
     low: Number(x.low),
     close: Number(x.close),
-    volume: Number(x.volume || 0),
+    volume: Number(x.volume ?? 0),
     source: 'historical',
   }));
 }

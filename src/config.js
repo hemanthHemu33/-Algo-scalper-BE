@@ -1109,7 +1109,7 @@ function validateProfileCombos() {
   const forceLot =
     String(env.FNO_MIN_LOT_POLICY || "STRICT").toUpperCase() ===
     "FORCE_ONE_LOT";
-  const riskInr = Number(env.RISK_PER_TRADE_INR || 0);
+  const riskInr = Number(env.RISK_PER_TRADE_INR ?? 0);
   if (fnoEnabled && forceLot && Number.isFinite(riskInr) && riskInr < 100) {
     failOrWarn(
       "[config] Unsafe combo: FORCE_ONE_LOT with very low RISK_PER_TRADE_INR may block trades or force oversized risk.",
@@ -1117,9 +1117,9 @@ function validateProfileCombos() {
   }
 
   const optTpEnabled = String(env.OPT_TP_ENABLED || "false") === "true";
-  const timeStopMin = Number(env.TIME_STOP_MIN || 0);
-  const noProgressMin = Number(env.TIME_STOP_NO_PROGRESS_MIN || 0);
-  const maxHoldMin = Number(env.TIME_STOP_MAX_HOLD_MIN || 0);
+  const timeStopMin = Number(env.TIME_STOP_MIN ?? 0);
+  const noProgressMin = Number(env.TIME_STOP_NO_PROGRESS_MIN ?? 0);
+  const maxHoldMin = Number(env.TIME_STOP_MAX_HOLD_MIN ?? 0);
   const proTimeStopsEnabled =
     (Number.isFinite(noProgressMin) && noProgressMin > 0) ||
     (Number.isFinite(maxHoldMin) && maxHoldMin > 0);

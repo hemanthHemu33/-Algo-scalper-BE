@@ -21,7 +21,7 @@ function seeded(seed) {
 }
 
 async function calibrateFromRecentTrades({ db, days = 5 }) {
-  const from = new Date(Date.now() - Math.max(1, Number(days || 5)) * 24 * 60 * 60 * 1000);
+  const from = new Date(Date.now() - Math.max(1, Number(days ?? 5)) * 24 * 60 * 60 * 1000);
   const rows = await db
     .collection('trades')
     .find({ createdAt: { $gte: from } })

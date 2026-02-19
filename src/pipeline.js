@@ -32,7 +32,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
     timezone: env.CANDLE_TZ,
   });
   const candleCache = new CandleCache({
-    maxCandles: Number(env.CANDLE_CACHE_MAX || 800),
+    maxCandles: Number(env.CANDLE_CACHE_MAX ?? 800),
   });
 
   const candleWriter = new CandleWriteBuffer();
@@ -194,10 +194,10 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
 
       if (doBackfill) {
         const daysOverride = Number(
-          opts.daysOverride ||
+          opts.daysOverride ??
             (isOptRuntime
               ? env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS_OPT
-              : env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS) ||
+              : env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS) ??
             1,
         );
 
@@ -296,7 +296,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
         String(env.SIGNAL_TICK_CONFIRM_ENABLED || "false") === "true" &&
         String(env.SIGNAL_TICK_CONFIRM_SUPPRESS_CLOSE || "true") !== "false";
       if (suppressClose) {
-        const key = `${tok}:${Number(c.interval_min || 0)}`;
+        const key = `${tok}:${Number(c.interval_min ?? 0)}`;
         const st = tickSignalState.get(key);
         const candleTs = c?.ts ? new Date(c.ts).getTime() : null;
         if (
@@ -315,7 +315,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
       const cached = candleCache.getCandles(
         c.instrument_token,
         c.interval_min,
-        Number(env.CANDLE_CACHE_LIMIT || 400),
+        Number(env.CANDLE_CACHE_LIMIT ?? 400),
       );
       const minCandles = getMinCandlesForSignal(env, c.interval_min);
       const signal = await evaluateOnCandleClose({
@@ -353,7 +353,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
     if (String(env.SIGNAL_TICK_CONFIRM_ENABLED || "false") !== "true") return;
     if (!allowSignalsNow()) return;
 
-    const throttleMs = Number(env.SIGNAL_TICK_CONFIRM_THROTTLE_MS || 1500);
+    const throttleMs = Number(env.SIGNAL_TICK_CONFIRM_THROTTLE_MS ?? 1500);
     const nowMs = Date.now();
 
     for (const t of candleTicks || []) {
@@ -411,7 +411,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
         const cached = candleCache.getCandles(
           tok,
           intervalMin,
-          Number(env.CANDLE_CACHE_LIMIT || 400),
+          Number(env.CANDLE_CACHE_LIMIT ?? 400),
         );
         const signal = await evaluateOnCandleTick({
           instrument_token: tok,
@@ -461,7 +461,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
 
     const tz = env.CANDLE_TZ || "Asia/Kolkata";
     const start = DateTime.fromJSDate(candle.ts, { zone: tz });
-    const intervalMin = Number(candle.interval_min || 0);
+    const intervalMin = Number(candle.interval_min ?? 0);
     const closeTs = start.plus({ minutes: Math.max(1, intervalMin) });
 
     const session = getSessionForDateTime(closeTs, {
@@ -539,8 +539,8 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
     if (String(env.CANDLE_TIMER_FINALIZER_ENABLED || "true") !== "true") return;
 
     const closed = candleBuilder.finalizeDue(new Date(), {
-      graceMs: Number(env.CANDLE_FINALIZE_GRACE_MS || 1500),
-      maxBars: Number(env.CANDLE_FINALIZE_MAX_BARS_PER_RUN || 3),
+      graceMs: Number(env.CANDLE_FINALIZE_GRACE_MS ?? 1500),
+      maxBars: Number(env.CANDLE_FINALIZE_MAX_BARS_PER_RUN ?? 3),
     });
 
     if (closed.length) {
@@ -549,7 +549,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   }
 
   if (String(env.CANDLE_TIMER_FINALIZER_ENABLED || "true") === "true") {
-    const everyMs = Number(env.CANDLE_FINALIZER_INTERVAL_MS || 1000);
+    const everyMs = Number(env.CANDLE_FINALIZER_INTERVAL_MS ?? 1000);
     setInterval(() => {
       enqueue(() => candleFinalizerTick(), "candleFinalizer").catch(() => {});
     }, everyMs);

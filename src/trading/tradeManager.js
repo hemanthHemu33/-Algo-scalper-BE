@@ -117,8 +117,8 @@ function sleep(ms) {
 }
 
 function jitterMs(baseMs, jitterPct = 0) {
-  const base = Math.max(0, Number(baseMs || 0));
-  const pct = Math.max(0, Number(jitterPct || 0));
+  const base = Math.max(0, Number(baseMs ?? 0));
+  const pct = Math.max(0, Number(jitterPct ?? 0));
   if (!(base > 0) || !(pct > 0)) return base;
   const delta = base * pct;
   return Math.max(0, Math.round(base - delta + Math.random() * delta * 2));
@@ -158,7 +158,7 @@ function percentile(values, p) {
     .filter((v) => Number.isFinite(v))
     .sort((a, b) => a - b);
   if (!sorted.length) return null;
-  const rank = Math.max(0, Math.min(1, Number(p || 0.95)));
+  const rank = Math.max(0, Math.min(1, Number(p ?? 0.95)));
   const idx = Math.min(
     sorted.length - 1,
     Math.floor(rank * (sorted.length - 1)),
@@ -211,7 +211,7 @@ function worseSlippageBps({ side, expected, actual, leg }) {
 function worseSlippageInr({ side, expected, actual, qty, leg }) {
   const exp = Number(expected);
   const act = Number(actual);
-  const q = Number(qty || 0);
+  const q = Number(qty ?? 0);
   if (!(exp > 0) || !(act > 0) || !(q > 0)) return null;
 
   const bps = worseSlippageBps({ side, expected: exp, actual: act, leg });
@@ -268,16 +268,16 @@ class TradeManager {
 
     // Order rate limits + daily count
     this.orderLimiter = new OrderRateLimiter({
-      maxPerSec: Number(env.MAX_ORDERS_PER_SEC || 10),
-      maxPerMin: Number(env.MAX_ORDERS_PER_MIN || 200),
-      maxPerDay: Number(env.MAX_ORDERS_PER_DAY || 3000),
+      maxPerSec: Number(env.MAX_ORDERS_PER_SEC ?? 10),
+      maxPerMin: Number(env.MAX_ORDERS_PER_MIN ?? 200),
+      maxPerDay: Number(env.MAX_ORDERS_PER_DAY ?? 3000),
     });
     this.brokerOrderLimiter = new OrderRateLimiter({
       maxPerSec: Number(
-        env.BROKER_MAX_ORDERS_PER_SEC || env.MAX_ORDERS_PER_SEC || 10,
+        env.BROKER_MAX_ORDERS_PER_SEC ?? env.MAX_ORDERS_PER_SEC ?? 10,
       ),
       maxPerMin: Number(
-        env.BROKER_MAX_ORDERS_PER_MIN || env.MAX_ORDERS_PER_MIN || 200,
+        env.BROKER_MAX_ORDERS_PER_MIN ?? env.MAX_ORDERS_PER_MIN ?? 200,
       ),
     });
     this.ordersPlacedToday = 0;
@@ -368,7 +368,7 @@ class TradeManager {
     this._slippageStats = {
       entryBps: [],
       exitInr: [],
-      size: Math.max(5, Number(env.SLIPPAGE_FEEDBACK_SAMPLE || 25)),
+      size: Math.max(5, Number(env.SLIPPAGE_FEEDBACK_SAMPLE ?? 25)),
     };
 
     // Rolling circuit breakers (5-minute window)
@@ -411,15 +411,15 @@ class TradeManager {
       return { ok: false, reason: "COOLDOWN", until: this._cbCooldownUntil };
     }
     const caps = {
-      rejects: Number(env.CB_MAX_REJECTS_5M || 5),
-      spreadSpikes: Number(env.CB_MAX_SPREAD_SPIKES_5M || 8),
-      staleTicks: Number(env.CB_MAX_STALE_TICKS_5M || 12),
-      quoteGuard: Number(env.CB_MAX_QUOTE_GUARD_HITS_5M || 4),
+      rejects: Number(env.CB_MAX_REJECTS_5M ?? 5),
+      spreadSpikes: Number(env.CB_MAX_SPREAD_SPIKES_5M ?? 8),
+      staleTicks: Number(env.CB_MAX_STALE_TICKS_5M ?? 12),
+      quoteGuard: Number(env.CB_MAX_QUOTE_GUARD_HITS_5M ?? 4),
     };
     for (const [k, maxN] of Object.entries(caps)) {
       const cnt = this._cbEvents[k]?.length || 0;
       if (Number.isFinite(maxN) && maxN > 0 && cnt >= maxN) {
-        const cd = Math.max(30, Number(env.CB_COOLDOWN_SEC || 180));
+        const cd = Math.max(30, Number(env.CB_COOLDOWN_SEC ?? 180));
         this._cbCooldownUntil = now + cd * 1000;
         logger.error(
           { kind: k, count: cnt, max: maxN, cooldownSec: cd },
@@ -444,7 +444,7 @@ class TradeManager {
     const spreadBps = Number(liqMeta?.spreadBps ?? pick?.bps);
     const health = Number(liqMeta?.healthScore ?? pick?.health_score);
     const depth = Number(
-      (Number(liqMeta?.bidQty || 0) + Number(liqMeta?.askQty || 0)) / 2,
+      (Number(liqMeta?.bidQty ?? 0) + Number(liqMeta?.askQty ?? 0)) / 2,
     );
 
     if (!Number.isFinite(base)) return baseConfidence;
@@ -468,10 +468,10 @@ class TradeManager {
   }
 
   _normalizeQtyToLot(qty, instrument) {
-    const q = Math.floor(Number(qty || 0));
+    const q = Math.floor(Number(qty ?? 0));
     if (!Number.isFinite(q) || q <= 0) return 0;
 
-    const lot = Number(instrument?.lot_size || 1);
+    const lot = Number(instrument?.lot_size ?? 1);
     if (!Number.isFinite(lot) || lot <= 1) return q;
 
     const rounded = Math.floor(q / lot) * lot;
@@ -484,8 +484,8 @@ class TradeManager {
   }
 
   _resolveFreezeQty(instrument) {
-    const instFreeze = Number(instrument?.freeze_qty || 0);
-    const envFreeze = Number(env.FNO_FREEZE_QTY || 0);
+    const instFreeze = Number(instrument?.freeze_qty ?? 0);
+    const envFreeze = Number(env.FNO_FREEZE_QTY ?? 0);
     if (Number.isFinite(instFreeze) && instFreeze > 0) return instFreeze;
     if (Number.isFinite(envFreeze) && envFreeze > 0) return envFreeze;
     return 0;
@@ -514,7 +514,7 @@ class TradeManager {
   }
 
   _getMaxSpreadBps(instrument) {
-    const base = Number(env.MAX_SPREAD_BPS || 15);
+    const base = Number(env.MAX_SPREAD_BPS ?? 15);
     const ex = String(instrument?.exchange || "").toUpperCase();
     const seg = String(instrument?.segment || "").toUpperCase();
     const ts = String(instrument?.tradingsymbol || "").toUpperCase();
@@ -534,9 +534,9 @@ class TradeManager {
       isDeriv && !isOpt && (seg.includes("FUT") || ts.includes("FUT"));
 
     if (isOpt)
-      return Number(env.MAX_SPREAD_BPS_OPT || env.OPT_MAX_SPREAD_BPS || base);
-    if (isFut) return Number(env.MAX_SPREAD_BPS_FUT || base);
-    return Number(env.MAX_SPREAD_BPS_EQ || base);
+      return Number(env.MAX_SPREAD_BPS_OPT ?? env.OPT_MAX_SPREAD_BPS ?? base);
+    if (isFut) return Number(env.MAX_SPREAD_BPS_FUT ?? base);
+    return Number(env.MAX_SPREAD_BPS_EQ ?? base);
   }
 
   _getStopLossOrderType(instrument) {
@@ -556,13 +556,13 @@ class TradeManager {
   }
 
   _buildStopLossLimitPrice({ triggerPrice, exitSide, instrument }) {
-    const tick = Number(instrument?.tick_size || 0.05);
+    const tick = Number(instrument?.tick_size ?? 0.05);
     const trig = Number(triggerPrice);
 
-    const bps = Math.max(0, Number(env.SL_LIMIT_BUFFER_BPS || 50));
-    const ticks = Math.max(0, Number(env.SL_LIMIT_BUFFER_TICKS || 10));
-    const abs = Math.max(0, Number(env.SL_LIMIT_BUFFER_ABS || 0));
-    const maxBps = Math.max(0, Number(env.SL_LIMIT_BUFFER_MAX_BPS || 500));
+    const bps = Math.max(0, Number(env.SL_LIMIT_BUFFER_BPS ?? 50));
+    const ticks = Math.max(0, Number(env.SL_LIMIT_BUFFER_TICKS ?? 10));
+    const abs = Math.max(0, Number(env.SL_LIMIT_BUFFER_ABS ?? 0));
+    const maxBps = Math.max(0, Number(env.SL_LIMIT_BUFFER_MAX_BPS ?? 500));
 
     let buf = 0;
     if (Number.isFinite(trig) && trig > 0) buf = (trig * bps) / 10000;
@@ -596,13 +596,13 @@ class TradeManager {
 
   _computeRiskStopLoss({ entryPrice, side, instrument, qty, riskInr }) {
     const entry = Number(entryPrice);
-    const baseRisk = Number(riskInr || env.RISK_PER_TRADE_INR || 0);
+    const baseRisk = Number(riskInr ?? env.RISK_PER_TRADE_INR ?? 0);
     const riskQty = Number(
-      qty || instrument?.lot_size || instrument?.lotSize || 1,
+      qty ?? instrument?.lot_size ?? instrument?.lotSize ?? 1,
     );
     const safeQty = Number.isFinite(riskQty) && riskQty > 0 ? riskQty : 1;
     const riskPts = safeQty > 0 ? baseRisk / safeQty : 0;
-    const tick = Number(instrument?.tick_size || 0.05);
+    const tick = Number(instrument?.tick_size ?? 0.05);
     const raw =
       String(side || "BUY").toUpperCase() === "BUY"
         ? entry - riskPts
@@ -686,7 +686,7 @@ class TradeManager {
       const tradeId = String(trade?.tradeId || "");
       if (!tradeId) return { applied: false };
 
-      const qty = Number(trade?.qty || 0);
+      const qty = Number(trade?.qty ?? 0);
       if (!Number.isFinite(qty) || qty <= 0) return { applied: false };
 
       const targetOrderId = trade?.targetOrderId
@@ -881,7 +881,7 @@ class TradeManager {
 
   _startExitLoop() {
     if (this._exitLoopTimer) return;
-    const everyMs = Number(env.EXIT_LOOP_MS || 0);
+    const everyMs = Number(env.EXIT_LOOP_MS ?? 0);
     if (!Number.isFinite(everyMs) || everyMs <= 0) return;
 
     this._exitLoopTimer = setInterval(
@@ -955,9 +955,9 @@ class TradeManager {
 
   async _updateDailyPnlState({ realized, openPnl, total, prevState }) {
     const lossCap = Number(
-      (this.risk?.getLimits?.().dailyLossCapInr ?? env.DAILY_MAX_LOSS_INR) || 0,
+      (this.risk?.getLimits?.().dailyLossCapInr ?? env.DAILY_MAX_LOSS_INR) ?? 0,
     );
-    const profitGoal = Number(env.DAILY_PROFIT_GOAL_INR || 0);
+    const profitGoal = Number(env.DAILY_PROFIT_GOAL_INR ?? 0);
 
     let state = "RUNNING";
     let reason = null;
@@ -1030,7 +1030,7 @@ class TradeManager {
     if (dr?.kill) {
       this.risk.setKillSwitch(true);
     }
-    this.ordersPlacedToday = Number(dr?.ordersPlaced || 0);
+    this.ordersPlacedToday = Number(dr?.ordersPlaced ?? 0);
   }
 
   async _hydrateRiskStateFromDb() {
@@ -1051,8 +1051,8 @@ class TradeManager {
     if (!state) return;
     await upsertRiskState(todayKey(), {
       kill: !!state.kill,
-      consecutiveFailures: Number(state.consecutiveFailures || 0),
-      tradesToday: Number(state.tradesToday || 0),
+      consecutiveFailures: Number(state.consecutiveFailures ?? 0),
+      tradesToday: Number(state.tradesToday ?? 0),
       openPositions: Array.isArray(state.openPositions)
         ? state.openPositions
         : [],
@@ -1070,12 +1070,12 @@ class TradeManager {
   async _checkExposureLimits({ instrument, qty, entryPrice }) {
     const limits = this.risk?.getLimits ? this.risk.getLimits() : {};
     const maxPerSymbolExposureInr = Number(
-      limits?.maxPerSymbolExposureInr || 0,
+      limits?.maxPerSymbolExposureInr ?? 0,
     );
     const maxPortfolioExposureInr = Number(
-      limits?.maxPortfolioExposureInr || 0,
+      limits?.maxPortfolioExposureInr ?? 0,
     );
-    const maxLeverage = Number(limits?.maxLeverage || 0);
+    const maxLeverage = Number(limits?.maxLeverage ?? 0);
 
     if (
       maxPerSymbolExposureInr <= 0 &&
@@ -1090,14 +1090,14 @@ class TradeManager {
     let totalExposure = 0;
     for (const p of positions) {
       const key = p.tradingsymbol || String(p.instrument_token || "");
-      const exp = Number(p.exposureInr || 0);
+      const exp = Number(p.exposureInr ?? 0);
       if (Number.isFinite(exp) && exp > 0) {
         exposureBySymbol[key] = (exposureBySymbol[key] || 0) + exp;
         totalExposure += exp;
       }
     }
 
-    const newExposure = Math.abs(Number(entryPrice || 0) * Number(qty || 0));
+    const newExposure = Math.abs(Number(entryPrice ?? 0) * Number(qty ?? 0));
     const symbolKey =
       instrument?.tradingsymbol || String(instrument?.instrument_token || "");
     const nextSymbolExposure = (exposureBySymbol[symbolKey] || 0) + newExposure;
@@ -1136,7 +1136,7 @@ class TradeManager {
 
     if (maxLeverage > 0) {
       const equitySnap = await equityService.snapshot({ kite: this.kite });
-      const equity = Number(equitySnap?.snapshot?.equity || 0);
+      const equity = Number(equitySnap?.snapshot?.equity ?? 0);
       if (Number.isFinite(equity) && equity > 0) {
         const leverage = nextTotalExposure / equity;
         if (leverage > maxLeverage) {
@@ -1158,7 +1158,7 @@ class TradeManager {
   }
 
   async _recordOrdersPlaced(n = 1) {
-    const inc = Number(n || 0);
+    const inc = Number(n ?? 0);
     if (!Number.isFinite(inc) || inc <= 0) return;
     this.ordersPlacedToday += inc;
     await upsertDailyRisk(todayKey(), { ordersPlaced: this.ordersPlacedToday });
@@ -1239,7 +1239,7 @@ class TradeManager {
       this.risk.setOpenPosition(Number(t.instrument_token), {
         tradeId: t.tradeId,
         side: t.side,
-        qty: Number(t.qty || 0),
+        qty: Number(t.qty ?? 0),
       });
       if (t?.targetVirtual && !t?.targetOrderId) {
         this._registerVirtualTargetFromTrade(t);
@@ -1256,7 +1256,7 @@ class TradeManager {
     const now = Date.now();
     this.lastTickAtByToken.set(token, now);
 
-    const lossEveryMs = Number(env.DAILY_LOSS_CHECK_MS || 2000);
+    const lossEveryMs = Number(env.DAILY_LOSS_CHECK_MS ?? 2000);
     if (
       Number.isFinite(lossEveryMs) &&
       lossEveryMs > 0 &&
@@ -1266,7 +1266,7 @@ class TradeManager {
       this._checkDailyLoss().catch(() => {});
     }
 
-    const flattenEveryMs = Number(env.FORCE_FLATTEN_CHECK_MS || 1000);
+    const flattenEveryMs = Number(env.FORCE_FLATTEN_CHECK_MS ?? 1000);
     if (
       Number.isFinite(flattenEveryMs) &&
       flattenEveryMs > 0 &&
@@ -1407,7 +1407,7 @@ class TradeManager {
     const t = Number(triggerPrice);
     if (!Number.isFinite(l) || !Number.isFinite(t) || t <= 0) return false;
 
-    const bufBps = Number(env.SL_WATCHDOG_TRIGGER_BPS_BUFFER || 5);
+    const bufBps = Number(env.SL_WATCHDOG_TRIGGER_BPS_BUFFER ?? 5);
     const b = Number.isFinite(bufBps) ? bufBps : 0;
     const factor = b > 0 ? b / 10000 : 0;
 
@@ -1427,7 +1427,7 @@ class TradeManager {
       const st = this._slWatch.get(id);
       if (!st || st.triggeredAtMs) return;
 
-      st.triggeredAtMs = Number(nowMs || Date.now());
+      st.triggeredAtMs = Number(nowMs ?? Date.now());
       st.triggeredBy = String(source || "tick");
       this._slWatch.set(id, st);
       try {
@@ -1437,7 +1437,7 @@ class TradeManager {
         }).catch(() => {});
       } catch {}
 
-      const openSec = Number(env.SL_WATCHDOG_OPEN_SEC || 8);
+      const openSec = Number(env.SL_WATCHDOG_OPEN_SEC ?? 8);
       const ms = Math.max(1000, openSec * 1000);
       if (st.timer) clearTimeout(st.timer);
       st.timer = setTimeout(() => {
@@ -1538,7 +1538,7 @@ class TradeManager {
         orderType: orderType || "LIMIT",
         triggeredAtMs: existing.triggeredAtMs || 0,
         lastActionAtMs: existing.lastActionAtMs || 0,
-        retryCount: Number(existing.retryCount || 0),
+        retryCount: Number(existing.retryCount ?? 0),
         lastLtp: existing.lastLtp || null,
         timer: existing.timer || null,
       });
@@ -1550,7 +1550,7 @@ class TradeManager {
     const t = Number(targetPrice);
     if (!Number.isFinite(l) || !Number.isFinite(t) || t <= 0) return false;
 
-    const bufBps = Number(env.TARGET_WATCHDOG_TRIGGER_BPS_BUFFER || 2);
+    const bufBps = Number(env.TARGET_WATCHDOG_TRIGGER_BPS_BUFFER ?? 2);
     const b = Number.isFinite(bufBps) ? bufBps : 0;
     const factor = b > 0 ? b / 10000 : 0;
 
@@ -1582,7 +1582,7 @@ class TradeManager {
   _armTargetWatchTimer(tradeId, st, openSec) {
     if (!st) return;
     if (st.timer) clearTimeout(st.timer);
-    const ms = Math.max(500, Number(openSec || 2) * 1000);
+    const ms = Math.max(500, Number(openSec ?? 2) * 1000);
     st.timer = setTimeout(() => {
       this._targetWatchdogFire(tradeId, "timeout").catch(() => {});
     }, ms);
@@ -1609,7 +1609,7 @@ class TradeManager {
     if (requireTouch && !hit) return;
 
     if (!st.triggeredAtMs) {
-      st.triggeredAtMs = Number(nowMs || Date.now());
+      st.triggeredAtMs = Number(nowMs ?? Date.now());
       this._targetWatch.set(tradeId, st);
       try {
         updateTrade(tradeId, {
@@ -1617,7 +1617,7 @@ class TradeManager {
         }).catch(() => {});
       } catch {}
 
-      const openSec = Number(env.TARGET_WATCHDOG_OPEN_SEC || 2);
+      const openSec = Number(env.TARGET_WATCHDOG_OPEN_SEC ?? 2);
       this._armTargetWatchTimer(tradeId, st, openSec);
     }
   }
@@ -1637,7 +1637,7 @@ class TradeManager {
       const st = this._targetWatch.get(tradeId);
       if (!st) return;
 
-      const openSec = Number(env.TARGET_WATCHDOG_OPEN_SEC || 2);
+      const openSec = Number(env.TARGET_WATCHDOG_OPEN_SEC ?? 2);
       const nowMs = Date.now();
 
       if (st.triggeredAtMs) {
@@ -1674,7 +1674,7 @@ class TradeManager {
   }
 
   _buildEntryLadderPrices({ side, basePrice, tick }) {
-    const steps = Math.max(0, Number(env.ENTRY_LADDER_TICKS || 2));
+    const steps = Math.max(0, Number(env.ENTRY_LADDER_TICKS ?? 2));
     const dir = String(side || "BUY").toUpperCase() === "BUY" ? 1 : -1;
     const out = [];
     for (let i = 0; i <= steps; i++) {
@@ -1697,10 +1697,10 @@ class TradeManager {
     basePrice,
   }) {
     if (!Boolean(env.ENTRY_LADDER_ENABLED ?? true)) return;
-    const tick = Number(instrument?.tick_size || 0.05);
+    const tick = Number(instrument?.tick_size ?? 0.05);
     const delayMs = Math.max(
       100,
-      Number(env.ENTRY_LADDER_STEP_DELAY_MS || 350),
+      Number(env.ENTRY_LADDER_STEP_DELAY_MS ?? 350),
     );
     const ladder = this._buildEntryLadderPrices({ side, basePrice, tick });
     if (ladder.length <= 1) return;
@@ -1708,7 +1708,7 @@ class TradeManager {
     const startPx = Number(ladder[0]);
     const maxChaseBps = Math.max(
       0,
-      Number(env.ENTRY_LADDER_MAX_CHASE_BPS || 35),
+      Number(env.ENTRY_LADDER_MAX_CHASE_BPS ?? 35),
     );
 
     for (let i = 1; i < ladder.length; i++) {
@@ -1789,8 +1789,8 @@ class TradeManager {
       const minHealth = Number(env.OPT_HEALTH_SCORE_MIN ?? 45);
       const bid = Number(q?.depth?.buy?.[0]?.price);
       const ask = Number(q?.depth?.sell?.[0]?.price);
-      const bidQty = Number(q?.depth?.buy?.[0]?.quantity || 0);
-      const askQty = Number(q?.depth?.sell?.[0]?.quantity || 0);
+      const bidQty = Number(q?.depth?.buy?.[0]?.quantity ?? 0);
+      const askQty = Number(q?.depth?.sell?.[0]?.quantity ?? 0);
       const ltp = Number(q?.last_price);
 
       if (
@@ -1828,7 +1828,7 @@ class TradeManager {
         };
       }
 
-      const minDepthQty = Number(env.OPT_MIN_DEPTH_QTY || 0);
+      const minDepthQty = Number(env.OPT_MIN_DEPTH_QTY ?? 0);
       if (minDepthQty > 0) {
         const topDepth = Math.min(
           Number.isFinite(bidQty) ? bidQty : 0,
@@ -1844,7 +1844,7 @@ class TradeManager {
       }
 
       const quoteTsMs = this._parseQuoteTimeMs(q);
-      const freshnessMaxMs = Number(env.STALE_TICK_MS || 3000);
+      const freshnessMaxMs = Number(env.STALE_TICK_MS ?? 3000);
       const ageMs = quoteTsMs
         ? Date.now() - quoteTsMs
         : Number.POSITIVE_INFINITY;
@@ -1939,12 +1939,12 @@ class TradeManager {
         return;
       }
 
-      const retryCount = Number(st.retryCount || 0);
+      const retryCount = Number(st.retryCount ?? 0);
       const maxRetries = Math.max(
         0,
-        Number(env.TARGET_WATCHDOG_MODIFY_RETRIES || 2),
+        Number(env.TARGET_WATCHDOG_MODIFY_RETRIES ?? 2),
       );
-      const tick = Number(fresh.instrument?.tick_size || 0.05);
+      const tick = Number(fresh.instrument?.tick_size ?? 0.05);
 
       if (retryCount >= maxRetries) {
         logger.warn(
@@ -1959,8 +1959,8 @@ class TradeManager {
           cause,
         }).catch(() => {});
 
-        const filledQty = Number(order?.filled_quantity || 0);
-        const totalQty = Number(order?.quantity || fresh.qty || 0);
+        const filledQty = Number(order?.filled_quantity ?? 0);
+        const totalQty = Number(order?.quantity ?? fresh.qty ?? 0);
         const remainingQty = Math.max(0, totalQty - filledQty);
 
         if (remainingQty < 1) {
@@ -2038,7 +2038,7 @@ class TradeManager {
       const quote = await this._getBestBidAsk(fresh.instrument);
       const bid = Number(quote?.bid);
       const ask = Number(quote?.ask);
-      const ltp = Number(quote?.ltp || st.lastLtp || 0);
+      const ltp = Number(quote?.ltp ?? st.lastLtp ?? 0);
 
       let price = null;
       if (st.exitSide === "SELL") {
@@ -2062,7 +2062,7 @@ class TradeManager {
           { tradeId: id, targetOrderId, retryCount, cause },
           "[target_watchdog] unable to compute marketable price -> retry later",
         );
-        const openSec = Number(env.TARGET_WATCHDOG_RETRY_SEC || 1);
+        const openSec = Number(env.TARGET_WATCHDOG_RETRY_SEC ?? 1);
         st.triggeredAtMs = Date.now();
         this._armTargetWatchTimer(id, st, openSec);
         return;
@@ -2091,7 +2091,7 @@ class TradeManager {
         "[target_watchdog] target touched -> aggressive modify",
       );
 
-      const retrySec = Number(env.TARGET_WATCHDOG_RETRY_SEC || 1);
+      const retrySec = Number(env.TARGET_WATCHDOG_RETRY_SEC ?? 1);
       st.triggeredAtMs = Date.now();
       this._armTargetWatchTimer(id, st, retrySec);
     } catch (e) {
@@ -2147,7 +2147,7 @@ class TradeManager {
       if (Number(st.token) !== tok) continue;
       if (!this._virtualTargetIsHit(ltp, st.targetPrice, st.exitSide)) continue;
 
-      st.firedAtMs = Number(nowMs || Date.now());
+      st.firedAtMs = Number(nowMs ?? Date.now());
       this._virtualTargetWatch.set(tradeId, st);
       this._fireVirtualTarget(tradeId, st, ltp).catch((e) => {
         logger.error({ tradeId, e: e.message }, "[virtual_target] fire failed");
@@ -2182,9 +2182,9 @@ class TradeManager {
         const now = Date.now();
         const throttleMs = Math.max(
           500,
-          Number(env.VIRTUAL_TARGET_LTP_FETCH_THROTTLE_MS || 1500),
+          Number(env.VIRTUAL_TARGET_LTP_FETCH_THROTTLE_MS ?? 1500),
         );
-        const last = Number(this._lastLtpFetchAtByToken.get(token) || 0);
+        const last = Number(this._lastLtpFetchAtByToken.get(token) ?? 0);
         if (now - last < throttleMs) return;
         this._lastLtpFetchAtByToken.set(token, now);
 
@@ -2224,7 +2224,7 @@ class TradeManager {
 
     if (fresh?.targetOrderId) return;
 
-    const qty = Number(fresh.qty || 0);
+    const qty = Number(fresh.qty ?? 0);
     if (!Number.isFinite(qty) || qty <= 0) return;
 
     logger.warn(
@@ -2342,7 +2342,7 @@ class TradeManager {
       const st = this._slWatch.get(tradeId);
       if (!st) return;
 
-      const openSec = Number(env.SL_WATCHDOG_OPEN_SEC || 8);
+      const openSec = Number(env.SL_WATCHDOG_OPEN_SEC ?? 8);
       const nowMs = Date.now();
       const slStatus = String(trade?.slOrderStatus || "").toUpperCase();
 
@@ -2402,11 +2402,11 @@ class TradeManager {
 
     const attempts = Math.max(
       1,
-      Number(env.ENTRY_TIMEOUT_LATE_FILL_ATTEMPTS || 2),
+      Number(env.ENTRY_TIMEOUT_LATE_FILL_ATTEMPTS ?? 2),
     );
     const delayMs = Math.max(
       0,
-      Number(env.ENTRY_TIMEOUT_LATE_FILL_DELAY_MS || 400),
+      Number(env.ENTRY_TIMEOUT_LATE_FILL_DELAY_MS ?? 400),
     );
 
     let latest = null;
@@ -2442,7 +2442,7 @@ class TradeManager {
   async _isFlatStateLikelyExitInProgress(trade, byId = null) {
     const graceMs = Math.max(
       0,
-      Number(env.OCO_FLAT_GRACE_MS || env.OCO_POSITION_FLAT_GRACE_MS || 3000),
+      Number(env.OCO_FLAT_GRACE_MS ?? env.OCO_POSITION_FLAT_GRACE_MS ?? 3000),
     );
     const now = Date.now();
     const inGraceByTimestamp =
@@ -2526,7 +2526,7 @@ class TradeManager {
 
     const timeoutMs = Math.max(
       1000,
-      Number(env.PANIC_EXIT_FILL_TIMEOUT_MS || 2500),
+      Number(env.PANIC_EXIT_FILL_TIMEOUT_MS ?? 2500),
     );
     this._clearTimeStopFallback(id);
 
@@ -2610,7 +2610,7 @@ class TradeManager {
     const instrument = fresh.instrument;
     const side = String(fresh?.side || "").toUpperCase();
     const exitSide = side === "SELL" ? "BUY" : "SELL";
-    const qty = Math.abs(Number(fresh?.qty || 0));
+    const qty = Math.abs(Number(fresh?.qty ?? 0));
     if (!Number.isFinite(qty) || qty < 1) {
       await this._panicExit(fresh, reason, { timeStop: true, preferLimit: true });
       return;
@@ -2625,8 +2625,8 @@ class TradeManager {
         reason,
         marketError: "TIME_STOP_SMART_LIMIT",
         product: this._activeTradeProduct(fresh),
-        bufferTicks: Number(env.TIME_STOP_EXIT_LIMIT_BUFFER_TICKS || 2),
-        maxBps: Number(env.TIME_STOP_EXIT_LIMIT_MAX_BPS || 200),
+        bufferTicks: Number(env.TIME_STOP_EXIT_LIMIT_BUFFER_TICKS ?? 2),
+        maxBps: Number(env.TIME_STOP_EXIT_LIMIT_MAX_BPS ?? 200),
         orderTag: "TIME_STOP_EXIT",
       });
 
@@ -2670,7 +2670,7 @@ class TradeManager {
 
     const timeoutMs = Math.max(
       0,
-      Number(env.PANIC_EXIT_FILL_TIMEOUT_MS || 2500),
+      Number(env.PANIC_EXIT_FILL_TIMEOUT_MS ?? 2500),
     );
     if (timeoutMs <= 0) return;
 
@@ -2724,8 +2724,8 @@ class TradeManager {
       return;
     }
 
-    const retryCount = Number(this._panicExitRetryCount.get(id) || 0);
-    const maxRetries = Math.max(0, Number(env.PANIC_EXIT_MAX_RETRIES || 1));
+    const retryCount = Number(this._panicExitRetryCount.get(id) ?? 0);
+    const maxRetries = Math.max(0, Number(env.PANIC_EXIT_MAX_RETRIES ?? 1));
 
     if (retryCount >= maxRetries) {
       logger.warn(
@@ -2775,8 +2775,8 @@ class TradeManager {
       }
 
       const order = after?.order || latest?.order || {};
-      const filledQty = Number(order?.filled_quantity || 0);
-      const totalQty = Number(order?.quantity || qty || 0);
+      const filledQty = Number(order?.filled_quantity ?? 0);
+      const totalQty = Number(order?.quantity ?? qty ?? 0);
       const remainingQty = Math.max(0, totalQty - filledQty);
 
       if (remainingQty < 1) {
@@ -2787,7 +2787,7 @@ class TradeManager {
 
       const fresh = (await getTrade(id)) || {};
       const inst = instrument || fresh.instrument;
-      const side = exitSide || (Number(fresh.qty || 0) >= 0 ? "SELL" : "BUY");
+      const side = exitSide || (Number(fresh.qty ?? 0) >= 0 ? "SELL" : "BUY");
 
       const fb = await this._panicExitFallbackLimit({
         tradeId: id,
@@ -2960,8 +2960,8 @@ class TradeManager {
   async _getLtp(token, instrument) {
     const tok = Number(token);
     const cached = this.lastPriceByToken.get(tok);
-    const staleMs = Number(env.STALE_TICK_MS || 0);
-    const lastTickAt = Number(this.lastTickAtByToken.get(tok) || 0);
+    const staleMs = Number(env.STALE_TICK_MS ?? 0);
+    const lastTickAt = Number(this.lastTickAtByToken.get(tok) ?? 0);
     const isStale =
       Number.isFinite(staleMs) &&
       staleMs > 0 &&
@@ -3016,7 +3016,7 @@ class TradeManager {
       return;
 
     const pnlToken = Number(
-      trade?.option_meta?.instrument_token || trade.instrument_token,
+      trade?.option_meta?.instrument_token ?? trade.instrument_token,
     );
     if (!Number.isFinite(pnlToken) || pnlToken <= 0) return;
 
@@ -3031,7 +3031,7 @@ class TradeManager {
       String(env.DAILY_LOSS_ALLOW_LTP_FETCH || "true") === "true";
     if (!Number.isFinite(ltp) && allowFetch && Number.isFinite(pnlToken)) {
       const now = Date.now();
-      const last = Number(this._lastLtpFetchAtByToken.get(pnlToken) || 0);
+      const last = Number(this._lastLtpFetchAtByToken.get(pnlToken) ?? 0);
       if (now - last >= 1500) {
         this._lastLtpFetchAtByToken.set(pnlToken, now);
         try {
@@ -3045,12 +3045,12 @@ class TradeManager {
 
     if (!Number.isFinite(ltp)) return;
 
-    let effectiveQty = Number(trade.qty || 0);
+    let effectiveQty = Number(trade.qty ?? 0);
     let entryPrice = Number(
-      trade.entryPrice ||
-        trade.expectedEntryPrice ||
-        trade.quoteAtEntry?.ltp ||
-        trade.candle?.close ||
+      trade.entryPrice ??
+        trade.expectedEntryPrice ??
+        trade.quoteAtEntry?.ltp ??
+        trade.candle?.close ??
         0,
     );
     let side = trade.side;
@@ -3083,11 +3083,11 @@ class TradeManager {
       ltp,
     );
     const day = await getDailyRisk(todayKey());
-    const realized = Number(day?.realizedPnl || 0);
+    const realized = Number(day?.realizedPnl ?? 0);
     const total = realized + openPnl;
-    const maxPosVal = Number(env.MAX_POSITION_VALUE_INR || 0);
+    const maxPosVal = Number(env.MAX_POSITION_VALUE_INR ?? 0);
     if (Number.isFinite(maxPosVal) && maxPosVal > 0) {
-      const maxAbs = Math.abs(Number(total || 0));
+      const maxAbs = Math.abs(Number(total ?? 0));
       if (Number.isFinite(maxAbs) && maxAbs > maxPosVal * 2) {
         logger.warn(
           { total, realized, openPnl, maxPosVal },
@@ -3107,7 +3107,7 @@ class TradeManager {
 
     if (state === "HARD_STOP") {
       const lossCap = Number(
-        (this.risk?.getLimits?.().dailyLossCapInr ?? env.DAILY_MAX_LOSS_INR) ||
+        (this.risk?.getLimits?.().dailyLossCapInr ?? env.DAILY_MAX_LOSS_INR) ??
           1000,
       );
       logger.error(
@@ -3201,7 +3201,7 @@ class TradeManager {
       return;
     }
 
-    const qty = Math.abs(Number(trade.qty || 0));
+    const qty = Math.abs(Number(trade.qty ?? 0));
     if (!Number.isFinite(qty) || qty < 1) return;
 
     const side = String(trade.side || "").toUpperCase();
@@ -3303,7 +3303,7 @@ class TradeManager {
     const enabled = String(env.RECONCILE_ON_ORDER_UPDATE || "true") === "true";
     if (!enabled) return;
 
-    const debounceMs = Math.max(250, Number(env.RECONCILE_DEBOUNCE_MS || 1500));
+    const debounceMs = Math.max(250, Number(env.RECONCILE_DEBOUNCE_MS ?? 1500));
 
     if (this._reconcileTimer) return;
 
@@ -3339,7 +3339,7 @@ class TradeManager {
     );
 
     for (const [token, qtyRaw] of posQtyByToken.entries()) {
-      const qty = Number(qtyRaw || 0);
+      const qty = Number(qtyRaw ?? 0);
       if (!Number.isFinite(qty) || qty === 0) continue;
       const trade = activeByToken.get(Number(token));
       this.risk.setOpenPosition(Number(token), {
@@ -3356,20 +3356,20 @@ class TradeManager {
   }
 
   async _monitorPortfolioRisk(reason = "tick") {
-    const everyMs = Math.max(1000, Number(env.PORTFOLIO_RISK_CHECK_MS || 5000));
+    const everyMs = Math.max(1000, Number(env.PORTFOLIO_RISK_CHECK_MS ?? 5000));
     if (Date.now() - this._lastPortfolioRiskCheckAt < everyMs) return;
     this._lastPortfolioRiskCheckAt = Date.now();
 
     try {
       const limits = this.risk?.getLimits ? this.risk.getLimits() : {};
       const maxPerSymbolExposureInr = Number(
-        limits?.maxPerSymbolExposureInr || 0,
+        limits?.maxPerSymbolExposureInr ?? 0,
       );
       const maxPortfolioExposureInr = Number(
-        limits?.maxPortfolioExposureInr || 0,
+        limits?.maxPortfolioExposureInr ?? 0,
       );
-      const maxLeverage = Number(limits?.maxLeverage || 0);
-      const maxMarginUtil = Number(limits?.maxMarginUtilization || 0);
+      const maxLeverage = Number(limits?.maxLeverage ?? 0);
+      const maxMarginUtil = Number(limits?.maxMarginUtilization ?? 0);
 
       if (
         maxPerSymbolExposureInr <= 0 &&
@@ -3385,7 +3385,7 @@ class TradeManager {
       let totalExposure = 0;
       for (const p of positions) {
         const key = p.tradingsymbol || String(p.instrument_token || "");
-        const exp = Number(p.exposureInr || 0);
+        const exp = Number(p.exposureInr ?? 0);
         if (Number.isFinite(exp) && exp > 0) {
           exposureBySymbol[key] = (exposureBySymbol[key] || 0) + exp;
           totalExposure += exp;
@@ -3393,9 +3393,9 @@ class TradeManager {
       }
 
       const equitySnap = await equityService.snapshot({ kite: this.kite });
-      const equity = Number(equitySnap?.snapshot?.equity || 0);
-      const utilized = Number(equitySnap?.snapshot?.utilized || 0);
-      const available = Number(equitySnap?.snapshot?.available || 0);
+      const equity = Number(equitySnap?.snapshot?.equity ?? 0);
+      const utilized = Number(equitySnap?.snapshot?.utilized ?? 0);
+      const available = Number(equitySnap?.snapshot?.available ?? 0);
       const utilization =
         utilized > 0 && available >= 0
           ? utilized / (utilized + available)
@@ -3557,8 +3557,8 @@ class TradeManager {
       this._slippageStats.exitInr.reduce((a, b) => a + b, 0) /
       (this._slippageStats.exitInr.length || 1);
 
-    const maxEntryBps = Number(env.SLIPPAGE_FEEDBACK_MAX_ENTRY_BPS || 0);
-    const maxExitInr = Number(env.SLIPPAGE_FEEDBACK_MAX_EXIT_INR || 0);
+    const maxEntryBps = Number(env.SLIPPAGE_FEEDBACK_MAX_ENTRY_BPS ?? 0);
+    const maxExitInr = Number(env.SLIPPAGE_FEEDBACK_MAX_EXIT_INR ?? 0);
 
     if (
       (maxEntryBps > 0 && avgEntry > maxEntryBps) ||
@@ -3566,7 +3566,7 @@ class TradeManager {
     ) {
       const cooldownMin = Math.max(
         1,
-        Number(env.SLIPPAGE_COOLDOWN_MINUTES || 15),
+        Number(env.SLIPPAGE_COOLDOWN_MINUTES ?? 15),
       );
       this._slippageCooldownUntil = Date.now() + cooldownMin * 60 * 1000;
       const kill =
@@ -3606,12 +3606,12 @@ class TradeManager {
 
     const maxLosses = Math.max(
       1,
-      Number(env.STRATEGY_MAX_CONSECUTIVE_LOSSES || 3),
+      Number(env.STRATEGY_MAX_CONSECUTIVE_LOSSES ?? 3),
     );
     if (pnl < 0 && next >= maxLosses) {
       const cooldownMin = Math.max(
         1,
-        Number(env.STRATEGY_COOLDOWN_MINUTES || 20),
+        Number(env.STRATEGY_COOLDOWN_MINUTES ?? 20),
       );
       const until = Date.now() + cooldownMin * 60 * 1000;
       this._strategyCooldownUntil.set(strategyId, until);
@@ -3656,10 +3656,10 @@ class TradeManager {
   }
 
   async _safePlaceOrder(variety, params, { purpose, tradeId } = {}) {
-    const maxAttempts = Math.max(1, Number(env.ORDER_PLACE_RETRY_MAX || 1));
+    const maxAttempts = Math.max(1, Number(env.ORDER_PLACE_RETRY_MAX ?? 1));
     const backoffMs = Math.max(
       0,
-      Number(env.ORDER_PLACE_RETRY_BACKOFF_MS || 250),
+      Number(env.ORDER_PLACE_RETRY_BACKOFF_MS ?? 250),
     );
 
     const baseParams = { ...params };
@@ -3688,7 +3688,7 @@ class TradeManager {
           `Broker rate limit hit (${brokerRate.reason}). Refusing to place order.`,
         );
       }
-      if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY || 3000)) {
+      if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY ?? 3000)) {
         this.risk.setKillSwitch(true);
         await upsertDailyRisk(todayKey(), {
           kill: true,
@@ -3759,10 +3759,10 @@ class TradeManager {
     const reason = detectCircuitBreakerReason(msg);
     if (!reason) return;
 
-    const token = Number(params?.instrument_token || 0);
+    const token = Number(params?.instrument_token ?? 0);
     const cooldownMin = Math.max(
       1,
-      Number(env.CIRCUIT_BREAKER_COOLDOWN_MINUTES || 5),
+      Number(env.CIRCUIT_BREAKER_COOLDOWN_MINUTES ?? 5),
     );
     if (Number.isFinite(token) && token > 0) {
       this.risk.setCooldown(token, cooldownMin * 60, reason.code);
@@ -3783,14 +3783,14 @@ class TradeManager {
     if (!reason) return;
 
     const token = Number(
-      trade?.instrument_token ||
-        order?.instrument_token ||
-        order?.instrument_token ||
+      trade?.instrument_token ??
+        order?.instrument_token ??
+        order?.instrument_token ??
         0,
     );
     const cooldownMin = Math.max(
       1,
-      Number(env.CIRCUIT_BREAKER_COOLDOWN_MINUTES || 5),
+      Number(env.CIRCUIT_BREAKER_COOLDOWN_MINUTES ?? 5),
     );
     if (Number.isFinite(token) && token > 0) {
       this.risk.setCooldown(token, cooldownMin * 60, reason.code);
@@ -3836,7 +3836,7 @@ class TradeManager {
     }
 
     // ✅ enforce daily limit for cancel as well
-    if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY || 3000)) {
+    if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY ?? 3000)) {
       this.risk.setKillSwitch(true);
       await upsertDailyRisk(todayKey(), {
         kill: true,
@@ -3893,8 +3893,8 @@ class TradeManager {
       };
     }
 
-    const cooldownMs = Math.max(0, Number(minIntervalMs || 0));
-    const lastModifyAt = Number(this._lastModifyAttemptAtByOrder.get(oid) || 0);
+    const cooldownMs = Math.max(0, Number(minIntervalMs ?? 0));
+    const lastModifyAt = Number(this._lastModifyAttemptAtByOrder.get(oid) ?? 0);
     if (cooldownMs > 0 && now - lastModifyAt < cooldownMs) {
       logger.info(
         {
@@ -3911,7 +3911,7 @@ class TradeManager {
 
     const currentOrder = this._lastOrdersById.get(oid);
     const nextPatch = { ...(patch || {}) };
-    const tick = Math.max(0.000001, Number(tickSize || 0.05));
+    const tick = Math.max(0.000001, Number(tickSize ?? 0.05));
     const hasMeaningfulChange = Object.entries(nextPatch).some(([k, v]) => {
       const cur = Number(currentOrder?.[k]);
       const nxt = Number(v);
@@ -3943,7 +3943,7 @@ class TradeManager {
       }
 
       // ✅ enforce daily limit for modify as well
-      if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY || 3000)) {
+      if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY ?? 3000)) {
         this.risk.setKillSwitch(true);
         await upsertDailyRisk(todayKey(), {
           kill: true,
@@ -3987,23 +3987,23 @@ class TradeManager {
       ) {
         try {
           retry.attempted = true;
-          const token = Number(retry?.token || 0);
+          const token = Number(retry?.token ?? 0);
           const instrument = retry?.instrument || null;
           const side = String(retry?.side || "").toUpperCase();
           const slType = String(retry?.slType || "").toUpperCase();
           const exitSide =
             String(retry?.exitSide || "").toUpperCase() ||
             (side === "BUY" ? "SELL" : "BUY");
-          const currentStopLoss = Number(retry?.currentStopLoss || 0);
+          const currentStopLoss = Number(retry?.currentStopLoss ?? 0);
 
           const freshLtp = await this._getLtp(token, instrument);
-          const tickSize = Number(instrument?.tick_size || 0.05);
-          const bufferTicks = Number(env.DYN_SL_RETRY_BUFFER_TICKS || 2);
+          const tickSize = Number(instrument?.tick_size ?? 0.05);
+          const bufferTicks = Number(env.DYN_SL_RETRY_BUFFER_TICKS ?? 2);
           const buffer =
             Math.max(1, Number.isFinite(bufferTicks) ? bufferTicks : 2) *
             tickSize;
 
-          let nextStop = Number(patch.trigger_price || 0);
+          let nextStop = Number(patch.trigger_price ?? 0);
           if (Number.isFinite(freshLtp) && freshLtp > 0) {
             if (side === "BUY") {
               const cap = freshLtp - buffer;
@@ -4066,7 +4066,7 @@ class TradeManager {
       const now = Date.now();
       const lookbackMs = Math.max(
         1000,
-        Number(env.ORDER_DEDUP_LOOKBACK_SEC || 120) * 1000,
+        Number(env.ORDER_DEDUP_LOOKBACK_SEC ?? 120) * 1000,
       );
 
       const want = normalizeOrderShapeForMatch(params);
@@ -4092,21 +4092,21 @@ class TradeManager {
   async _replayOrphanUpdates(orderId, opts = {}) {
     const oid = String(orderId || "");
     if (!oid) return;
-    const attempt = Number(opts.attempt || 0);
+    const attempt = Number(opts.attempt ?? 0);
     const maxAttempts = Math.max(
       1,
-      Number(env.ORPHAN_REPLAY_MAX_ATTEMPTS || 4),
+      Number(env.ORPHAN_REPLAY_MAX_ATTEMPTS ?? 4),
     );
-    const baseDelayMs = Math.max(0, Number(env.ORPHAN_REPLAY_DELAY_MS || 250));
+    const baseDelayMs = Math.max(0, Number(env.ORPHAN_REPLAY_DELAY_MS ?? 250));
     const backoffFactor = Math.max(
       1,
-      Number(env.ORPHAN_REPLAY_BACKOFF_FACTOR || 2),
+      Number(env.ORPHAN_REPLAY_BACKOFF_FACTOR ?? 2),
     );
     const backoffMaxMs = Math.max(
       baseDelayMs,
-      Number(env.ORPHAN_REPLAY_BACKOFF_MAX_MS || 10_000),
+      Number(env.ORPHAN_REPLAY_BACKOFF_MAX_MS ?? 10_000),
     );
-    const jitterPct = Math.max(0, Number(env.ORPHAN_REPLAY_JITTER_PCT || 0.15));
+    const jitterPct = Math.max(0, Number(env.ORPHAN_REPLAY_JITTER_PCT ?? 0.15));
 
     try {
       const linkCheck = await findTradeByOrder(oid);
@@ -4146,7 +4146,7 @@ class TradeManager {
                   backoffMaxMs,
                 },
               });
-              this._orphanReplayStats.deadLettered += Number(moved?.moved || 0);
+              this._orphanReplayStats.deadLettered += Number(moved?.moved ?? 0);
               this._orphanReplayStats.lastDeadLetterAt = Date.now();
               logger.warn(
                 {
@@ -4206,14 +4206,14 @@ class TradeManager {
     const symbol = String(order?.tradingsymbol || "").toUpperCase();
     const txnType = String(order?.transaction_type || "").toUpperCase();
     const qty = Math.abs(
-      Number(order?.filled_quantity || order?.quantity || 0),
+      Number(order?.filled_quantity ?? order?.quantity ?? 0),
     );
     if (!symbol || !txnType || !(qty > 0)) return null;
 
     const ms = parseOrderTimestampMs(order) || Date.now();
     const winMs = Math.max(
       15_000,
-      Number(env.RECONCILE_BROKER_SQOFF_MATCH_WINDOW_SEC || 300) * 1000,
+      Number(env.RECONCILE_BROKER_SQOFF_MATCH_WINDOW_SEC ?? 300) * 1000,
     );
 
     const actives = await getActiveTrades();
@@ -4222,7 +4222,7 @@ class TradeManager {
 
     for (const t of actives || []) {
       const tSymbol = String(t?.instrument?.tradingsymbol || "").toUpperCase();
-      const tQty = Math.abs(Number(t?.qty || 0));
+      const tQty = Math.abs(Number(t?.qty ?? 0));
       const tExitSide =
         String(t?.side || "").toUpperCase() === "BUY" ? "SELL" : "BUY";
       const tStatus = String(t?.status || "").toUpperCase();
@@ -4260,7 +4260,7 @@ class TradeManager {
 
     const tradeId = String(trade.tradeId);
     const exitPrice = Number(
-      order?.average_price || order?.price || trade?.exitPrice || 0,
+      order?.average_price ?? order?.price ?? trade?.exitPrice ?? 0,
     );
     await updateTrade(tradeId, {
       status: STATUS.CLOSED,
@@ -4366,7 +4366,7 @@ class TradeManager {
       } catch {}
 
       // Use live net qty if possible to avoid over-exiting (which can flip the position)
-      let netQty = Number(fresh.qty || 0);
+      let netQty = Number(fresh.qty ?? 0);
       try {
         const positions = await this.kite.getPositions();
         const net = positions?.net || positions?.day || [];
@@ -4536,9 +4536,9 @@ class TradeManager {
       const key = `${String(ex).toUpperCase()}:${String(sym).toUpperCase()}`;
       const resp = await this.kite.getQuote([key]);
       const q = resp?.[key] || {};
-      const bid = Number(q?.depth?.buy?.[0]?.price || 0);
-      const ask = Number(q?.depth?.sell?.[0]?.price || 0);
-      const ltp = Number(q?.last_price || 0);
+      const bid = Number(q?.depth?.buy?.[0]?.price ?? 0);
+      const ask = Number(q?.depth?.sell?.[0]?.price ?? 0);
+      const ltp = Number(q?.last_price ?? 0);
       const ref = Number.isFinite(ltp) && ltp > 0 ? ltp : exitSide === "SELL" ? bid : ask;
       const spreadBps =
         Number.isFinite(ref) &&
@@ -4551,7 +4551,7 @@ class TradeManager {
           : Infinity;
       const maxSpreadBps = Math.max(
         1,
-        Number(env.TIME_STOP_EXIT_MARKET_MAX_SPREAD_BPS || 45),
+        Number(env.TIME_STOP_EXIT_MARKET_MAX_SPREAD_BPS ?? 45),
       );
       const ok = spreadBps <= maxSpreadBps;
       if (!ok) {
@@ -4590,16 +4590,16 @@ class TradeManager {
     const sym = instrument?.tradingsymbol;
     const key = `${String(ex).toUpperCase()}:${String(sym).toUpperCase()}`;
 
-    const tick = Number(instrument?.tick_size || 0.05);
+    const tick = Number(instrument?.tick_size ?? 0.05);
     const bufTicks = Math.max(
       1,
       Number(
-        bufferTicks == null ? env.PANIC_EXIT_LIMIT_BUFFER_TICKS || 2 : bufferTicks,
+        bufferTicks == null ? env.PANIC_EXIT_LIMIT_BUFFER_TICKS ?? 2 : bufferTicks,
       ),
     );
     const maxBpsCap = Math.max(
       50,
-      Number(maxBps == null ? env.PANIC_EXIT_LIMIT_MAX_BPS || 250 : maxBps),
+      Number(maxBps == null ? env.PANIC_EXIT_LIMIT_MAX_BPS ?? 250 : maxBps),
     );
 
     const resp = await this.kite.getQuote([key]);
@@ -4761,7 +4761,7 @@ class TradeManager {
           const tradeId = crypto.randomUUID();
           const side = qty > 0 ? "BUY" : "SELL";
           const avg = Number(
-            p?.average_price || p?.buy_price || p?.sell_price || 0,
+            p?.average_price ?? p?.buy_price ?? p?.sell_price ?? 0,
           );
 
           this.recoveredPosition = {
@@ -4792,7 +4792,7 @@ class TradeManager {
           this.activeTradeId = tradeId;
 
           const absQty = Math.abs(qty);
-          const avgPrice = Number(avg || 0);
+          const avgPrice = Number(avg ?? 0);
           const riskStop =
             Number.isFinite(avgPrice) && avgPrice > 0
               ? this._computeRiskStopLoss({
@@ -4800,7 +4800,7 @@ class TradeManager {
                   side,
                   instrument,
                   qty: absQty,
-                  riskInr: Number(env.RISK_PER_TRADE_INR || 0),
+                  riskInr: Number(env.RISK_PER_TRADE_INR ?? 0),
                 })
               : null;
           const stopLoss = riskStop?.stopLoss || null;
@@ -4937,7 +4937,7 @@ class TradeManager {
     try {
       if (!this.kite || typeof this.kite.getPositions !== "function") return;
 
-      const winSec = Number(env.OCO_RECENT_CLOSED_WINDOW_SEC || 120);
+      const winSec = Number(env.OCO_RECENT_CLOSED_WINDOW_SEC ?? 120);
       const now = Date.now();
 
       const watchTradeIds = [];
@@ -4946,7 +4946,7 @@ class TradeManager {
         this.lastClosedTradeId &&
         this.lastClosedTradeId !== this.activeTradeId &&
         winSec > 0 &&
-        now - Number(this.lastClosedAt || 0) <= winSec * 1000
+        now - Number(this.lastClosedAt ?? 0) <= winSec * 1000
       ) {
         watchTradeIds.push(this.lastClosedTradeId);
       }
@@ -4978,8 +4978,8 @@ class TradeManager {
         const trade = await getTrade(tradeId);
         if (!trade) continue;
         const token = Number(trade.instrument_token);
-        const netQty = Number(posQtyByToken.get(token) || 0);
-        const expectedQty = Math.abs(Number(trade.qty || 0));
+        const netQty = Number(posQtyByToken.get(token) ?? 0);
+        const expectedQty = Math.abs(Number(trade.qty ?? 0));
         const expectedSign =
           String(trade.side || "").toUpperCase() === "SELL" ? -1 : 1;
 
@@ -5127,7 +5127,7 @@ class TradeManager {
     const tradeId = trade.tradeId;
     const token = Number(trade.instrument_token);
     const hasPosInfo = posQtyByToken instanceof Map;
-    const netQty = hasPosInfo ? Number(posQtyByToken.get(token) || 0) : null;
+    const netQty = hasPosInfo ? Number(posQtyByToken.get(token) ?? 0) : null;
 
     await this._virtualTargetHeartbeat(trade, netQty, "reconcile");
     const optEnforced = await this._enforceOptVirtualTargetMode(
@@ -5234,7 +5234,7 @@ class TradeManager {
         if (ps === "COMPLETE") {
           this._clearPanicExitWatch(tradeId);
           this._panicExitRetryCount.delete(String(tradeId));
-          const exitPrice = Number(panic.average_price || panic.price || 0);
+          const exitPrice = Number(panic.average_price ?? panic.price ?? 0);
           await updateTrade(tradeId, {
             status: STATUS.CLOSED,
             exitPrice: exitPrice > 0 ? exitPrice : trade.exitPrice,
@@ -5318,16 +5318,16 @@ class TradeManager {
       // If ENTRY is partially filled (or OPEN with partial fills) while we were offline,
       // place/adjust protective exits for the filled quantity.
       const es = String(entryStatus || "").toUpperCase();
-      const filledNow = Number(entry?.filled_quantity || 0);
+      const filledNow = Number(entry?.filled_quantity ?? 0);
       if ((es === "PARTIAL" || es === "OPEN") && filledNow > 0) {
         const avgNow = Number(
-          entry?.average_price || trade.entryPrice || trade.candle?.close,
+          entry?.average_price ?? trade.entryPrice ?? trade.candle?.close,
         );
 
         const missingExits =
           !trade.slOrderId ||
           (this._isTargetRequired() && !trade.targetOrderId);
-        const qtyChanged = filledNow !== Number(trade.qty || 0);
+        const qtyChanged = filledNow !== Number(trade.qty ?? 0);
 
         if (qtyChanged || missingExits) {
           await updateTrade(tradeId, {
@@ -5358,9 +5358,9 @@ class TradeManager {
       trade.status !== STATUS.LIVE
     ) {
       const avg = Number(
-        entry.average_price || trade.entryPrice || trade.candle?.close,
+        entry.average_price ?? trade.entryPrice ?? trade.candle?.close,
       );
-      const filledQty = Number(entry.filled_quantity || trade.qty);
+      const filledQty = Number(entry.filled_quantity ?? trade.qty);
       await updateTrade(tradeId, {
         status: STATUS.ENTRY_FILLED,
         entryPrice: avg,
@@ -5454,7 +5454,7 @@ class TradeManager {
     const iv = kind === "modify" ? st.modifyIntervalsMs : st.evalIntervalsMs;
     const lastKey = kind === "modify" ? "lastModifyAt" : "lastEvalAt";
 
-    const prev = Number(st[lastKey] || 0);
+    const prev = Number(st[lastKey] ?? 0);
     if (prev > 0 && ts >= prev) iv.push(ts - prev);
     st[lastKey] = ts;
 
@@ -5539,18 +5539,18 @@ class TradeManager {
       return;
     }
 
-    const minMs = Number(env.DYNAMIC_EXIT_MIN_INTERVAL_MS || 5000);
-    const minModifyMs = Number(env.DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS || 1200);
+    const minMs = Number(env.DYNAMIC_EXIT_MIN_INTERVAL_MS ?? 5000);
+    const minModifyMs = Number(env.DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS ?? 1200);
     const now = Date.now();
-    const lastEval = Number(this._dynExitLastEvalAt.get(tradeId) || 0);
-    const lastModify = Number(this._dynExitLastAt.get(tradeId) || 0);
+    const lastEval = Number(this._dynExitLastEvalAt.get(tradeId) ?? 0);
+    const lastModify = Number(this._dynExitLastAt.get(tradeId) ?? 0);
     if (now - lastEval < minMs) {
       this._dynExitCadenceStats.skippedEvalThrottle += 1;
       return;
     }
 
     const backoffUntil = Number(
-      this._dynExitFailBackoffUntil.get(tradeId) || 0,
+      this._dynExitFailBackoffUntil.get(tradeId) ?? 0,
     );
     if (Number.isFinite(backoffUntil) && now < backoffUntil) {
       this._dynExitCadenceStats.skippedBackoff += 1;
@@ -5570,7 +5570,7 @@ class TradeManager {
       if (!Number.isFinite(ltp) || ltp <= 0) return;
 
       const intervalMin = Number(
-        trade.intervalMin || trade.candle?.interval_min || 1,
+        trade.intervalMin ?? trade.candle?.interval_min ?? 1,
       );
       let candles = [];
       try {
@@ -5580,7 +5580,7 @@ class TradeManager {
       }
       // For OPT trades we may not have full candle history immediately; exit model can fall back.
       let underlyingLtp;
-      const uTok = Number(trade.underlying_token || 0);
+      const uTok = Number(trade.underlying_token ?? 0);
       if (Number.isFinite(uTok) && uTok > 0 && uTok !== token) {
         const cachedU = this.lastPriceByToken.get(uTok);
         if (Number.isFinite(cachedU)) underlyingLtp = cachedU;
@@ -5589,7 +5589,7 @@ class TradeManager {
           String(env.OPT_DYN_EXIT_ALLOW_UNDERLYING_LTP_FETCH || "false") ===
           "true";
         if (!Number.isFinite(underlyingLtp) && allowFetch) {
-          const lastFetch = Number(this._lastLtpFetchAtByToken.get(uTok) || 0);
+          const lastFetch = Number(this._lastLtpFetchAtByToken.get(uTok) ?? 0);
           if (now - lastFetch >= 2500) {
             this._lastLtpFetchAtByToken.set(uTok, now);
             try {
@@ -5605,9 +5605,9 @@ class TradeManager {
       if (timeStopLatched && !trade?.panicExitOrderId) {
         const escCooldownMs = Math.max(
           500,
-          Number(env.TIME_STOP_LATCH_ESCALATE_COOLDOWN_MS || 8000),
+          Number(env.TIME_STOP_LATCH_ESCALATE_COOLDOWN_MS ?? 8000),
         );
-        const lastEscAt = Number(this._timeStopEscalationAt.get(String(tradeId)) || 0);
+        const lastEscAt = Number(this._timeStopEscalationAt.get(String(tradeId)) ?? 0);
         if (now - lastEscAt >= escCooldownMs) {
           this._timeStopEscalationAt.set(String(tradeId), now);
           logger.warn(
@@ -5670,7 +5670,7 @@ class TradeManager {
         };
         if (isTimeStop) {
           const dedupWindowMs =
-            Math.max(0, Number(env.TIME_STOP_ALERT_DEDUP_MIN || 10)) * 60 * 1000;
+            Math.max(0, Number(env.TIME_STOP_ALERT_DEDUP_MIN ?? 10)) * 60 * 1000;
           const triggeredAtMs = trade?.timeStopTriggeredAt
             ? new Date(trade.timeStopTriggeredAt).getTime()
             : NaN;
@@ -5814,7 +5814,7 @@ class TradeManager {
             slType,
             exitSide: slSide,
             currentStopLoss:
-              Number(trade.stopLoss || sl?.trigger_price || 0) || 0,
+              Number(trade.stopLoss ?? sl?.trigger_price ?? 0) || 0,
           };
 
           try {
@@ -5826,8 +5826,8 @@ class TradeManager {
                 purpose: "DYN_TRAIL_SL",
                 tradeId,
                 retry: retryMeta,
-                tickSize: Number(trade?.instrument?.tick_size || 0.05),
-                minIntervalMs: Math.max(1000, Number(minModifyMs || 0)),
+                tickSize: Number(trade?.instrument?.tick_size ?? 0.05),
+                minIntervalMs: Math.max(1000, Number(minModifyMs ?? 0)),
               },
             );
             const appliedTrigger = Number(
@@ -5927,9 +5927,9 @@ class TradeManager {
               low.includes("gateway") ||
               low.includes("timeout");
             if (isRateLimit || isTransientNet) {
-              const softBaseMs = Number(env.DYN_EXIT_FAIL_BACKOFF_MS || 2000);
+              const softBaseMs = Number(env.DYN_EXIT_FAIL_BACKOFF_MS ?? 2000);
               const softMaxMs = Number(
-                env.DYN_EXIT_FAIL_BACKOFF_MAX_MS || 15000,
+                env.DYN_EXIT_FAIL_BACKOFF_MAX_MS ?? 15000,
               );
               // Single backoff window for soft-fails.
               this._dynExitFailBackoffUntil.set(
@@ -5943,11 +5943,11 @@ class TradeManager {
               return;
             }
 
-            const fails = Number(this._dynExitFailCount.get(tradeId) || 0) + 1;
+            const fails = Number(this._dynExitFailCount.get(tradeId) ?? 0) + 1;
             this._dynExitFailCount.set(tradeId, fails);
-            const baseBackoff = Number(env.DYN_EXIT_FAIL_BACKOFF_MS || 2000);
+            const baseBackoff = Number(env.DYN_EXIT_FAIL_BACKOFF_MS ?? 2000);
             const maxBackoff = Number(
-              env.DYN_EXIT_FAIL_BACKOFF_MAX_MS || 15000,
+              env.DYN_EXIT_FAIL_BACKOFF_MAX_MS ?? 15000,
             );
             const nextBackoff = Math.max(500, baseBackoff) * Math.max(1, fails);
             this._dynExitFailBackoffUntil.set(
@@ -6006,8 +6006,8 @@ class TradeManager {
               {
                 purpose: "DYN_ADJUST_TARGET",
                 tradeId,
-                tickSize: Number(trade?.instrument?.tick_size || 0.05),
-                minIntervalMs: Math.max(1000, Number(minModifyMs || 0)),
+                tickSize: Number(trade?.instrument?.tick_size ?? 0.05),
+                minIntervalMs: Math.max(1000, Number(minModifyMs ?? 0)),
               },
             );
             await updateTrade(tradeId, {
@@ -6061,8 +6061,8 @@ class TradeManager {
   }
 
   async _watchEntryUntilDone(tradeId, entryOrderId) {
-    const pollMs = Number(env.ENTRY_WATCH_POLL_MS || 1000);
-    const maxMs = Number(env.ENTRY_WATCH_MS || 30000);
+    const pollMs = Number(env.ENTRY_WATCH_POLL_MS ?? 1000);
+    const maxMs = Number(env.ENTRY_WATCH_MS ?? 30000);
     const deadline = Date.now() + maxMs;
 
     while (Date.now() < deadline) {
@@ -6124,8 +6124,8 @@ class TradeManager {
       status = String(status || "").toUpperCase();
 
       if (status === "COMPLETE") {
-        const avgPx = Number(avg || t.entryPrice || t.candle?.close);
-        const qty = Number(filledQty || t.qty);
+        const avgPx = Number(avg ?? t.entryPrice ?? t.candle?.close);
+        const qty = Number(filledQty ?? t.qty);
 
         await updateTrade(tradeId, {
           status: STATUS.ENTRY_FILLED,
@@ -6242,7 +6242,7 @@ class TradeManager {
     if (status === "COMPLETE") {
       const avgPx = Number(avg) || Number(tFinal.expectedEntryPrice) || 0;
 
-      const qty = Number(filledQty || tFinal.qty || 0);
+      const qty = Number(filledQty ?? tFinal.qty ?? 0);
 
       await updateTrade(tradeId, {
         status: STATUS.ENTRY_FILLED,
@@ -6296,12 +6296,12 @@ class TradeManager {
         const lateOrder = late?.order || {};
         if (lateStatus === "COMPLETE") {
           const avgPx = Number(
-            lateOrder.average_price ||
-              tFinal.expectedEntryPrice ||
-              tFinal.entryPrice ||
+            lateOrder.average_price ??
+              tFinal.expectedEntryPrice ??
+              tFinal.entryPrice ??
               0,
           );
-          const qty = Number(lateOrder.filled_quantity || tFinal.qty || 0);
+          const qty = Number(lateOrder.filled_quantity ?? tFinal.qty ?? 0);
           await updateTrade(tradeId, {
             status: STATUS.ENTRY_FILLED,
             entryPrice: avgPx,
@@ -6366,7 +6366,7 @@ class TradeManager {
   }) {
     const id = String(tradeId || "");
     const oid = String(entryOrderId || "");
-    const ms = Number(timeoutMs || 0);
+    const ms = Number(timeoutMs ?? 0);
     if (!id || !oid || ms <= 0) return;
 
     this._clearEntryLimitFallbackTimer(id);
@@ -6438,13 +6438,13 @@ class TradeManager {
     const statusInfo = await this._getOrderStatus(entryOrderId);
     const status = String(statusInfo?.status || "").toUpperCase();
     const order = statusInfo?.order || {};
-    const filledNow = Number(order.filled_quantity || 0);
+    const filledNow = Number(order.filled_quantity ?? 0);
     const avgNow = Number(
-      order.average_price || t.entryPrice || t.candle?.close || 0,
+      order.average_price ?? t.entryPrice ?? t.candle?.close ?? 0,
     );
 
       if (status === "COMPLETE") {
-      const qty = Number(order.filled_quantity || t.qty);
+      const qty = Number(order.filled_quantity ?? t.qty);
       await updateTrade(tradeId, {
         status: STATUS.ENTRY_FILLED,
         entryPrice: avgNow > 0 ? avgNow : t.entryPrice,
@@ -6517,7 +6517,7 @@ class TradeManager {
     // Final safety recheck before aggressive fallback (race window between exchange fill and this timer)
     const graceMs = Math.max(
       0,
-      Number(env.ENTRY_LIMIT_FALLBACK_GRACE_MS || 250),
+      Number(env.ENTRY_LIMIT_FALLBACK_GRACE_MS ?? 250),
     );
     if (graceMs > 0) {
       await sleep(graceMs);
@@ -6525,13 +6525,13 @@ class TradeManager {
       const againInfo = await this._getOrderStatus(entryOrderId);
       const againStatus = String(againInfo?.status || "").toUpperCase();
       const againOrder = againInfo?.order || {};
-      const filledAgain = Number(againOrder.filled_quantity || 0);
+      const filledAgain = Number(againOrder.filled_quantity ?? 0);
       const avgAgain = Number(
-        againOrder.average_price || t.entryPrice || t.candle?.close || 0,
+        againOrder.average_price ?? t.entryPrice ?? t.candle?.close ?? 0,
       );
 
       if (againStatus === "COMPLETE") {
-        const qty = Number(againOrder.filled_quantity || t.qty);
+        const qty = Number(againOrder.filled_quantity ?? t.qty);
         await updateTrade(tradeId, {
           status: STATUS.ENTRY_FILLED,
           entryPrice: avgAgain > 0 ? avgAgain : t.entryPrice,
@@ -6634,13 +6634,13 @@ class TradeManager {
     const afterInfo = await this._checkLateFillAfterCancel(entryOrderId);
     const afterStatus = String(afterInfo?.status || "").toUpperCase();
     const afterOrder = afterInfo?.order || {};
-    const filledAfter = Number(afterOrder.filled_quantity || 0);
+    const filledAfter = Number(afterOrder.filled_quantity ?? 0);
     const avgAfter = Number(
-      afterOrder.average_price || t.entryPrice || t.candle?.close || 0,
+      afterOrder.average_price ?? t.entryPrice ?? t.candle?.close ?? 0,
     );
 
     if (afterStatus === "COMPLETE") {
-      const qty = Number(afterOrder.filled_quantity || t.qty);
+      const qty = Number(afterOrder.filled_quantity ?? t.qty);
       await updateTrade(tradeId, {
         status: STATUS.ENTRY_FILLED,
         entryPrice: avgAfter > 0 ? avgAfter : t.entryPrice,
@@ -6681,7 +6681,7 @@ class TradeManager {
     // If cancel is still being processed, don't place MARKET yet — reschedule a short re-check.
     if (afterStatus && afterStatus !== "CANCELLED" && !isDead(afterStatus)) {
       const waitMs = jitterMs(
-        Number(env.ENTRY_LIMIT_FALLBACK_CANCEL_WAIT_MS || 400),
+        Number(env.ENTRY_LIMIT_FALLBACK_CANCEL_WAIT_MS ?? 400),
         0.25,
       );
       logger.warn(
@@ -6708,12 +6708,12 @@ class TradeManager {
     const known = this._getKnownOrderStatus(entryOrderId);
     const knownStatus = String(known?.status || "").toUpperCase();
     const knownOrder = known?.order || {};
-    const knownFilled = Number(knownOrder.filled_quantity || 0);
+    const knownFilled = Number(knownOrder.filled_quantity ?? 0);
     const knownAvg = Number(
-      knownOrder.average_price || t.entryPrice || t.candle?.close || 0,
+      knownOrder.average_price ?? t.entryPrice ?? t.candle?.close ?? 0,
     );
     if (knownStatus === "COMPLETE" || knownFilled > 0) {
-      const qty = Number(knownOrder.filled_quantity || t.qty);
+      const qty = Number(knownOrder.filled_quantity ?? t.qty);
       await updateTrade(tradeId, {
         status: knownStatus === "COMPLETE" ? STATUS.ENTRY_FILLED : STATUS.ENTRY_OPEN,
         entryPrice: knownAvg > 0 ? knownAvg : t.entryPrice,
@@ -6785,8 +6785,8 @@ class TradeManager {
     const oid = String(orderId || "");
     if (!oid) return;
 
-    const pollMs = Number(env.EXIT_WATCH_POLL_MS || 1000);
-    const maxMs = Number(env.EXIT_WATCH_MS || 20000);
+    const pollMs = Number(env.EXIT_WATCH_POLL_MS ?? 1000);
+    const maxMs = Number(env.EXIT_WATCH_MS ?? 20000);
     const deadline = Date.now() + maxMs;
 
     while (Date.now() < deadline) {
@@ -6835,7 +6835,7 @@ class TradeManager {
   }
 
   _armStopLossSla({ tradeId, slOrderId, instrumentToken }) {
-    const slaMs = Math.max(1000, Number(env.SL_SAFETY_SLA_MS || 3000));
+    const slaMs = Math.max(1000, Number(env.SL_SAFETY_SLA_MS ?? 3000));
     if (!tradeId || !slOrderId) return;
 
     setTimeout(async () => {
@@ -6870,10 +6870,10 @@ class TradeManager {
           return;
         }
 
-        const token = Number(instrumentToken || trade.instrument_token);
+        const token = Number(instrumentToken ?? trade.instrument_token);
         const cooldownMin = Math.max(
           1,
-          Number(env.SL_SLA_BREACH_COOLDOWN_MIN || 5),
+          Number(env.SL_SLA_BREACH_COOLDOWN_MIN ?? 5),
         );
         if (Number.isFinite(token) && token > 0 && this.risk?.setCooldown) {
           this.risk.setCooldown(token, cooldownMin * 60, "SL_SLA_BREACH");
@@ -7002,8 +7002,8 @@ class TradeManager {
   }
 
   async _expectedMoveModel({ token, baseIntervalMin, atrPeriod, closeHint }) {
-    const atrMult = Number(env.EXPECTED_MOVE_ATR_MULT || 0.5);
-    const horizonMin = Number(env.EXPECTED_MOVE_HORIZON_MIN || 15);
+    const atrMult = Number(env.EXPECTED_MOVE_ATR_MULT ?? 0.5);
+    const horizonMin = Number(env.EXPECTED_MOVE_HORIZON_MIN ?? 15);
 
     // Prefer computing ATR on a realistic horizon interval if it exists; else fall back.
     const refIntervals = String(env.EXPECTED_MOVE_REF_INTERVALS || "15,5,3,1")
@@ -7022,7 +7022,7 @@ class TradeManager {
     for (const n of refIntervals) pushUnique(n);
     pushUnique(baseIntervalMin);
 
-    const limit = Math.max(60, Number(env.ATR_LOOKBACK_LIMIT || 200));
+    const limit = Math.max(60, Number(env.ATR_LOOKBACK_LIMIT ?? 200));
     let usedIntervalMin = null;
     let atr = null;
     let usedLen = null;
@@ -7096,14 +7096,14 @@ class TradeManager {
       return { ok: true, note: "multi_tf_disabled" };
     }
 
-    const base = Number(env.MULTI_TF_INTERVAL_MIN || 5);
+    const base = Number(env.MULTI_TF_INTERVAL_MIN ?? 5);
     const candidates = [base, 3, 5, 15]
       .map((n) => Number(n))
       .filter((n) => Number.isFinite(n) && n > 0);
 
-    const limit = Math.max(80, Number(env.MTF_LOOKBACK_LIMIT || 200));
-    const fastLen = Number(env.MULTI_TF_EMA_FAST || 9);
-    const slowLen = Number(env.MULTI_TF_EMA_SLOW || 21);
+    const limit = Math.max(80, Number(env.MTF_LOOKBACK_LIMIT ?? 200));
+    const fastLen = Number(env.MULTI_TF_EMA_FAST ?? 9);
+    const slowLen = Number(env.MULTI_TF_EMA_SLOW ?? 21);
 
     let usedIntervalMin = null;
     let candles = null;
@@ -7210,7 +7210,7 @@ class TradeManager {
 
     // Base context for all filters (also feeds cost/edge gating)
     const close = Number(last.close);
-    const atrPeriod = Number(env.EXPECTED_MOVE_ATR_PERIOD || 14);
+    const atrPeriod = Number(env.EXPECTED_MOVE_ATR_PERIOD ?? 14);
     const atrBase = atrLast(candles, atrPeriod);
     const atr = atrBase; // FIX: prevent "atr is not defined"
     const style = String(strategyStyle || "").toUpperCase() || "UNKNOWN";
@@ -7361,7 +7361,7 @@ class TradeManager {
 
     // Range percentile filter (optional)
     if (String(env.ENABLE_RANGE_PCTL_FILTER) === "true") {
-      const lookback = Math.max(20, Number(env.RANGE_PCTL_LOOKBACK || 50));
+      const lookback = Math.max(20, Number(env.RANGE_PCTL_LOOKBACK ?? 50));
       const ranges = candles
         .slice(-lookback)
         .map((c) => {
@@ -7382,8 +7382,8 @@ class TradeManager {
         const cur = ranges[ranges.length - 1];
         const hist = ranges.slice(0, -1);
         const p = percentileRank(hist, cur);
-        const minP = Number(env.MIN_RANGE_PCTL || 30);
-        const maxP = Number(env.MAX_RANGE_PCTL || 99);
+        const minP = Number(env.MIN_RANGE_PCTL ?? 30);
+        const maxP = Number(env.MAX_RANGE_PCTL ?? 99);
         if (p < minP)
           return {
             ok: false,
@@ -7423,7 +7423,7 @@ class TradeManager {
       const strength = info?.meta?.strengthBps;
       baseMeta.multiTf = info?.meta || null;
 
-      const maxBps = Number(env.RANGE_MAX_TREND_STRENGTH_BPS || 40);
+      const maxBps = Number(env.RANGE_MAX_TREND_STRENGTH_BPS ?? 40);
       if (
         Number.isFinite(strength) &&
         Number.isFinite(maxBps) &&
@@ -7450,13 +7450,13 @@ class TradeManager {
     minTicks,
     maxPct,
   }) {
-    const tick = Number(instrument?.tick_size || 0.05);
+    const tick = Number(instrument?.tick_size ?? 0.05);
     const slDist = Math.abs(Number(entryGuess) - Number(stopLoss));
     const ticks = tick > 0 ? slDist / tick : slDist;
 
     const minTicksVal = Number.isFinite(Number(minTicks))
       ? Number(minTicks)
-      : Number(env.MIN_SL_TICKS || 2);
+      : Number(env.MIN_SL_TICKS ?? 2);
     if (Number.isFinite(ticks) && ticks < minTicksVal) {
       return {
         ok: false,
@@ -7466,7 +7466,7 @@ class TradeManager {
 
     const maxPctVal = Number.isFinite(Number(maxPct))
       ? Number(maxPct)
-      : Number(env.MAX_SL_PCT || 1.0);
+      : Number(env.MAX_SL_PCT ?? 1.0);
     if (Number.isFinite(entryGuess) && entryGuess > 0) {
       const pct = (slDist / entryGuess) * 100;
       if (pct > maxPctVal) {
@@ -7722,9 +7722,9 @@ class TradeManager {
       if (!liq.ok) {
         const alt = (picked?.meta?.topCandidates || []).find(
           (c) =>
-            Number(c?.instrument_token || 0) > 0 &&
-            Number(c?.health_score || 0) >=
-              Number(env.OPT_HEALTH_SCORE_MIN || 45),
+            Number(c?.instrument_token ?? 0) > 0 &&
+            Number(c?.health_score ?? 0) >=
+              Number(env.OPT_HEALTH_SCORE_MIN ?? 45),
         );
         if (
           alt &&
@@ -7771,7 +7771,7 @@ class TradeManager {
           backfill:
             String(env.OPT_RUNTIME_SUBSCRIBE_BACKFILL || "false") === "true",
           // Prefer a slightly deeper backfill for options (per-token override supported by pipeline).
-          daysOverride: Number(env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS_OPT || 2),
+          daysOverride: Number(env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS_OPT ?? 2),
         });
       }
 
@@ -7797,7 +7797,7 @@ class TradeManager {
         );
       }
 
-      const warmMs = Number(env.OPT_LTP_WARMUP_MS || 1500);
+      const warmMs = Number(env.OPT_LTP_WARMUP_MS ?? 1500);
       if (rt?.ok && Number.isFinite(warmMs) && warmMs > 0) {
         await sleep(Math.min(5000, warmMs));
       }
@@ -7927,7 +7927,7 @@ class TradeManager {
     }
     const instrument = await ensureInstrument(this.kite, token);
 
-    const tick = Number(instrument.tick_size || 0.05);
+    const tick = Number(instrument.tick_size ?? 0.05);
 
     // Normalize side and detect contract type (options)
     const side = String(s.side || "BUY").toUpperCase();
@@ -7950,18 +7950,18 @@ class TradeManager {
     const maxEntrySlipBps = Number(
       isOptContract
         ? Number(
-            env.MAX_ENTRY_SLIPPAGE_BPS_OPT || env.MAX_ENTRY_SLIPPAGE_BPS || 120,
+            env.MAX_ENTRY_SLIPPAGE_BPS_OPT ?? env.MAX_ENTRY_SLIPPAGE_BPS ?? 120,
           )
-        : Number(env.MAX_ENTRY_SLIPPAGE_BPS || 25),
+        : Number(env.MAX_ENTRY_SLIPPAGE_BPS ?? 25),
     );
     const maxEntrySlipKillBps = Number(
       isOptContract
         ? Number(
-            env.MAX_ENTRY_SLIPPAGE_KILL_BPS_OPT ||
-              env.MAX_ENTRY_SLIPPAGE_KILL_BPS ||
+            env.MAX_ENTRY_SLIPPAGE_KILL_BPS_OPT ??
+              env.MAX_ENTRY_SLIPPAGE_KILL_BPS ??
               250,
           )
-        : Number(env.MAX_ENTRY_SLIPPAGE_KILL_BPS || 60),
+        : Number(env.MAX_ENTRY_SLIPPAGE_KILL_BPS ?? 60),
     );
 
     // Spread filter (use separate threshold for options)
@@ -8017,19 +8017,19 @@ class TradeManager {
         stopMode === "PREMIUM_POINTS" ||
         stopMode === "PRICE"
       ) {
-        const pts = Number(env.OPT_STOP_POINTS || env.OPT_SL_POINTS || 0);
+        const pts = Number(env.OPT_STOP_POINTS ?? env.OPT_SL_POINTS ?? 0);
         if (Number.isFinite(pts) && pts > 0) {
           const raw = Number(expectedEntryPrice) - pts;
           stopLoss = roundToTick(raw, tick, "down");
         } else {
           // Fallback to pct if points not configured.
-          const slPct = Number(env.OPT_STOP_PCT || env.OPT_SL_PCT || 12);
+          const slPct = Number(env.OPT_STOP_PCT ?? env.OPT_SL_PCT ?? 12);
           const raw = Number(expectedEntryPrice) * (1 - slPct / 100);
           stopLoss = roundToTick(raw, tick, "down");
         }
       } else {
         // Default: premium percent stop
-        const slPct = Number(env.OPT_STOP_PCT || env.OPT_SL_PCT || 12);
+        const slPct = Number(env.OPT_STOP_PCT ?? env.OPT_SL_PCT ?? 12);
         const raw = Number(expectedEntryPrice) * (1 - slPct / 100);
         stopLoss = roundToTick(raw, tick, "down");
       }
@@ -8047,8 +8047,8 @@ class TradeManager {
     }
 
     // Regime filters / MTF confirmation
-    const intervalMin = Number(s.intervalMin || s.candle?.interval_min || 1);
-    const regimeToken = Number(s.underlying_token || token);
+    const intervalMin = Number(s.intervalMin ?? s.candle?.interval_min ?? 1);
+    const regimeToken = Number(s.underlying_token ?? token);
     const regimeSide = String(s.underlying_side || s.side);
     const reg = await this._regimeFilters({
       token: regimeToken,
@@ -8080,8 +8080,8 @@ class TradeManager {
           tickSize: tick,
           optionMeta: s.option_meta,
           atr: Number(reg?.meta?.atr),
-          atrMult: Number(env.OPT_SL_UNDERLYING_ATR_MULT || 1.0),
-          minTicks: Number(env.OPT_SL_UNDERLYING_MIN_TICKS || 6),
+          atrMult: Number(env.OPT_SL_UNDERLYING_ATR_MULT ?? 1.0),
+          minTicks: Number(env.OPT_SL_UNDERLYING_MIN_TICKS ?? 6),
         });
         if (fit?.ok) {
           stopLoss = fit.stopLoss;
@@ -8105,7 +8105,7 @@ class TradeManager {
       stopLoss,
       side,
       instrument,
-      maxPct: s.option_meta ? Number(env.OPT_MAX_SL_PCT || 35) : undefined,
+      maxPct: s.option_meta ? Number(env.OPT_MAX_SL_PCT ?? 35) : undefined,
     });
     if (!gate.ok) {
       logger.info({ token, reason: gate.reason }, "[trade] blocked (SL gate)");
@@ -8123,7 +8123,7 @@ class TradeManager {
         const planCandles = await getRecentCandles(
           regimeToken,
           intervalMin,
-          Number(env.PLAN_CANDLE_LIMIT || 800),
+          Number(env.PLAN_CANDLE_LIMIT ?? 800),
         );
 
         // For options, also fetch option-premium candles (premium-aware exits)
@@ -8136,9 +8136,9 @@ class TradeManager {
             typeof this.kite?.getHistoricalData === "function"
           ) {
             const daysOverride = Number(
-              env.OPT_PLAN_PREM_BACKFILL_DAYS ||
-                env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS_OPT ||
-                env.BACKFILL_DAYS ||
+              env.OPT_PLAN_PREM_BACKFILL_DAYS ??
+                env.RUNTIME_SUBSCRIBE_BACKFILL_DAYS_OPT ??
+                env.BACKFILL_DAYS ??
                 3,
             );
             try {
@@ -8174,15 +8174,15 @@ class TradeManager {
             token, // option token (not underlying)
             intervalMin,
             Number(
-              env.OPT_PLAN_PREM_CANDLE_LIMIT || env.PLAN_CANDLE_LIMIT || 800,
+              env.OPT_PLAN_PREM_CANDLE_LIMIT ?? env.PLAN_CANDLE_LIMIT ?? 800,
             ),
           );
         }
 
         const entryUnderlying = Number(
           s.option_meta
-            ? s.underlying_ltp || s.candle?.close || 0
-            : quoteAtEntry?.ltp || s.candle?.close || 0,
+            ? s.underlying_ltp ?? s.candle?.close ?? 0
+            : quoteAtEntry?.ltp ?? s.candle?.close ?? 0,
         );
 
         const atr = Number(reg?.meta?.atr);
@@ -8201,7 +8201,7 @@ class TradeManager {
           signalStyle: s.strategyStyle,
           entryUnderlying,
           expectedMoveUnderlying: Number(reg?.meta?.expectedMovePerShare),
-          atrPeriod: Number(env.EXPECTED_MOVE_ATR_PERIOD || 14),
+          atrPeriod: Number(env.EXPECTED_MOVE_ATR_PERIOD ?? 14),
           optionMeta: s.option_meta
             ? { ...s.option_meta, strategyStyle: s.strategyStyle }
             : null,
@@ -8223,8 +8223,8 @@ class TradeManager {
             side,
             instrument,
             maxPct: s.option_meta
-              ? Number(env.OPT_MAX_SL_PCT || 35)
-              : Number(env.MAX_SL_PCT || 1.2),
+              ? Number(env.OPT_MAX_SL_PCT ?? 35)
+              : Number(env.MAX_SL_PCT ?? 1.2),
           });
           if (!slGate2.ok) {
             logger.info(
@@ -8243,7 +8243,7 @@ class TradeManager {
     }
 
     // ---- Adaptive optimizer (strategy×symbol×time-bucket auto-block + dynamic RR) ----
-    const rrBase = Number(plan?.ok ? plan.rr : env.RR_TARGET || 1.0);
+    const rrBase = Number(plan?.ok ? plan.rr : env.RR_TARGET ?? 1.0);
     const opt = optimizer.evaluateSignal({
       symbol: instrument.tradingsymbol,
       strategyId: s.strategyId,
@@ -8251,7 +8251,7 @@ class TradeManager {
       atrBase: reg?.meta?.atrBase || reg?.meta?.atr,
       close: reg?.meta?.close,
       rrBase,
-      spreadBps: Number(sp?.meta?.bps || 0),
+      spreadBps: Number(sp?.meta?.bps ?? 0),
       signalRegime: s.regime,
       strategyStyle: s.strategyStyle,
       confidence: conf,
@@ -8270,8 +8270,8 @@ class TradeManager {
     }
 
     // Optimizer de-weight: confidence multiplier (and optional qty multiplier)
-    const confidenceMult = Number(opt?.meta?.confidenceMult || 1);
-    const qtyMult = Number(opt?.meta?.qtyMult || 1);
+    const confidenceMult = Number(opt?.meta?.confidenceMult ?? 1);
+    const qtyMult = Number(opt?.meta?.qtyMult ?? 1);
     const confidenceRaw = conf;
     const confidenceUsed =
       Number.isFinite(confidenceRaw) && Number.isFinite(confidenceMult)
@@ -8309,7 +8309,7 @@ class TradeManager {
       }
     }
 
-    const rrTarget = Number(plan?.ok ? plan.rr : opt?.meta?.rrUsed || rrBase);
+    const rrTarget = Number(plan?.ok ? plan.rr : opt?.meta?.rrUsed ?? rrBase);
     const qtyMode = String(
       env.QTY_SIZING_MODE || "RISK_THEN_MARGIN",
     ).toUpperCase();
@@ -8317,9 +8317,9 @@ class TradeManager {
       planMeta?.style || s.strategyStyle || "",
     ).toUpperCase();
     const _openMult = _styleForSizing.includes("OPEN")
-      ? Number(env.OPEN_RISK_MULT || 0.7)
+      ? Number(env.OPEN_RISK_MULT ?? 0.7)
       : 1.0;
-    const _riskInrOverride = Number(env.RISK_PER_TRADE_INR || 0) * _openMult;
+    const _riskInrOverride = Number(env.RISK_PER_TRADE_INR ?? 0) * _openMult;
 
     // Option SL fitter: if 1-lot risk exceeds cap, tighten SL toward entry to fit.
     // This avoids frequent LOT_RISK_CAP blocks when lot sizes are large.
@@ -8328,14 +8328,14 @@ class TradeManager {
       s.option_meta &&
       Boolean(env.OPT_SL_FIT_ENABLED) &&
       Boolean(env.LOT_RISK_CAP_ENFORCE) &&
-      Number(instrument?.lot_size || 1) > 1
+      Number(instrument?.lot_size ?? 1) > 1
     ) {
       const lot = Number(instrument.lot_size);
-      const tickSize = Number(instrument.tick_size || tick || 0.05);
-      const epsPct = Number(env.LOT_RISK_CAP_EPS_PCT || 0.02);
+      const tickSize = Number(instrument.tick_size ?? tick ?? 0.05);
+      const epsPct = Number(env.LOT_RISK_CAP_EPS_PCT ?? 0.02);
       const capInr = _riskInrOverride * (1 + epsPct);
       const minTicks = Number(
-        env.OPT_SL_FIT_MIN_TICKS || env.MIN_SL_TICKS || 2,
+        env.OPT_SL_FIT_MIN_TICKS ?? env.MIN_SL_TICKS ?? 2,
       );
 
       const fit = fitStopLossToLotRiskCap({
@@ -8368,7 +8368,7 @@ class TradeManager {
             side,
             entry: entryGuess,
             stopLoss,
-            rr: Number(rrTarget || env.RR_TARGET || 2.2),
+            rr: Number(rrTarget ?? env.RR_TARGET ?? 2.2),
             tickSize,
           });
           if (newT != null) plannedTargetPrice = newT;
@@ -8401,31 +8401,31 @@ class TradeManager {
         const thetaDay = Number(metaOpt.theta_per_day);
         const ivChPts = Number(metaOpt.iv_change_pts);
 
-        const minDropPts = Number(env.OPT_IV_DROP_MIN_PTS || 1.5);
-        const capDropPts = Number(env.OPT_IV_DROP_CAP_PTS || 4.0);
+        const minDropPts = Number(env.OPT_IV_DROP_MIN_PTS ?? 1.5);
+        const capDropPts = Number(env.OPT_IV_DROP_CAP_PTS ?? 4.0);
 
         const holdMin = Number(
-          env.OPT_EXPECTED_HOLD_MIN || env.OPT_EXIT_MAX_HOLD_MIN || 10,
+          env.OPT_EXPECTED_HOLD_MIN ?? env.OPT_EXIT_MAX_HOLD_MIN ?? 10,
         );
-        const edgeMult = Number(env.OPT_IV_THETA_EDGE_MULT || 1.2);
+        const edgeMult = Number(env.OPT_IV_THETA_EDGE_MULT ?? 1.2);
 
         // Expected premium gain: prefer planned target distance; fallback to delta-mapped move.
         const expectedGainP = Number.isFinite(Number(plannedTargetPrice))
-          ? Math.abs(Number(plannedTargetPrice) - Number(entryGuess || 0))
+          ? Math.abs(Number(plannedTargetPrice) - Number(entryGuess ?? 0))
           : null;
 
         const entryU = Number(
-          planMeta?.underlying?.entry || s.underlying_ltp || 0,
+          planMeta?.underlying?.entry ?? s.underlying_ltp ?? 0,
         );
-        const targetU = Number(planMeta?.underlying?.target || 0);
+        const targetU = Number(planMeta?.underlying?.target ?? 0);
         const moveU =
           Number.isFinite(entryU) && Number.isFinite(targetU) && targetU > 0
             ? Math.abs(targetU - entryU)
-            : Math.abs(Number(reg?.meta?.expectedMovePerShare || 0));
+            : Math.abs(Number(reg?.meta?.expectedMovePerShare ?? 0));
 
         const absDelta = Number.isFinite(Number(metaOpt.delta))
           ? Math.abs(Number(metaOpt.delta))
-          : Number(planMeta?.option?.absDelta || 0);
+          : Number(planMeta?.option?.absDelta ?? 0);
         const gamma = Number.isFinite(Number(metaOpt.gamma))
           ? Math.abs(Number(metaOpt.gamma))
           : 0;
@@ -8527,14 +8527,14 @@ class TradeManager {
       entryPrice: entryGuess,
       stopLoss,
       riskInr: _riskInrOverride,
-      lotSize: Number(instrument.lot_size || 1),
+      lotSize: Number(instrument.lot_size ?? 1),
       expectedSlippagePts: Number(
-        env.EXPECTED_SLIPPAGE_POINTS ||
-          (Number(quoteAtEntry?.bps || 0) > 0 && Number(entryGuess) > 0
+        env.EXPECTED_SLIPPAGE_POINTS ??
+          (Number(quoteAtEntry?.bps ?? 0) > 0 && Number(entryGuess) > 0
             ? (Number(quoteAtEntry.bps) / 10000) * Number(entryGuess)
             : 0),
       ),
-      feePerLotInr: Number(env.EXPECTED_FEES_PER_LOT_INR || 0),
+      feePerLotInr: Number(env.EXPECTED_FEES_PER_LOT_INR ?? 0),
     });
 
     // If you want sizing purely from available margin, set:
@@ -8546,7 +8546,7 @@ class TradeManager {
     // for "as much as possible" within your caps.
     let qtyWanted =
       qtyMode === "MARGIN"
-        ? Number(env.MAX_QTY_HARDCAP || env.MAX_QTY || 10000)
+        ? Number(env.MAX_QTY_HARDCAP ?? env.MAX_QTY ?? 10000)
         : qtyByRisk;
 
     // Lot-aware sizing: if policy forces at least 1 lot, ensure the marginSizer checks margin for >= 1 lot
@@ -8554,7 +8554,7 @@ class TradeManager {
     if (
       String(env.FNO_MIN_LOT_POLICY || "FORCE_ONE_LOT").toUpperCase() ===
         "FORCE_ONE_LOT" &&
-      Number(instrument.lot_size || 0) > 1
+      Number(instrument.lot_size ?? 0) > 1
     ) {
       // Guard against NaN (e.g., if a caller ever provides an invalid qtyWanted).
       const baseQty = Number.isFinite(Number(qtyWanted))
@@ -8633,12 +8633,12 @@ class TradeManager {
     );
 
     if (lotRiskCapEnforce && (qtyMode !== "MARGIN" || lotRiskApplyInMargin)) {
-      const entryForRisk = Number(expectedEntryPrice || entryGuess || 0);
-      let perUnitRisk = Math.abs(entryForRisk - Number(stopLoss || 0));
+      const entryForRisk = Number(expectedEntryPrice ?? entryGuess ?? 0);
+      let perUnitRisk = Math.abs(entryForRisk - Number(stopLoss ?? 0));
       const intendedRiskInr = Number(
-        _riskInrOverride || env.RISK_PER_TRADE_INR || 0,
+        _riskInrOverride ?? env.RISK_PER_TRADE_INR ?? 0,
       );
-      const epsPct = Math.max(0, Number(env.LOT_RISK_CAP_EPS_PCT || 0));
+      const epsPct = Math.max(0, Number(env.LOT_RISK_CAP_EPS_PCT ?? 0));
       const capInr = intendedRiskInr * (1 + epsPct);
 
       if (
@@ -8649,7 +8649,7 @@ class TradeManager {
       ) {
         let trueRiskInr = perUnitRisk * qty;
         if (trueRiskInr > capInr) {
-          const lot = Math.max(1, Number(instrument?.lot_size || 1));
+          const lot = Math.max(1, Number(instrument?.lot_size ?? 1));
 
           // Compute the max qty that fits inside cap (respecting lot size for derivatives).
           let newQty =
@@ -8673,9 +8673,9 @@ class TradeManager {
               forceOneLot && lot > 1 && !!s.option_meta && slFitWhenCapBlocks;
 
             if (canRescueBySlFit) {
-              const tickSize = Number(instrument.tick_size || tick || 0.05);
+              const tickSize = Number(instrument.tick_size ?? tick ?? 0.05);
               const minTicks = Number(
-                env.OPT_SL_FIT_MIN_TICKS || env.MIN_SL_TICKS || 2,
+                env.OPT_SL_FIT_MIN_TICKS ?? env.MIN_SL_TICKS ?? 2,
               );
 
               const fit = fitStopLossToLotRiskCap({
@@ -8708,7 +8708,7 @@ class TradeManager {
                     side,
                     entry: entryGuess,
                     stopLoss,
-                    rr: Number(rrTarget || env.RR_TARGET || 2.2),
+                    rr: Number(rrTarget ?? env.RR_TARGET ?? 2.2),
                     tickSize,
                   });
                   if (newT != null) plannedTargetPrice = newT;
@@ -8832,15 +8832,15 @@ class TradeManager {
             (String(
               s.option_meta?.moneyness || env.OPT_MONEYNESS || "ATM",
             ).toUpperCase() === "ITM"
-              ? Number(env.OPT_DELTA_ITM || 0.65)
+              ? Number(env.OPT_DELTA_ITM ?? 0.65)
               : String(
                     s.option_meta?.moneyness || env.OPT_MONEYNESS || "ATM",
                   ).toUpperCase() === "OTM"
-                ? Number(env.OPT_DELTA_OTM || 0.4)
-                : Number(env.OPT_DELTA_ATM || 0.5))
+                ? Number(env.OPT_DELTA_OTM ?? 0.4)
+                : Number(env.OPT_DELTA_ATM ?? 0.5))
           : Number(reg?.meta?.expectedMovePerShare),
       qty,
-      spreadBps: Number(sp?.meta?.bps || 0),
+      spreadBps: Number(sp?.meta?.bps ?? 0),
       env,
       instrument,
     });
@@ -8857,7 +8857,7 @@ class TradeManager {
       ? estimateMinGreen({
           entryPrice: expectedEntryPrice,
           qty,
-          spreadBps: Number(sp?.meta?.bps || 0),
+          spreadBps: Number(sp?.meta?.bps ?? 0),
           env,
           instrument,
         })
@@ -8915,7 +8915,7 @@ class TradeManager {
       minGreenInr: minGreen.minGreenInr,
       minGreenPts: minGreen.minGreenPts,
       // planned risk cap used for sizing / gating (₹)
-      riskInr: Number(_riskInrOverride || env.RISK_PER_TRADE_INR || 0),
+      riskInr: Number(_riskInrOverride ?? env.RISK_PER_TRADE_INR ?? 0),
       entryOrderType,
       maxEntrySlippageBps: maxEntrySlipBps,
       maxEntrySlippageKillBps: maxEntrySlipKillBps,
@@ -9005,7 +9005,7 @@ class TradeManager {
         instrument,
         side,
         basePrice: Number(
-          entryParams.price || expectedEntryPrice || entryGuess,
+          entryParams.price ?? expectedEntryPrice ?? entryGuess,
         ),
       }).catch((e) => {
         logger.warn(
@@ -9020,7 +9020,7 @@ class TradeManager {
       isOptContract &&
       entryOrderType === "LIMIT" &&
       String(env.ENTRY_LIMIT_FALLBACK_TO_MARKET || "false") === "true" &&
-      Number(env.ENTRY_LIMIT_TIMEOUT_MS || 0) > 0
+      Number(env.ENTRY_LIMIT_TIMEOUT_MS ?? 0) > 0
     ) {
       try {
         this._scheduleEntryLimitFallback({
@@ -9175,7 +9175,7 @@ class TradeManager {
     // ✅ FIXED: PANIC_EXIT must not reference undefined variables and must not finalize on dead status
     if (link.role === "PANIC_EXIT") {
       if (status === "COMPLETE") {
-        const exitPrice = Number(order.average_price || order.price || 0);
+        const exitPrice = Number(order.average_price ?? order.price ?? 0);
         this._clearPanicExitWatch(trade.tradeId);
         this._panicExitRetryCount.delete(String(trade.tradeId));
 
@@ -9200,12 +9200,12 @@ class TradeManager {
 
       // OPEN / PARTIAL: track progress, but do not place SL/TARGET (panic exit is the protection)
       if (status === "OPEN" || status === "PARTIAL") {
-        const filledNow = Number(order.filled_quantity || 0);
+        const filledNow = Number(order.filled_quantity ?? 0);
         if (filledNow > 0) {
           await updateTrade(trade.tradeId, {
             panicExitLastStatus: status,
             panicExitFilledQty: filledNow,
-            panicExitAvgPrice: Number(order.average_price || 0) || null,
+            panicExitAvgPrice: Number(order.average_price ?? 0) || null,
             panicExitLastUpdateAt: new Date(),
           });
           alert("warn", "⚠️ PANIC EXIT partial/open (still exiting)", {
@@ -9276,8 +9276,8 @@ class TradeManager {
 
       if (progressedSet0.includes(progressedStatus0)) {
         // Still record any filled qty/avg on stale updates for bookkeeping, but do NOT place exits again.
-        const filledNow0 = Number(order.filled_quantity || 0);
-        const avgNow0 = Number(order.average_price || 0);
+        const filledNow0 = Number(order.filled_quantity ?? 0);
+        const avgNow0 = Number(order.average_price ?? 0);
         if (filledNow0 > 0) {
           const patch0 = {};
           if (
@@ -9286,7 +9286,7 @@ class TradeManager {
           ) {
             patch0.entryPrice = avgNow0;
           }
-          const prevQty0 = Number(freshEntryTrade0?.qty || 0);
+          const prevQty0 = Number(freshEntryTrade0?.qty ?? 0);
           if (!Number.isFinite(prevQty0) || filledNow0 > prevQty0) {
             patch0.qty = filledNow0;
           }
@@ -9323,14 +9323,14 @@ class TradeManager {
         }
         this._clearEntryLimitFallbackTimer(trade.tradeId);
         const avg = Number(
-          order.average_price || trade.entryPrice || trade.candle?.close,
+          order.average_price ?? trade.entryPrice ?? trade.candle?.close,
         );
-        const filledQty = Number(order.filled_quantity || trade.qty);
+        const filledQty = Number(order.filled_quantity ?? trade.qty);
 
         const expected = Number(
-          trade.expectedEntryPrice ||
-            trade.quoteAtEntry?.ltp ||
-            trade.candle?.close ||
+          trade.expectedEntryPrice ??
+            trade.quoteAtEntry?.ltp ??
+            trade.candle?.close ??
             0,
         );
         const slipBps =
@@ -9360,23 +9360,23 @@ class TradeManager {
           );
 
         const maxBps = Number(
-          trade.maxEntrySlippageBps ||
+          trade.maxEntrySlippageBps ??
             (isOptContract
-              ? env.MAX_ENTRY_SLIPPAGE_BPS_OPT || 120
-              : env.MAX_ENTRY_SLIPPAGE_BPS || 25),
+              ? env.MAX_ENTRY_SLIPPAGE_BPS_OPT ?? 120
+              : env.MAX_ENTRY_SLIPPAGE_BPS ?? 25),
         );
         const killBpsBase = Number(
-          trade.maxEntrySlippageKillBps ||
+          trade.maxEntrySlippageKillBps ??
             (isOptContract
-              ? env.MAX_ENTRY_SLIPPAGE_KILL_BPS_OPT || 250
-              : env.MAX_ENTRY_SLIPPAGE_KILL_BPS || 60),
+              ? env.MAX_ENTRY_SLIPPAGE_KILL_BPS_OPT ?? 250
+              : env.MAX_ENTRY_SLIPPAGE_KILL_BPS ?? 60),
         );
 
-        const tick = Number(trade.instrument?.tick_size || 0.05);
+        const tick = Number(trade.instrument?.tick_size ?? 0.05);
         const ticksAllowance = Number(
           isOptContract
-            ? env.MAX_ENTRY_SLIPPAGE_TICKS_OPT || 4
-            : env.MAX_ENTRY_SLIPPAGE_TICKS || 2,
+            ? env.MAX_ENTRY_SLIPPAGE_TICKS_OPT ?? 4
+            : env.MAX_ENTRY_SLIPPAGE_TICKS ?? 2,
         );
         const tickBps =
           expected > 0 && tick > 0 ? (tick / expected) * 10000 : null;
@@ -9462,7 +9462,7 @@ class TradeManager {
           ? estimateMinGreen({
               entryPrice: avg,
               qty: filledQty,
-              spreadBps: Number(trade?.quoteAtEntry?.bps || 0),
+              spreadBps: Number(trade?.quoteAtEntry?.bps ?? 0),
               env,
               instrument: trade.instrument,
             })
@@ -9479,13 +9479,13 @@ class TradeManager {
           side: trade.side,
           instrument: trade.instrument,
           qty: filledQty,
-          riskInr: Number(env.RISK_PER_TRADE_INR || 0),
+          riskInr: Number(env.RISK_PER_TRADE_INR ?? 0),
         });
 
-        const timeStopMin = Number(env.TIME_STOP_MIN || 0);
+        const timeStopMin = Number(env.TIME_STOP_MIN ?? 0);
         const proTimeStopsEnabled =
-          Number(env.TIME_STOP_NO_PROGRESS_MIN || 0) > 0 ||
-          Number(env.TIME_STOP_MAX_HOLD_MIN || 0) > 0;
+          Number(env.TIME_STOP_NO_PROGRESS_MIN ?? 0) > 0 ||
+          Number(env.TIME_STOP_MAX_HOLD_MIN ?? 0) > 0;
         const timeStopAt =
           !proTimeStopsEnabled && Number.isFinite(timeStopMin) && timeStopMin > 0
             ? new Date(Date.now() + timeStopMin * 60 * 1000)
@@ -9554,9 +9554,9 @@ class TradeManager {
         return;
       }
 
-      const filledNow = Number(order.filled_quantity || 0);
+      const filledNow = Number(order.filled_quantity ?? 0);
       const avgNow = Number(
-        order.average_price || trade.entryPrice || trade.candle?.close || 0,
+        order.average_price ?? trade.entryPrice ?? trade.candle?.close ?? 0,
       );
       if ((status === "PARTIAL" || status === "OPEN") && filledNow > 0) {
         if (!isCurrentEntry) {
@@ -9584,7 +9584,7 @@ class TradeManager {
           ? estimateMinGreen({
               entryPrice: avgNow,
               qty: filledNow,
-              spreadBps: Number(trade?.quoteAtEntry?.bps || 0),
+              spreadBps: Number(trade?.quoteAtEntry?.bps ?? 0),
               env,
               instrument: trade.instrument,
             })
@@ -9600,12 +9600,12 @@ class TradeManager {
           side: trade.side,
           instrument: trade.instrument,
           qty: filledNow,
-          riskInr: Number(env.RISK_PER_TRADE_INR || 0),
+          riskInr: Number(env.RISK_PER_TRADE_INR ?? 0),
         });
-        const timeStopMin = Number(env.TIME_STOP_MIN || 0);
+        const timeStopMin = Number(env.TIME_STOP_MIN ?? 0);
         const proTimeStopsEnabled =
-          Number(env.TIME_STOP_NO_PROGRESS_MIN || 0) > 0 ||
-          Number(env.TIME_STOP_MAX_HOLD_MIN || 0) > 0;
+          Number(env.TIME_STOP_NO_PROGRESS_MIN ?? 0) > 0 ||
+          Number(env.TIME_STOP_MAX_HOLD_MIN ?? 0) > 0;
         const timeStopAt =
           !proTimeStopsEnabled && Number.isFinite(timeStopMin) && timeStopMin > 0
             ? new Date(Date.now() + timeStopMin * 60 * 1000)
@@ -9745,8 +9745,8 @@ class TradeManager {
 
     if (link.role === "TP1") {
       // TP1 is a partial take-profit. We must transition to runner stage safely.
-      const filledNow = Number(order.filled_quantity || 0);
-      const qtyNow = Number(order.quantity || trade.tp1Qty || trade.qty || 0);
+      const filledNow = Number(order.filled_quantity ?? 0);
+      const qtyNow = Number(order.quantity ?? trade.tp1Qty ?? trade.qty ?? 0);
 
       if (status === "COMPLETE") {
         return this._onTp1Filled(trade.tradeId, trade, order);
@@ -9796,7 +9796,7 @@ class TradeManager {
         try {
           const fresh = (await getTrade(trade.tradeId)) || trade;
           await this._placeExitsIfMissing(fresh);
-          await this._ensureExitQty(trade.tradeId, Number(fresh.qty || 0));
+          await this._ensureExitQty(trade.tradeId, Number(fresh.qty ?? 0));
         } catch (e) {
           logger.warn(
             { tradeId: trade.tradeId, e: e.message },
@@ -9817,8 +9817,8 @@ class TradeManager {
       } catch {}
 
       // Partial exit fills are dangerous (remaining qty may be unprotected or double-exited).
-      const filledNow = Number(order.filled_quantity || 0);
-      const qtyNow = Number(order.quantity || trade.qty || 0);
+      const filledNow = Number(order.filled_quantity ?? 0);
+      const qtyNow = Number(order.quantity ?? trade.qty ?? 0);
       if (
         (status === "PARTIAL" || status === "OPEN") &&
         filledNow > 0 &&
@@ -9951,8 +9951,8 @@ class TradeManager {
       }
 
       // Partial SL fills are dangerous (can leave remainder exposed or cause over-exit).
-      const filledNow = Number(order.filled_quantity || 0);
-      const qtyNow = Number(order.quantity || trade.qty || 0);
+      const filledNow = Number(order.filled_quantity ?? 0);
+      const qtyNow = Number(order.quantity ?? trade.qty ?? 0);
       if (
         (status === "PARTIAL" || status === "OPEN") &&
         filledNow > 0 &&
@@ -10109,8 +10109,8 @@ class TradeManager {
     )
       return;
 
-    const count = Number(fresh.targetReplaceCount || 0);
-    const max = Number(env.TARGET_REPLACE_MAX || 2);
+    const count = Number(fresh.targetReplaceCount ?? 0);
+    const max = Number(env.TARGET_REPLACE_MAX ?? 2);
     if (count >= max) {
       logger.error(
         { tradeId, count, max, source },
@@ -10162,7 +10162,7 @@ class TradeManager {
   async _ensureExitQty(tradeId, desiredQty) {
     const fresh = await getTrade(tradeId);
     if (!fresh) return;
-    const qty = Number(desiredQty || fresh.qty || 0);
+    const qty = Number(desiredQty ?? fresh.qty ?? 0);
     if (qty < 1) return;
 
     // Adjust SL qty (safety critical)
@@ -10241,16 +10241,16 @@ class TradeManager {
       const t = await getTrade(tradeId);
       if (!t) return { ok: true, skipped: true };
 
-      const entry = Number(entryPrice || t.entryPrice || 0);
-      const sl = Number(t.stopLoss || 0);
-      const q = Number(qty || t.qty || 0);
+      const entry = Number(entryPrice ?? t.entryPrice ?? 0);
+      const sl = Number(t.stopLoss ?? 0);
+      const q = Number(qty ?? t.qty ?? 0);
 
       if (!(entry > 0) || !(sl > 0) || !(q > 0)) {
         return { ok: true, skipped: true };
       }
 
-      const capBase = Number(t.riskInr || env.RISK_PER_TRADE_INR || 0);
-      const eps = Math.max(0, Number(env.POST_FILL_RISK_EPS_PCT || 0));
+      const capBase = Number(t.riskInr ?? env.RISK_PER_TRADE_INR ?? 0);
+      const eps = Math.max(0, Number(env.POST_FILL_RISK_EPS_PCT ?? 0));
       const capInr = capBase * (1 + eps);
 
       const perUnitRisk = Math.abs(entry - sl);
@@ -10280,10 +10280,10 @@ class TradeManager {
         return { ok: true, refit: false };
       }
 
-      const tickSize = Number(t.instrument?.tick_size || 0.05);
+      const tickSize = Number(t.instrument?.tick_size ?? 0.05);
       const minTicks = Math.max(
         1,
-        Number(env.POST_FILL_RISK_MIN_TICKS || env.OPT_SL_FIT_MIN_TICKS || 2),
+        Number(env.POST_FILL_RISK_MIN_TICKS ?? env.OPT_SL_FIT_MIN_TICKS ?? 2),
       );
 
       const fit = fitStopLossToLotRiskCap({
@@ -10316,7 +10316,7 @@ class TradeManager {
 
         // Optional: keep RR consistent by refitting target from RR_TARGET
         if (env.POST_FILL_RISK_REFIT_TARGET) {
-          const rr = Number(t.rr || env.RR_TARGET || 1.0);
+          const rr = Number(t.rr ?? env.RR_TARGET ?? 1.0);
           const newTarget = computeTargetFromRR({
             side: t.side,
             entry,
@@ -10403,12 +10403,12 @@ class TradeManager {
       const t = await getTrade(tradeId);
       if (!t) return { ok: true, skipped: true };
 
-      const entry = Number(entryPrice || t.entryPrice || 0);
-      const sl = Number(t.stopLoss || t.initialStopLoss || 0);
+      const entry = Number(entryPrice ?? t.entryPrice ?? 0);
+      const sl = Number(t.stopLoss ?? t.initialStopLoss ?? 0);
       if (!(entry > 0) || !(sl > 0)) return { ok: true, skipped: true };
 
-      const rr = Number(t.rr || env.RR_TARGET || 1.0);
-      const tickSize = Number(t.instrument?.tick_size || 0.05);
+      const rr = Number(t.rr ?? env.RR_TARGET ?? 1.0);
+      const tickSize = Number(t.instrument?.tick_size ?? 0.05);
       const newTarget = computeTargetFromRR({
         side: t.side,
         entry,
@@ -10469,23 +10469,23 @@ class TradeManager {
       return Number(trade.plannedTargetPrice);
     }
 
-    const rr = Number(trade.rr || 1.0);
-    const entryPx = Number(trade.entryPrice || trade.candle?.close);
-    const baseSL = Number(trade.initialStopLoss || trade.stopLoss);
+    const rr = Number(trade.rr ?? 1.0);
+    const entryPx = Number(trade.entryPrice ?? trade.candle?.close);
+    const baseSL = Number(trade.initialStopLoss ?? trade.stopLoss);
     const riskPerShare = Math.abs(entryPx - baseSL);
     const targetPx =
       trade.side === "BUY"
         ? entryPx + rr * riskPerShare
         : entryPx - rr * riskPerShare;
 
-    const tick = Number(trade.instrument.tick_size || 0.05);
+    const tick = Number(trade.instrument.tick_size ?? 0.05);
     return roundToTick(targetPx, tick, trade.side === "BUY" ? "up" : "down");
   }
 
   async _placeTargetOnly(trade) {
     const tradeId = trade.tradeId;
 
-    const entryPx = Number(trade.entryPrice || trade.candle?.close);
+    const entryPx = Number(trade.entryPrice ?? trade.candle?.close);
     if (!Number.isFinite(entryPx) || entryPx <= 0)
       throw new Error("missing_entry_price");
 
@@ -10564,7 +10564,7 @@ class TradeManager {
   }
   _scaleOutEligible(trade) {
     const enabled = String(env.SCALE_OUT_ENABLED) === "true";
-    const initQty = Number(trade?.initialQty || trade?.qty || 0);
+    const initQty = Number(trade?.initialQty ?? trade?.qty ?? 0);
     return enabled && initQty >= 2 && !trade?.tp1Aborted;
   }
 
@@ -10572,7 +10572,7 @@ class TradeManager {
     const total = Number(totalQty);
     if (!Number.isFinite(total) || total < 2) return null;
 
-    const pct = Number(env.TP1_QTY_PCT || 50);
+    const pct = Number(env.TP1_QTY_PCT ?? 50);
     const raw = Math.floor((total * pct) / 100);
     const lot = Math.max(1, Number(lotSize) || 1);
 
@@ -10600,11 +10600,11 @@ class TradeManager {
   }
 
   _computeTp1Price(trade) {
-    const entry = Number(trade?.entryPrice || 0);
-    const sl = Number(trade?.initialStopLoss || trade?.stopLoss || 0);
+    const entry = Number(trade?.entryPrice ?? 0);
+    const sl = Number(trade?.initialStopLoss ?? trade?.stopLoss ?? 0);
     const risk = Math.abs(entry - sl);
-    const mult = Number(env.TP1_R || 1);
-    const tick = Number(trade?.instrument?.tick_size || 0.05);
+    const mult = Number(env.TP1_R ?? 1);
+    const tick = Number(trade?.instrument?.tick_size ?? 0.05);
 
     if (!Number.isFinite(entry) || !Number.isFinite(sl) || !(risk > 0))
       return null;
@@ -10616,10 +10616,10 @@ class TradeManager {
 
   async _placeTp1Only(trade) {
     const tradeId = trade.tradeId;
-    const initQty = Number(trade.initialQty || trade.qty || 0);
+    const initQty = Number(trade.initialQty ?? trade.qty ?? 0);
     const sizing = this._computeTp1Qty(
       initQty,
-      Number(trade?.instrument?.lot_size || 1),
+      Number(trade?.instrument?.lot_size ?? 1),
     );
     if (!sizing) throw new Error("SCALE_OUT_NOT_ELIGIBLE");
 
@@ -10662,7 +10662,7 @@ class TradeManager {
       tp1Price,
       tp1Qty: sizing.tp1Qty,
       runnerQty: sizing.runnerQty,
-      tp1R: Number(env.TP1_R || 1),
+      tp1R: Number(env.TP1_R ?? 1),
     }).catch(() => {});
 
     if (isHalted()) {
@@ -10694,7 +10694,7 @@ class TradeManager {
     const tradeId = trade.tradeId;
     const token = Number(trade.instrument_token);
     const intervalMin = Number(
-      trade.intervalMin || trade.candle?.interval_min || 1,
+      trade.intervalMin ?? trade.candle?.interval_min ?? 1,
     );
 
     let candles = [];
@@ -10801,9 +10801,9 @@ class TradeManager {
     qty,
     label,
   }) {
-    const entry = Number(entryPrice || 0);
-    const exit = Number(exitPrice || 0);
-    const q = Number(qty || 0);
+    const entry = Number(entryPrice ?? 0);
+    const exit = Number(exitPrice ?? 0);
+    const q = Number(qty ?? 0);
     if (
       !Number.isFinite(entry) ||
       !Number.isFinite(exit) ||
@@ -10817,7 +10817,7 @@ class TradeManager {
 
     const key = todayKey();
     const cur = await getDailyRisk(key);
-    const realized = Number(cur?.realizedPnl || 0);
+    const realized = Number(cur?.realizedPnl ?? 0);
 
     await upsertDailyRisk(key, {
       realizedPnl: realized + pnl,
@@ -10842,7 +10842,7 @@ class TradeManager {
       });
       await updateTrade(tradeId, {
         pnlLegs: legs,
-        partialRealizedPnl: Number(t?.partialRealizedPnl || 0) + pnl,
+        partialRealizedPnl: Number(t?.partialRealizedPnl ?? 0) + pnl,
       });
     } catch {
       // ignore
@@ -10855,7 +10855,7 @@ class TradeManager {
   }
 
   async _onTp1PartialFill(tradeId, trade, tp1Order) {
-    const filled = Number(tp1Order.filled_quantity || 0);
+    const filled = Number(tp1Order.filled_quantity ?? 0);
     if (!(filled > 0)) return;
 
     const oid = String(
@@ -10883,16 +10883,16 @@ class TradeManager {
     const fresh = (await getTrade(tradeId)) || trade;
     if (!fresh) return;
 
-    const entry = Number(fresh.entryPrice || 0);
-    const initQty = Number(fresh.initialQty || fresh.qty || 0);
+    const entry = Number(fresh.entryPrice ?? 0);
+    const initQty = Number(fresh.initialQty ?? fresh.qty ?? 0);
     const filledQty = Number(
-      opts.forcedFilledQty || tp1Order.filled_quantity || fresh.tp1Qty || 0,
+      opts.forcedFilledQty ?? tp1Order.filled_quantity ?? fresh.tp1Qty ?? 0,
     );
     const avgExit = Number(
-      tp1Order.average_price || tp1Order.price || fresh.tp1Price || 0,
+      tp1Order.average_price ?? tp1Order.price ?? fresh.tp1Price ?? 0,
     );
 
-    const tp1ExpectedPrice = Number(fresh.tp1Price || tp1Order.price || 0);
+    const tp1ExpectedPrice = Number(fresh.tp1Price ?? tp1Order.price ?? 0);
 
     // TP1 spread sample (never blocks)
     let tp1QuoteAt = null;
@@ -10985,22 +10985,22 @@ class TradeManager {
       runnerQty: remaining,
     });
     // Resize + tighten SL to "true breakeven" (+buffer, +estimated per-share fees)
-    const tick = Number(fresh.instrument?.tick_size || 0.05);
+    const tick = Number(fresh.instrument?.tick_size ?? 0.05);
     const bufTicks = Number(
-      env.RUNNER_BE_BUFFER_TICKS || env.DYN_BE_BUFFER_TICKS || 1,
+      env.RUNNER_BE_BUFFER_TICKS ?? env.DYN_BE_BUFFER_TICKS ?? 1,
     );
     const buffer = bufTicks * tick;
 
     // Estimate round-trip costs for the remaining (runner) qty.
     // This prevents BE exits that are still fee-negative on small quantities.
 
-    const entrySpreadBps = Number(fresh?.quoteAtEntry?.bps || 0);
-    const tp1SpreadBps = Number(tp1QuoteAt?.bps || 0);
+    const entrySpreadBps = Number(fresh?.quoteAtEntry?.bps ?? 0);
+    const tp1SpreadBps = Number(tp1QuoteAt?.bps ?? 0);
     const spreadBpsUsed =
       entrySpreadBps > 0 && tp1SpreadBps > 0
         ? (entrySpreadBps + tp1SpreadBps) / 2
         : entrySpreadBps || tp1SpreadBps || 0;
-    const mult = Number(env.DYN_BE_COST_MULT || 1.0);
+    const mult = Number(env.DYN_BE_COST_MULT ?? 1.0);
     let costPerShare = 0;
     let estCostInr = 0;
     let costMeta = null;
@@ -11012,7 +11012,7 @@ class TradeManager {
         env,
         instrument: fresh?.instrument || null,
       });
-      estCostInr = Number(est?.estCostInr || 0);
+      estCostInr = Number(est?.estCostInr ?? 0);
       costMeta = est?.meta || null;
       if (Number.isFinite(estCostInr) && estCostInr > 0 && remaining > 0) {
         costPerShare = estCostInr / remaining;
@@ -11026,7 +11026,7 @@ class TradeManager {
 
     const be = roundToTick(rawBe, tick, fresh.side === "BUY" ? "up" : "down");
 
-    const curSL = Number(fresh.stopLoss || fresh.initialStopLoss || 0);
+    const curSL = Number(fresh.stopLoss ?? fresh.initialStopLoss ?? 0);
     const newSL =
       fresh.side === "BUY"
         ? Math.max(curSL || -Infinity, be)
@@ -11272,7 +11272,7 @@ class TradeManager {
         this._armStopLossSla({
           tradeId,
           slOrderId,
-          instrumentToken: Number(fresh.instrument_token || token),
+          instrumentToken: Number(fresh.instrument_token ?? token),
         });
       }
 
@@ -11326,7 +11326,7 @@ class TradeManager {
       }
 
       const scaleEnabled = String(env.SCALE_OUT_ENABLED) === "true";
-      const initQty = Number(fresh2.initialQty || fresh2.qty || trade.qty || 0);
+      const initQty = Number(fresh2.initialQty ?? fresh2.qty ?? trade.qty ?? 0);
       const eligible = scaleEnabled && initQty >= 2 && !fresh2.tp1Aborted;
 
       if (eligible) {
@@ -11519,11 +11519,11 @@ class TradeManager {
     }
 
     const exitPrice = Number(
-      targetOrder.average_price || targetOrder.price || trade.targetPrice || 0,
+      targetOrder.average_price ?? targetOrder.price ?? trade.targetPrice ?? 0,
     );
 
     const exitExpectedPrice = Number(
-      trade.targetPrice || targetOrder.price || 0,
+      trade.targetPrice ?? targetOrder.price ?? 0,
     );
 
     // Exit spread sample (never blocks)
@@ -11613,11 +11613,11 @@ class TradeManager {
     }
 
     const exitPrice = Number(
-      slOrder.average_price || slOrder.trigger_price || trade.stopLoss || 0,
+      slOrder.average_price ?? slOrder.trigger_price ?? trade.stopLoss ?? 0,
     );
 
     const exitExpectedPrice = Number(
-      trade.stopLoss || slOrder.trigger_price || trade.initialStopLoss || 0,
+      trade.stopLoss ?? slOrder.trigger_price ?? trade.initialStopLoss ?? 0,
     );
 
     // Exit spread sample (never blocks)
@@ -11747,8 +11747,8 @@ class TradeManager {
     const t = await getTrade(tradeId);
     if (!t) return;
 
-    const entry = Number(t.entryPrice || 0);
-    const exit = Number(t.exitPrice || 0);
+    const entry = Number(t.entryPrice ?? 0);
+    const exit = Number(t.exitPrice ?? 0);
     if (
       !Number.isFinite(entry) ||
       !Number.isFinite(exit) ||
@@ -11757,12 +11757,12 @@ class TradeManager {
     )
       return;
 
-    const qty = Number(t.qty || 0);
+    const qty = Number(t.qty ?? 0);
     const pnl = t.side === "BUY" ? (exit - entry) * qty : (entry - exit) * qty;
 
     const key = todayKey();
     const cur = await getDailyRisk(key);
-    const realized = Number(cur?.realizedPnl || 0);
+    const realized = Number(cur?.realizedPnl ?? 0);
 
     await upsertDailyRisk(key, {
       realizedPnl: realized + pnl,
@@ -11784,18 +11784,18 @@ class TradeManager {
     const t = await getTrade(tradeId);
     if (!t) return null;
 
-    const entry = Number(t.entryPrice || 0);
-    const exit = Number(t.exitPrice || 0);
+    const entry = Number(t.entryPrice ?? 0);
+    const exit = Number(t.exitPrice ?? 0);
     const side = String(t.side || "BUY").toUpperCase();
 
     if (!(entry > 0) || !(exit > 0)) return null;
 
-    const qtyNow = Number(t.qty || 0);
-    const baseQty = Number(t.initialQty || qtyNow || 0);
+    const qtyNow = Number(t.qty ?? 0);
+    const baseQty = Number(t.initialQty ?? qtyNow ?? 0);
     if (!(baseQty > 0)) return null;
 
     // PnL: include any booked partial legs + the final leg.
-    const partial = Number(t.partialRealizedPnl || 0);
+    const partial = Number(t.partialRealizedPnl ?? 0);
     const finalLegPnl =
       side === "BUY" ? (exit - entry) * qtyNow : (entry - exit) * qtyNow;
 
@@ -11803,11 +11803,11 @@ class TradeManager {
 
     // Expected PnL based on expected entry/exit prices (helps separate charges vs slippage impact)
     const expectedEntry = Number(
-      t.expectedEntryPrice || t.entryExpectedPrice || 0,
+      t.expectedEntryPrice ?? t.entryExpectedPrice ?? 0,
     );
-    const expectedExit = Number(t.exitExpectedPrice || 0);
-    const tp1Exp = Number(t.tp1ExpectedPrice || 0);
-    const tp1Qty = Number(t.tp1FilledQty || 0);
+    const expectedExit = Number(t.exitExpectedPrice ?? 0);
+    const tp1Exp = Number(t.tp1ExpectedPrice ?? 0);
+    const tp1Qty = Number(t.tp1FilledQty ?? 0);
 
     let pnlExpectedInr = null;
     try {
@@ -11839,11 +11839,11 @@ class TradeManager {
 
     // More realistic order count: scale-out usually means ENTRY + TP1 + final exit.
     const scaleOutUsed =
-      !!t.tp1Done && Number(t.tp1FilledQty || 0) > 0 && baseQty > qtyNow;
+      !!t.tp1Done && Number(t.tp1FilledQty ?? 0) > 0 && baseQty > qtyNow;
     const execOrders = scaleOutUsed ? 3 : 2;
 
-    const entrySpreadBps = Number(t?.quoteAtEntry?.bps || 0);
-    const exitSpreadBps = Number(t?.exitQuoteAt?.bps || 0);
+    const entrySpreadBps = Number(t?.quoteAtEntry?.bps ?? 0);
+    const exitSpreadBps = Number(t?.exitQuoteAt?.bps ?? 0);
     const spreadBpsUsed =
       entrySpreadBps > 0 && exitSpreadBps > 0
         ? (entrySpreadBps + exitSpreadBps) / 2
@@ -11859,7 +11859,7 @@ class TradeManager {
         env: { ...env, EXPECTED_EXECUTED_ORDERS: execOrders },
         instrument: t?.instrument || null,
       });
-      estCostInr = Number(est?.estCostInr || 0);
+      estCostInr = Number(est?.estCostInr ?? 0);
       costMeta = est?.meta || null;
     } catch {}
 
@@ -11872,11 +11872,11 @@ class TradeManager {
       ? grossPnlInr - estCostInr
       : null;
 
-    const entrySlippage = Number(t.entrySlippageInrWorse || 0);
-    const exitSlippage = Number(t.exitSlippageInrWorse || 0);
-    const brokerage = Number(costMeta?.brokerage || 0);
+    const entrySlippage = Number(t.entrySlippageInrWorse ?? 0);
+    const exitSlippage = Number(t.exitSlippageInrWorse ?? 0);
+    const brokerage = Number(costMeta?.brokerage ?? 0);
     const taxes =
-      (Number(costMeta?.turnover || 0) * Number(costMeta?.variableBps || 0)) /
+      (Number(costMeta?.turnover ?? 0) * Number(costMeta?.variableBps ?? 0)) /
       10000;
     const feesTotal = brokerage + taxes;
 
@@ -12010,9 +12010,9 @@ class TradeManager {
     this._dynExitFailBackoffUntil.delete(tradeId);
     this._dynPeakLtpByTrade.delete(tradeId);
     this._clearVirtualTarget(tradeId);
-    const qty = Number(t?.qty || 0);
-    const entry = Number(t?.entryPrice || 0);
-    const exit = Number(t?.exitPrice || 0);
+    const qty = Number(t?.qty ?? 0);
+    const entry = Number(t?.entryPrice ?? 0);
+    const exit = Number(t?.exitPrice ?? 0);
     const pnl =
       qty > 0 && entry > 0 && exit > 0
         ? String(t?.side || "BUY").toUpperCase() === "BUY"
@@ -12070,7 +12070,7 @@ class TradeManager {
 }
 
 function fallbackSL(entry, side) {
-  const pct = Number(env.SL_PCT_FALLBACK || 0.3) / 100.0;
+  const pct = Number(env.SL_PCT_FALLBACK ?? 0.3) / 100.0;
   if (side === "BUY") return entry * (1 - pct);
   return entry * (1 + pct);
 }
@@ -12099,10 +12099,10 @@ function optionStopLossFromUnderlyingATR({
 
   const fallbackDelta =
     moneyness === "ITM"
-      ? Number(env.OPT_DELTA_ITM || 0.65)
+      ? Number(env.OPT_DELTA_ITM ?? 0.65)
       : moneyness === "OTM"
-        ? Number(env.OPT_DELTA_OTM || 0.4)
-        : Number(env.OPT_DELTA_ATM || 0.5);
+        ? Number(env.OPT_DELTA_OTM ?? 0.4)
+        : Number(env.OPT_DELTA_ATM ?? 0.5);
 
   const deltaRaw = Math.abs(Number(optionMeta?.delta));
   const delta =
@@ -12116,8 +12116,8 @@ function optionStopLossFromUnderlyingATR({
     return { ok: false, reason: "NO_PREM_MOVE" };
   }
 
-  const tick = Number(tickSize || 0.05);
-  const minTicksNum = Math.max(0, Number(minTicks || 0));
+  const tick = Number(tickSize ?? 0.05);
+  const minTicksNum = Math.max(0, Number(minTicks ?? 0));
   const minStop = minTicksNum > 0 ? minTicksNum * tick : 0;
   if (minStop > 0) premMove = Math.max(premMove, minStop);
 
@@ -12147,13 +12147,13 @@ function optionStopLossFromUnderlyingATR({
 
 function calcOpenPnl(trade, ltp) {
   const entry = Number(
-    trade.entryPrice ||
-      trade.expectedEntryPrice ||
-      trade.quoteAtEntry?.ltp ||
-      trade.candle?.close ||
+    trade.entryPrice ??
+      trade.expectedEntryPrice ??
+      trade.quoteAtEntry?.ltp ??
+      trade.candle?.close ??
       0,
   );
-  const qty = Number(trade.qty || 0);
+  const qty = Number(trade.qty ?? 0);
   if (!entry || !qty) return 0;
   return trade.side === "BUY" ? (ltp - entry) * qty : (entry - ltp) * qty;
 }
@@ -12176,7 +12176,7 @@ function makeTag(tradeId, role) {
 
 function isRetryablePlaceError(e) {
   const msg = String(e?.message || e || "").toLowerCase();
-  const status = Number(e?.status || e?.http_code || e?.code || 0);
+  const status = Number(e?.status ?? e?.http_code ?? e?.code ?? 0);
   if ([429, 500, 502, 503, 504].includes(status)) return true;
   const patterns = [
     "etimedout",
@@ -12215,9 +12215,9 @@ function normalizeOrderShapeForMatch(x) {
     transaction_type: String(x.transaction_type || "").toUpperCase(),
     order_type: String(x.order_type || "").toUpperCase(),
     product: String(x.product || "").toUpperCase(),
-    quantity: Number(x.quantity || 0),
-    price: Number(x.price || 0),
-    trigger_price: Number(x.trigger_price || x.triggerPrice || 0),
+    quantity: Number(x.quantity ?? 0),
+    price: Number(x.price ?? 0),
+    trigger_price: Number(x.trigger_price ?? x.triggerPrice ?? 0),
   };
 }
 
@@ -12235,8 +12235,8 @@ function ordersMatch(a, b) {
 }
 
 function nearlyEq(a, b) {
-  const x = Number(a || 0);
-  const y = Number(b || 0);
+  const x = Number(a ?? 0);
+  const y = Number(b ?? 0);
   return Math.abs(x - y) < 1e-6;
 }
 
@@ -12285,7 +12285,7 @@ function avgNum(arr) {
 }
 
 function emaLast(values, period) {
-  const p = Math.max(1, Number(period || 1));
+  const p = Math.max(1, Number(period ?? 1));
   const xs = values.map((n) => Number(n)).filter((n) => Number.isFinite(n));
   if (xs.length < p) return NaN;
   const k = 2 / (p + 1);
@@ -12297,7 +12297,7 @@ function emaLast(values, period) {
 }
 
 function atrLast(candles, period = 14) {
-  const p = Math.max(1, Number(period || 14));
+  const p = Math.max(1, Number(period ?? 14));
   if (!Array.isArray(candles) || candles.length < p + 2) return NaN;
   const trs = [];
   for (let i = 1; i < candles.length; i++) {

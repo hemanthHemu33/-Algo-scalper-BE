@@ -21,7 +21,7 @@ function orbStrategy({ candles, intervalMin, orbMinutes = 15, volMult = 1.2, vol
 
   const needBars = Math.max(
     1,
-    Math.ceil(Number(orbMinutes) / Math.max(1, Number(intervalMin || 1)))
+    Math.ceil(Number(orbMinutes) / Math.max(1, Number(intervalMin ?? 1)))
   );
 
   const opening = candles.filter((c) => {
@@ -38,7 +38,7 @@ function orbStrategy({ candles, intervalMin, orbMinutes = 15, volMult = 1.2, vol
   const orbLow = minLow(opening);
 
   const close = Number(last.close);
-  const vol = Number(last.volume || 0);
+  const vol = Number(last.volume ?? 0);
   const av = avgVolume(candles, volLookback) || 1;
 
   if (close > orbHigh && vol >= av * volMult) {

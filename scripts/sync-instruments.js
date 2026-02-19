@@ -34,14 +34,14 @@ async function main() {
       instrument_token: tok,
       exchange: row.exchange,
       tradingsymbol: row.tradingsymbol,
-      tick_size: Number(row.tick_size || 0.05),
-      lot_size: Number(row.lot_size || 1),
-      freeze_qty: Number(row.freeze_qty || row.freeze_quantity || 0) || null,
+      tick_size: Number(row.tick_size ?? 0.05),
+      lot_size: Number(row.lot_size ?? 1),
+      freeze_qty: Number(row.freeze_qty ?? row.freeze_quantity ?? 0) || null,
       segment: row.segment || null,
       instrument_type: row.instrument_type || null,
       name: row.name || null,
       expiry: row.expiry || null,
-      strike: Number(row.strike || 0) || null,
+      strike: Number(row.strike ?? 0) || null,
     });
     cached++;
   }

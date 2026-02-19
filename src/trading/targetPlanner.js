@@ -134,12 +134,12 @@ function planRunnerTarget({ trade, candles }) {
     };
   }
 
-  const minRR = Number(env.RUNNER_MIN_RR || 1.5);
-  const minBps = Number(env.RUNNER_MIN_TARGET_BPS || 0);
-  const atrMult = Number(env.RUNNER_ATR_MULT || 2);
-  const swingLb = Number(env.RUNNER_SWING_LOOKBACK || 120);
-  const vwapLb = Number(env.RUNNER_VWAP_LOOKBACK || 120);
-  const fallbackRR = Number(env.RUNNER_FALLBACK_RR || 2);
+  const minRR = Number(env.RUNNER_MIN_RR ?? 1.5);
+  const minBps = Number(env.RUNNER_MIN_TARGET_BPS ?? 0);
+  const atrMult = Number(env.RUNNER_ATR_MULT ?? 2);
+  const swingLb = Number(env.RUNNER_SWING_LOOKBACK ?? 120);
+  const vwapLb = Number(env.RUNNER_VWAP_LOOKBACK ?? 120);
+  const fallbackRR = Number(env.RUNNER_FALLBACK_RR ?? 2);
   const prio = parsePriorityList(
     env.RUNNER_TARGET_PRIORITY || "PIVOT,SWING,ATR,RR"
   );

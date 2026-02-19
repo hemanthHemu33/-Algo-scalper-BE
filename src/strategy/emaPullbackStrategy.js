@@ -32,7 +32,7 @@ function emaPullbackStrategy({
   const curFast = emaFast[n - 1];
   const curSlow = emaSlow[n - 1];
 
-  const curVol = Number(candles[n - 1].volume || 0);
+  const curVol = Number(candles[n - 1].volume ?? 0);
   const av = avgVolume(candles, volLookback);
   if (!Number.isFinite(av) || av <= 0) return null;
 

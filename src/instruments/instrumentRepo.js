@@ -36,7 +36,7 @@ function parseCsvList(v) {
 
 async function getInstrumentsDump(kite, exchange) {
   const ex = String(exchange || env.DEFAULT_EXCHANGE || "NSE").toUpperCase();
-  const ttlSec = Number(env.INSTRUMENTS_DUMP_TTL_SEC || 3600);
+  const ttlSec = Number(env.INSTRUMENTS_DUMP_TTL_SEC ?? 3600);
   const now = Date.now();
   const cached = dumpCache.get(ex);
   if (cached && now - cached.fetchedAt < ttlSec * 1000) return cached.rows;
@@ -67,7 +67,7 @@ async function getInstrumentByToken(instrument_token) {
 }
 
 function isInstrumentCacheStale(doc) {
-  const maxAgeHours = Number(env.INSTRUMENT_CACHE_MAX_AGE_HOURS || 0);
+  const maxAgeHours = Number(env.INSTRUMENT_CACHE_MAX_AGE_HOURS ?? 0);
   if (!Number.isFinite(maxAgeHours) || maxAgeHours <= 0) return false;
   const updatedAt = doc?.updatedAt ? new Date(doc.updatedAt).getTime() : 0;
   if (!updatedAt || Number.isNaN(updatedAt)) return true;
@@ -141,8 +141,8 @@ async function ensureInstrument(kite, instrument_token) {
     exchange: row.exchange || usedEx,
     tradingsymbol: row.tradingsymbol,
     tick_size: normalizeTickSize(row.tick_size),
-    lot_size: Number(row.lot_size || 1),
-    freeze_qty: Number(row.freeze_qty || row.freeze_quantity || 0) || null,
+    lot_size: Number(row.lot_size ?? 1),
+    freeze_qty: Number(row.freeze_qty ?? row.freeze_quantity ?? 0) || null,
     segment: row.segment,
     instrument_type: row.instrument_type,
     name: row.name,
@@ -225,8 +225,8 @@ async function ensureInstrumentBySymbol(kite, symbol) {
     exchange: row.exchange,
     tradingsymbol: row.tradingsymbol,
     tick_size: normalizeTickSize(row.tick_size),
-    lot_size: Number(row.lot_size || 1),
-    freeze_qty: Number(row.freeze_qty || row.freeze_quantity || 0) || null,
+    lot_size: Number(row.lot_size ?? 1),
+    freeze_qty: Number(row.freeze_qty ?? row.freeze_quantity ?? 0) || null,
     segment: row.segment,
     instrument_type: row.instrument_type,
     name: row.name,
@@ -269,8 +269,8 @@ async function preloadInstrumentsByToken(kite, tokens = []) {
           exchange: row.exchange || ex,
           tradingsymbol: row.tradingsymbol,
           tick_size: normalizeTickSize(row.tick_size),
-          lot_size: Number(row.lot_size || 1),
-          freeze_qty: Number(row.freeze_qty || row.freeze_quantity || 0) || null,
+          lot_size: Number(row.lot_size ?? 1),
+          freeze_qty: Number(row.freeze_qty ?? row.freeze_quantity ?? 0) || null,
           segment: row.segment,
           instrument_type: row.instrument_type,
           name: row.name,

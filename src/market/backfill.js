@@ -13,9 +13,9 @@ async function backfillCandles({
   const days = Number(
     Number.isFinite(Number(daysOverride))
       ? Number(daysOverride)
-      : Number(env.BACKFILL_DAYS || 3),
+      : Number(env.BACKFILL_DAYS ?? 3),
   );
-  const maxDays = Number(env.BACKFILL_MAX_DAYS || 10);
+  const maxDays = Number(env.BACKFILL_MAX_DAYS ?? 10);
   const minCandles = getMinCandlesForSignal(env, intervalMin);
 
   const to = DateTime.now().setZone(timezone);
@@ -45,7 +45,7 @@ async function backfillCandles({
     high: Number(x.high),
     low: Number(x.low),
     close: Number(x.close),
-    volume: Number(x.volume || 0),
+    volume: Number(x.volume ?? 0),
     source: "historical",
   }));
 

@@ -191,33 +191,33 @@ function buildApp() {
         "# TYPE engine_ticker_connected gauge",
         `engine_ticker_connected ${ticker.connected ? 1 : 0}`,
         "# TYPE engine_market_ticks_total counter",
-        `engine_market_ticks_total ${Number(mh?.totals?.ticks || 0)}`,
+        `engine_market_ticks_total ${Number(mh?.totals?.ticks ?? 0)}`,
         "# TYPE engine_market_gaps_total counter",
-        `engine_market_gaps_total ${Number(mh?.totals?.gaps || 0)}`,
+        `engine_market_gaps_total ${Number(mh?.totals?.gaps ?? 0)}`,
         "# TYPE engine_market_missing_timestamp_total counter",
-        `engine_market_missing_timestamp_total ${Number(mh?.totals?.missingTimestamp || 0)}`,
+        `engine_market_missing_timestamp_total ${Number(mh?.totals?.missingTimestamp ?? 0)}`,
         "# TYPE engine_signals_total counter",
-        `engine_signals_total ${Number(sig?.counts?.total || 0)}`,
+        `engine_signals_total ${Number(sig?.counts?.total ?? 0)}`,
         "# TYPE engine_signals_accepted_total counter",
-        `engine_signals_accepted_total ${Number(sig?.counts?.accepted || 0)}`,
+        `engine_signals_accepted_total ${Number(sig?.counts?.accepted ?? 0)}`,
         "# TYPE engine_dynamic_exit_eval_runs_total counter",
-        `engine_dynamic_exit_eval_runs_total ${Number(dyn?.evalRuns || 0)}`,
+        `engine_dynamic_exit_eval_runs_total ${Number(dyn?.evalRuns ?? 0)}`,
         "# TYPE engine_dynamic_exit_modify_runs_total counter",
-        `engine_dynamic_exit_modify_runs_total ${Number(dyn?.modifyRuns || 0)}`,
+        `engine_dynamic_exit_modify_runs_total ${Number(dyn?.modifyRuns ?? 0)}`,
         "# TYPE engine_dynamic_exit_skipped_eval_throttle_total counter",
-        `engine_dynamic_exit_skipped_eval_throttle_total ${Number(dyn?.skipped?.evalThrottle || 0)}`,
+        `engine_dynamic_exit_skipped_eval_throttle_total ${Number(dyn?.skipped?.evalThrottle ?? 0)}`,
         "# TYPE engine_dynamic_exit_skipped_modify_throttle_total counter",
-        `engine_dynamic_exit_skipped_modify_throttle_total ${Number(dyn?.skipped?.modifyThrottle || 0)}`,
+        `engine_dynamic_exit_skipped_modify_throttle_total ${Number(dyn?.skipped?.modifyThrottle ?? 0)}`,
         "# TYPE engine_dynamic_exit_eval_cadence_p95_ms gauge",
-        `engine_dynamic_exit_eval_cadence_p95_ms ${Number(dyn?.evalCadenceMs?.p95 || 0)}`,
+        `engine_dynamic_exit_eval_cadence_p95_ms ${Number(dyn?.evalCadenceMs?.p95 ?? 0)}`,
         "# TYPE engine_dynamic_exit_modify_cadence_p95_ms gauge",
-        `engine_dynamic_exit_modify_cadence_p95_ms ${Number(dyn?.modifyCadenceMs?.p95 || 0)}`,
+        `engine_dynamic_exit_modify_cadence_p95_ms ${Number(dyn?.modifyCadenceMs?.p95 ?? 0)}`,
         "# TYPE engine_dynamic_exit_eval_burst_max gauge",
-        `engine_dynamic_exit_eval_burst_max ${Number(dyn?.burst?.evalMax || 0)}`,
+        `engine_dynamic_exit_eval_burst_max ${Number(dyn?.burst?.evalMax ?? 0)}`,
         "# TYPE engine_orphan_replay_retries_scheduled_total counter",
-        `engine_orphan_replay_retries_scheduled_total ${Number(orphan?.retriesScheduled || 0)}`,
+        `engine_orphan_replay_retries_scheduled_total ${Number(orphan?.retriesScheduled ?? 0)}`,
         "# TYPE engine_orphan_replay_dead_lettered_total counter",
-        `engine_orphan_replay_dead_lettered_total ${Number(orphan?.deadLettered || 0)}`,
+        `engine_orphan_replay_dead_lettered_total ${Number(orphan?.deadLettered ?? 0)}`,
       ];
       res.set("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
       return res.send(lines.join("\n") + "\n");
@@ -425,7 +425,7 @@ function buildApp() {
         checks.push({ ok: true, code: "KILL_SWITCH_OFF" });
       }
 
-      const breakerUntil = Number(quoteGuard?.breakerOpenUntil || 0);
+      const breakerUntil = Number(quoteGuard?.breakerOpenUntil ?? 0);
       const breakerOpen = breakerUntil > Date.now();
       if (env.CRITICAL_HEALTH_FAIL_ON_QUOTE_BREAKER && breakerOpen) {
         checks.push({
@@ -620,13 +620,13 @@ function buildApp() {
     try {
       const token = Number(req.query.token);
       const intervalMin = Number(
-        req.query.intervalMin || req.query.interval || 1,
+        req.query.intervalMin ?? req.query.interval ?? 1,
       );
       const includeLive =
         String(req.query.includeLive || req.query.live || "false") === "true" ||
         String(req.query.includeLive || req.query.live || "0") === "1";
 
-      const limitRaw = Number(req.query.limit || 300);
+      const limitRaw = Number(req.query.limit ?? 300);
       const limit = Number.isFinite(limitRaw)
         ? Math.min(2000, Math.max(10, limitRaw))
         : 300;
@@ -851,7 +851,7 @@ function buildApp() {
 
   app.get("/admin/trades/recent", requirePerm("read"), async (req, res) => {
     try {
-      const limitRaw = Number(req.query.limit || 10);
+      const limitRaw = Number(req.query.limit ?? 10);
       const limit = Number.isFinite(limitRaw)
         ? Math.min(50, Math.max(1, limitRaw))
         : 10;
@@ -886,11 +886,11 @@ function buildApp() {
     requirePerm("read"),
     async (req, res) => {
       try {
-        const limitRaw = Number(req.query.limit || 200);
+        const limitRaw = Number(req.query.limit ?? 200);
         const limit = Number.isFinite(limitRaw)
           ? Math.min(500, Math.max(1, limitRaw))
           : 200;
-        const sinceHoursRaw = Number(req.query.sinceHours || 72);
+        const sinceHoursRaw = Number(req.query.sinceHours ?? 72);
         const sinceHours = Number.isFinite(sinceHoursRaw)
           ? Math.min(24 * 30, Math.max(1, sinceHoursRaw))
           : 72;
@@ -1015,7 +1015,7 @@ function buildApp() {
     try {
       const orderId = req.query.orderId || req.query.order_id;
       const tradeId = req.query.tradeId || req.query.trade_id || null;
-      const limit = Number(req.query.limit || 200);
+      const limit = Number(req.query.limit ?? 200);
       const rows = await getOrderLogsSnapshot({
         orderId,
         tradeId,
@@ -1081,7 +1081,7 @@ function buildApp() {
   // Strategy telemetry (KPIs)
   app.get("/admin/strategy/kpis", requirePerm("read"), async (req, res) => {
     try {
-      const limit = Number(req.query.limit || 500);
+      const limit = Number(req.query.limit ?? 500);
       const data = await getStrategyKpis({ limit });
       res.json({ ok: true, ...data });
     } catch (e) {
@@ -1092,7 +1092,7 @@ function buildApp() {
   // Execution quality stats
   app.get("/admin/execution/quality", requirePerm("read"), async (req, res) => {
     try {
-      const limit = Number(req.query.limit || 500);
+      const limit = Number(req.query.limit ?? 500);
       const data = await getExecutionQuality({ limit });
       res.json({
         ok: true,
@@ -1133,7 +1133,7 @@ function buildApp() {
   // Audit & compliance logs
   app.get("/admin/audit/logs", requirePerm("read"), async (req, res) => {
     try {
-      const limit = Number(req.query.limit || 100);
+      const limit = Number(req.query.limit ?? 100);
       const rows = await listAuditLogs({ limit });
       res.json({ ok: true, rows });
     } catch (e) {
@@ -1189,7 +1189,7 @@ function buildApp() {
 
   app.get("/admin/alerts/incidents", requirePerm("read"), async (req, res) => {
     try {
-      const limit = Number(req.query.limit || 100);
+      const limit = Number(req.query.limit ?? 100);
       const rows = await listIncidents({ limit });
       res.json({ ok: true, rows });
     } catch (e) {
@@ -1237,9 +1237,9 @@ function buildApp() {
     async (req, res) => {
       const snapshot = telemetry.snapshot();
       const isEmpty =
-        Number(snapshot.candidatesTotal || 0) === 0 &&
-        Number(snapshot.decisionsTotal || 0) === 0 &&
-        Number(snapshot.blockedTotal || 0) === 0;
+        Number(snapshot.candidatesTotal ?? 0) === 0 &&
+        Number(snapshot.decisionsTotal ?? 0) === 0 &&
+        Number(snapshot.blockedTotal ?? 0) === 0;
 
       if (!isEmpty) {
         res.json({ ok: true, source: "memory", data: snapshot });

@@ -31,7 +31,7 @@ function isExpiryAllowed({ expiryISO, env, nowMs, minDaysToExpiry, avoidExpiryDa
 
   const configuredMin = Number.isFinite(Number(minDaysToExpiry))
     ? Number(minDaysToExpiry)
-    : Number(env?.OPT_MIN_DAYS_TO_EXPIRY || 0);
+    : Number(env?.OPT_MIN_DAYS_TO_EXPIRY ?? 0);
   const allowZeroDte = Boolean(env?.OPT_ALLOW_ZERO_DTE ?? false);
   const minDays = allowZeroDte ? configuredMin : Math.max(1, configuredMin);
 

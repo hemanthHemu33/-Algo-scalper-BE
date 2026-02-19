@@ -35,7 +35,7 @@ function roundToTick(price, tick, mode = "nearest") {
 }
 
 function atrLast(candles, period = 14) {
-  const p = Math.max(2, Number(period || 14));
+  const p = Math.max(2, Number(period ?? 14));
   if (!Array.isArray(candles) || candles.length < p + 2) return null;
   let trs = [];
   for (let i = candles.length - p; i < candles.length; i += 1) {
@@ -135,7 +135,7 @@ function computePrevDayLevels(candles, env) {
 
 function vwap(candles, lookback = 120) {
   if (!Array.isArray(candles) || !candles.length) return null;
-  const n = Math.max(5, Number(lookback || 120));
+  const n = Math.max(5, Number(lookback ?? 120));
   const tail = candles.slice(-n);
   let pv = 0;
   let v = 0;
@@ -163,7 +163,7 @@ function computeOpeningRange(candles, env, intervalMin) {
   if (!Array.isArray(candles) || !candles.length) return null;
   const openMin = hhmmToMinutes(env.MARKET_OPEN || "09:15");
   if (openMin == null) return null;
-  const win = Math.max(5, Number(env.SELECTOR_OPEN_WINDOW_MIN || 20));
+  const win = Math.max(5, Number(env.SELECTOR_OPEN_WINDOW_MIN ?? 20));
   const endMin = openMin + win;
   const todayKey = dayKey(safeNum(candles[candles.length - 1]?.ts), env);
 
@@ -276,8 +276,8 @@ function buildTradePlan({
   );
   const noiseMinMult = safeNum(env.PLAN_SL_NOISE_ATR_MIN_MULT, 0.25);
 
-  const swingLookback = Math.max(20, Number(env.PLAN_SWING_LOOKBACK || 60));
-  const rangeLookback = Math.max(20, Number(env.PLAN_RANGE_LOOKBACK || 30));
+  const swingLookback = Math.max(20, Number(env.PLAN_SWING_LOOKBACK ?? 60));
+  const rangeLookback = Math.max(20, Number(env.PLAN_RANGE_LOOKBACK ?? 30));
 
   const tailSwing = candles.slice(-swingLookback);
   const tailRange = candles.slice(-rangeLookback);

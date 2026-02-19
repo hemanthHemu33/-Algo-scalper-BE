@@ -73,8 +73,8 @@ function optionType(trade) {
 }
 
 function computeBaseRisk(trade) {
-  const entry = Number(trade.entryPrice || trade.candle?.close);
-  const sl0 = Number(trade.initialStopLoss || trade.stopLoss);
+  const entry = Number(trade.entryPrice ?? trade.candle?.close);
+  const sl0 = Number(trade.initialStopLoss ?? trade.stopLoss);
   const risk = Math.abs(entry - sl0);
   return { entry, sl0, risk: Number.isFinite(risk) ? risk : 0 };
 }
@@ -133,8 +133,8 @@ function computeTargetFromRisk({ side, entry, risk, rr, tick }) {
 }
 
 function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
-  const qty = Number(trade.qty || trade.initialQty || 0);
-  const mult = Number(env.DYN_BE_COST_MULT || 1.0);
+  const qty = Number(trade.qty ?? trade.initialQty ?? 0);
+  const mult = Number(env.DYN_BE_COST_MULT ?? 1.0);
   const spreadBps = Number(trade?.quoteAtEntry?.bps ?? 0);
 
   // Fallback: breakeven defaults to entry when qty/entry is unavailable.
@@ -188,12 +188,12 @@ function applyMinGreenExitRules({
   side,
   tick,
 }) {
-  const qty = Number(trade?.qty || trade?.initialQty || 0);
+  const qty = Number(trade?.qty ?? trade?.initialQty ?? 0);
   const minGreenEnabled = String(env.MIN_GREEN_ENABLED || "true") === "true";
-  const minGreenInr = minGreenEnabled ? Number(trade?.minGreenInr || 0) : 0;
-  const minGreenPts = minGreenEnabled ? Number(trade?.minGreenPts || 0) : 0;
+  const minGreenInr = minGreenEnabled ? Number(trade?.minGreenInr ?? 0) : 0;
+  const minGreenPts = minGreenEnabled ? Number(trade?.minGreenPts ?? 0) : 0;
 
-  const curSL = Number(trade?.stopLoss || sl0);
+  const curSL = Number(trade?.stopLoss ?? sl0);
   let newSL =
     basePlan?.sl?.stopLoss && Number.isFinite(basePlan.sl.stopLoss)
       ? Number(basePlan.sl.stopLoss)
@@ -202,7 +202,7 @@ function applyMinGreenExitRules({
   const tradePatch = { ...(basePlan?.tradePatch || {}) };
 
   const pnlInr = unrealizedPnlInr({ side, entry, ltp, qty });
-  const riskPerTradeInr = Number(trade?.riskInr || env.RISK_PER_TRADE_INR || 0);
+  const riskPerTradeInr = Number(trade?.riskInr ?? env.RISK_PER_TRADE_INR ?? 0);
   const pnlR =
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
       ? pnlInr / riskPerTradeInr
@@ -235,9 +235,9 @@ function applyMinGreenExitRules({
     tradePatch.peakPnlInr = peakPnlInr;
   }
 
-  const timeStopMin = Number(env.TIME_STOP_MIN || 0);
-  const noProgressMin = Number(env.TIME_STOP_NO_PROGRESS_MIN || 0);
-  const noProgressMfeR = Number(env.TIME_STOP_NO_PROGRESS_MFE_R || 0.2);
+  const timeStopMin = Number(env.TIME_STOP_MIN ?? 0);
+  const noProgressMin = Number(env.TIME_STOP_NO_PROGRESS_MIN ?? 0);
+  const noProgressMfeR = Number(env.TIME_STOP_NO_PROGRESS_MFE_R ?? 0.2);
   const noProgressUnderlyingConfirm =
     String(
       env.TIME_STOP_NO_PROGRESS_REQUIRE_UL_CONFIRM ||
@@ -250,14 +250,14 @@ function applyMinGreenExitRules({
     .trim()
     .toUpperCase();
   const noProgressUnderlyingBps = Number(
-    env.TIME_STOP_NO_PROGRESS_UL_BPS ||
-      env.TIME_STOP_NO_PROGRESS_UNDERLYING_MFE_BPS ||
+    env.TIME_STOP_NO_PROGRESS_UL_BPS ??
+      env.TIME_STOP_NO_PROGRESS_UNDERLYING_MFE_BPS ??
       12,
   );
-  const maxHoldMin = Number(env.TIME_STOP_MAX_HOLD_MIN || 0);
-  const maxHoldSkipIfPnlR = Number(env.TIME_STOP_MAX_HOLD_SKIP_IF_PNL_R || 0.8);
+  const maxHoldMin = Number(env.TIME_STOP_MAX_HOLD_MIN ?? 0);
+  const maxHoldSkipIfPnlR = Number(env.TIME_STOP_MAX_HOLD_SKIP_IF_PNL_R ?? 0.8);
   const maxHoldSkipIfPeakR = Number(
-    env.TIME_STOP_MAX_HOLD_SKIP_IF_PEAK_R || env.TIME_STOP_MAX_HOLD_SKIP_IF_PEAK_PNL_R || 1.0,
+    env.TIME_STOP_MAX_HOLD_SKIP_IF_PEAK_R ?? env.TIME_STOP_MAX_HOLD_SKIP_IF_PEAK_PNL_R ?? 1.0,
   );
   const maxHoldSkipIfLocked =
     String(env.TIME_STOP_MAX_HOLD_SKIP_IF_LOCKED || "true") !== "false";
@@ -275,9 +275,9 @@ function applyMinGreenExitRules({
       : null;
   const timeStopLatched = Boolean(trade?.timeStopTriggeredAt);
 
-  const beArmR = Number(env.BE_ARM_R || 0.6);
-  const beArmCostMult = Number(env.BE_ARM_COST_MULT || 2.0);
-  const trailArmR = Number(env.TRAIL_ARM_R || 1.0);
+  const beArmR = Number(env.BE_ARM_R ?? 0.6);
+  const beArmCostMult = Number(env.BE_ARM_COST_MULT ?? 2.0);
+  const trailArmR = Number(env.TRAIL_ARM_R ?? 1.0);
   const pnlStepInr = Number.isFinite(qty) && qty > 0 && Number.isFinite(tick) && tick > 0
     ? qty * tick
     : 0;
@@ -288,7 +288,7 @@ function applyMinGreenExitRules({
     Number.isFinite(estCostInr) && estCostInr > 0 && Number.isFinite(beArmCostMult) && beArmCostMult > 0
       ? beArmCostMult * estCostInr
       : null;
-  const beLockAtFallback = Number(env.BE_LOCK_AT_PROFIT_INR || 0);
+  const beLockAtFallback = Number(env.BE_LOCK_AT_PROFIT_INR ?? 0);
   const beLockAt = Math.max(
     Number.isFinite(beLockAtFromR) ? beLockAtFromR : 0,
     Number.isFinite(beLockAtFromCost) ? beLockAtFromCost : 0,
@@ -297,7 +297,7 @@ function applyMinGreenExitRules({
   const trailStartInr =
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
       ? trailArmR * riskPerTradeInr
-      : Number(env.DYN_TRAIL_START_PROFIT_INR || 0);
+      : Number(env.DYN_TRAIL_START_PROFIT_INR ?? 0);
   const beArmEpsInr = pnlStepInr;
   const trailArmEpsInr = pnlStepInr;
 
@@ -507,14 +507,14 @@ function applyMinGreenExitRules({
 
   const allowTrail = beLockedNow || trailLockedNow || trade?.tp1Done;
 
-  const trailGapPreBePct = Number(env.TRAIL_GAP_PRE_BE_PCT || 0.08);
-  const trailGapPostBePct = Number(env.TRAIL_GAP_POST_BE_PCT || 0.04);
-  const trailTightenR = Number(env.TRAIL_TIGHTEN_R || 1.5);
-  const trailGapPostBePctTight = Number(env.TRAIL_GAP_POST_BE_PCT_TIGHT || trailGapPostBePct);
-  const trailGapMinPts = Number(env.TRAIL_GAP_MIN_PTS || 2);
-  const trailGapMaxPts = Number(env.TRAIL_GAP_MAX_PTS || 10);
+  const trailGapPreBePct = Number(env.TRAIL_GAP_PRE_BE_PCT ?? 0.08);
+  const trailGapPostBePct = Number(env.TRAIL_GAP_POST_BE_PCT ?? 0.04);
+  const trailTightenR = Number(env.TRAIL_TIGHTEN_R ?? 1.5);
+  const trailGapPostBePctTight = Number(env.TRAIL_GAP_POST_BE_PCT_TIGHT ?? trailGapPostBePct);
+  const trailGapMinPts = Number(env.TRAIL_GAP_MIN_PTS ?? 2);
+  const trailGapMaxPts = Number(env.TRAIL_GAP_MAX_PTS ?? 10);
   const beBufferTicks = safeNum(env.BE_BUFFER_TICKS, safeNum(env.DYN_BE_BUFFER_TICKS, 1));
-  const triggerBufferTicks = Number(env.TRIGGER_BUFFER_TICKS || 1);
+  const triggerBufferTicks = Number(env.TRIGGER_BUFFER_TICKS ?? 1);
 
   const trueBE = toFiniteOrNaN(basePlan?.meta?.trueBE);
   let beFloor = null;
@@ -542,9 +542,9 @@ function applyMinGreenExitRules({
   }
 
   if (beLockedNow && Number.isFinite(entry) && Number.isFinite(qty) && qty > 0) {
-    const beLockKeepR = Number(env.BE_PROFIT_LOCK_KEEP_R || env.PROFIT_LOCK_KEEP_R || 0.25);
-    const beLockCostMult = Number(env.BE_PROFIT_LOCK_COST_MULT || env.PROFIT_LOCK_COST_MULT || 1.0);
-    const beLockMinInr = Number(env.BE_PROFIT_LOCK_MIN_INR || env.PROFIT_LOCK_MIN_INR || 0);
+    const beLockKeepR = Number(env.BE_PROFIT_LOCK_KEEP_R ?? env.PROFIT_LOCK_KEEP_R ?? 0.25);
+    const beLockCostMult = Number(env.BE_PROFIT_LOCK_COST_MULT ?? env.PROFIT_LOCK_COST_MULT ?? 1.0);
+    const beLockMinInr = Number(env.BE_PROFIT_LOCK_MIN_INR ?? env.PROFIT_LOCK_MIN_INR ?? 0);
     const lockByR =
       Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0 && Number.isFinite(beLockKeepR) && beLockKeepR > 0
         ? beLockKeepR * riskPerTradeInr
@@ -573,9 +573,9 @@ function applyMinGreenExitRules({
   }
 
   const profitLockEnabled = String(env.PROFIT_LOCK_ENABLED || "false") === "true";
-  const profitLockR = Number(env.PROFIT_LOCK_R || 1.0);
-  const profitLockKeepR = Number(env.PROFIT_LOCK_KEEP_R || 0.25);
-  const profitLockMinInr = Number(env.PROFIT_LOCK_MIN_INR || 0);
+  const profitLockR = Number(env.PROFIT_LOCK_R ?? 1.0);
+  const profitLockKeepR = Number(env.PROFIT_LOCK_KEEP_R ?? 0.25);
+  const profitLockMinInr = Number(env.PROFIT_LOCK_MIN_INR ?? 0);
   const profitLockArmed =
     profitLockEnabled && Number.isFinite(mfeR) && mfeR >= profitLockR;
   if (profitLockArmed && !trade?.profitLockArmedAt) {
@@ -655,10 +655,10 @@ function applyMinGreenExitRules({
     isOptionTrade(trade) &&
     Number.isFinite(entry) &&
     String(env.OPT_EXIT_ALLOW_WIDEN_SL || "true") === "true" &&
-    holdMin <= Number(env.OPT_EXIT_WIDEN_WINDOW_MIN || 2);
+    holdMin <= Number(env.OPT_EXIT_WIDEN_WINDOW_MIN ?? 2);
 
-  const baseRiskInr = Number(trade?.riskInr || env.RISK_PER_TRADE_INR || 0);
-  const widenMult = Number(env.OPT_EXIT_WIDEN_MAX_RISK_MULT || 1.3);
+  const baseRiskInr = Number(trade?.riskInr ?? env.RISK_PER_TRADE_INR ?? 0);
+  const widenMult = Number(env.OPT_EXIT_WIDEN_MAX_RISK_MULT ?? 1.3);
   const maxRiskInr =
     allowWiden && Number.isFinite(baseRiskInr) && baseRiskInr > 0
       ? baseRiskInr * Math.max(1, widenMult)
@@ -693,8 +693,8 @@ function applyMinGreenExitRules({
 
   const stepTicks = Number(
     beLockedNow
-      ? env.DYN_STEP_TICKS_POST_BE || env.DYN_TRAIL_STEP_TICKS || 10
-      : env.DYN_STEP_TICKS_PRE_BE || env.DYN_TRAIL_STEP_TICKS || 20,
+      ? env.DYN_STEP_TICKS_POST_BE ?? env.DYN_TRAIL_STEP_TICKS ?? 10
+      : env.DYN_STEP_TICKS_PRE_BE ?? env.DYN_TRAIL_STEP_TICKS ?? 20,
   );
   const step = stepTicks * tick;
   const curSlRounded = roundToTick(curSL, tick, side === "BUY" ? "down" : "up");
@@ -711,7 +711,7 @@ function applyMinGreenExitRules({
     if (!(Number.isFinite(beLockAt) && beLockAt > 0)) skipReasons.push("be_lock_disabled");
     else if (!meetsThreshold(pnlInr, beLockAt, beArmEpsInr))
       skipReasons.push(
-        `pnlInr=${Number(pnlInr || 0).toFixed(2)} < beLockAt=${beLockAt} (eps=${Number(beArmEpsInr || 0).toFixed(2)})`,
+        `pnlInr=${Number(pnlInr ?? 0).toFixed(2)} < beLockAt=${beLockAt} (eps=${Number(beArmEpsInr ?? 0).toFixed(2)})`,
       );
   }
 
@@ -724,7 +724,7 @@ function applyMinGreenExitRules({
   if (!trailLockedNow) {
     if (!(Number.isFinite(trailStartInr) && trailStartInr > 0)) skipReasons.push("trail_arm_disabled");
     else if (!allowTrail) {
-      skipReasons.push(`pnlInr=${Number(pnlInr || 0).toFixed(2)} < trailStartInr=${trailStartInr}`);
+      skipReasons.push(`pnlInr=${Number(pnlInr ?? 0).toFixed(2)} < trailStartInr=${trailStartInr}`);
     }
   }
 
@@ -753,7 +753,7 @@ function applyMinGreenExitRules({
   if (forceBePriorityMove) {
     skipReasons.push("be_priority_sl_move");
   } else if (!shouldMoveSL) {
-    skipReasons.push(`sl_move_below_step (move=${Number(slMove || 0).toFixed(2)}, step=${Number(step || 0).toFixed(2)})`);
+    skipReasons.push(`sl_move_below_step (move=${Number(slMove ?? 0).toFixed(2)}, step=${Number(step ?? 0).toFixed(2)})`);
   }
 
   return {
@@ -813,7 +813,7 @@ function applyMinGreenExitRules({
 
 function premiumVolPct(candles, lookback = 20) {
   if (!Array.isArray(candles) || candles.length < 4) return null;
-  const n = Math.max(4, Math.min(Number(lookback || 20), 120));
+  const n = Math.max(4, Math.min(Number(lookback ?? 20), 120));
   const tail = candles.slice(-n);
   const rets = [];
   for (let i = 1; i < tail.length; i += 1) {
@@ -848,7 +848,7 @@ function optionExitFallback({
   beInfo,
 }) {
   const side = String(trade.side || "").toUpperCase();
-  const tick = Number(trade.instrument?.tick_size || 0.05);
+  const tick = Number(trade.instrument?.tick_size ?? 0.05);
 
   const { entry, sl0 } = computeBaseRisk(trade);
   if (
@@ -861,7 +861,7 @@ function optionExitFallback({
   if (side !== "BUY" && side !== "SELL")
     return { ok: false, reason: "invalid_side" };
 
-  const now = Number(nowTs || Date.now());
+  const now = Number(nowTs ?? Date.now());
   const refTs =
     tsFrom(trade.entryFilledAt) ||
     tsFrom(trade.createdAt) ||
@@ -870,9 +870,9 @@ function optionExitFallback({
   const holdMin = Math.max(0, (now - refTs) / (60 * 1000));
 
   // ===== Time-based exit (hard stop) =====
-  const globalMaxHold = Number(env.TIME_STOP_MAX_HOLD_MIN || 0);
+  const globalMaxHold = Number(env.TIME_STOP_MAX_HOLD_MIN ?? 0);
   const proMaxHoldEnabled = Number.isFinite(globalMaxHold) && globalMaxHold > 0;
-  const maxHold = Number(env.OPT_EXIT_MAX_HOLD_MIN || 25);
+  const maxHold = Number(env.OPT_EXIT_MAX_HOLD_MIN ?? 25);
   if (!proMaxHoldEnabled && Number.isFinite(maxHold) && maxHold > 0 && holdMin >= maxHold) {
     return {
       ok: true,
@@ -883,9 +883,9 @@ function optionExitFallback({
 
   // ===== Coarse "IV crush" protection =====
   // If premium is falling sharply while underlying hasn't moved much, it's often IV crush / theta bleed.
-  const neutralBps = Number(env.OPT_IV_NEUTRAL_BPS || 12);
-  const crushPct = Number(env.OPT_IV_CRUSH_PREMIUM_PCT || 18);
-  const crushMinHold = Number(env.OPT_IV_CRUSH_MIN_HOLD_MIN || 3);
+  const neutralBps = Number(env.OPT_IV_NEUTRAL_BPS ?? 12);
+  const crushPct = Number(env.OPT_IV_CRUSH_PREMIUM_PCT ?? 18);
+  const crushMinHold = Number(env.OPT_IV_CRUSH_MIN_HOLD_MIN ?? 3);
 
   const pPct = profitPct({ side, entry, ltp }); // BUY positive == profit
   const uBps = underlyingMoveBps({ trade, underlyingLtp });
@@ -912,15 +912,15 @@ function optionExitFallback({
   }
 
   // ===== Premium % model (w/ volatility-aware widening) =====
-  const baseSlPct = Number(env.OPT_EXIT_BASE_SL_PCT || 18);
-  const baseTpPct = Number(env.OPT_EXIT_BASE_TARGET_PCT || 35);
-  const minSlPct = Number(env.OPT_EXIT_MIN_SL_PCT || 8);
-  const maxSlPct = Number(env.OPT_EXIT_MAX_SL_PCT || env.OPT_MAX_SL_PCT || 35);
+  const baseSlPct = Number(env.OPT_EXIT_BASE_SL_PCT ?? 18);
+  const baseTpPct = Number(env.OPT_EXIT_BASE_TARGET_PCT ?? 35);
+  const minSlPct = Number(env.OPT_EXIT_MIN_SL_PCT ?? 8);
+  const maxSlPct = Number(env.OPT_EXIT_MAX_SL_PCT ?? env.OPT_MAX_SL_PCT ?? 35);
 
-  const volLookback = Number(env.OPT_EXIT_VOL_LOOKBACK || 20);
-  const volRef = Number(env.OPT_EXIT_VOL_REF_PCT || 6);
-  const vfMin = Number(env.OPT_EXIT_WIDEN_FACTOR_MIN || 0.75);
-  const vfMax = Number(env.OPT_EXIT_WIDEN_FACTOR_MAX || 1.8);
+  const volLookback = Number(env.OPT_EXIT_VOL_LOOKBACK ?? 20);
+  const volRef = Number(env.OPT_EXIT_VOL_REF_PCT ?? 6);
+  const vfMin = Number(env.OPT_EXIT_WIDEN_FACTOR_MIN ?? 0.75);
+  const vfMax = Number(env.OPT_EXIT_WIDEN_FACTOR_MAX ?? 1.8);
 
   const volPct = premiumVolPct(candles, volLookback);
   const volFactor =
@@ -956,7 +956,7 @@ function optionExitFallback({
   // ===== Controlled early widening (options only) =====
   const allowWiden =
     String(env.OPT_EXIT_ALLOW_WIDEN_SL || "true") === "true" &&
-    holdMin <= Number(env.OPT_EXIT_WIDEN_WINDOW_MIN || 2);
+    holdMin <= Number(env.OPT_EXIT_WIDEN_WINDOW_MIN ?? 2);
 
   if (allowWiden && Number.isFinite(curSL)) {
     // If current SL is much tighter than the model, widen it to reduce early noise stop-outs.
@@ -966,10 +966,10 @@ function optionExitFallback({
   }
 
   // ===== Premium trailing (after profit threshold) =====
-  const trailStartPct = Number(env.OPT_EXIT_TRAIL_START_PROFIT_PCT || 15);
-  const baseTrailPct = Number(env.OPT_EXIT_TRAIL_PCT_BASE || 12);
-  const trailMin = Number(env.OPT_EXIT_TRAIL_PCT_MIN || 6);
-  const trailMax = Number(env.OPT_EXIT_TRAIL_PCT_MAX || 22);
+  const trailStartPct = Number(env.OPT_EXIT_TRAIL_START_PROFIT_PCT ?? 15);
+  const baseTrailPct = Number(env.OPT_EXIT_TRAIL_PCT_BASE ?? 12);
+  const trailMin = Number(env.OPT_EXIT_TRAIL_PCT_MIN ?? 6);
+  const trailMax = Number(env.OPT_EXIT_TRAIL_PCT_MAX ?? 22);
 
   const trailPct = clamp(baseTrailPct * volFactor, trailMin, trailMax);
 
@@ -985,20 +985,20 @@ function optionExitFallback({
 
   // ===== IV spike heuristic: premium up a lot while underlying "neutral" =====
   // Lock profits aggressively: tighten SL and optionally place a marketable target to hit bid/ask.
-  const spikePct = Number(env.OPT_IV_SPIKE_PREMIUM_PCT || 25);
+  const spikePct = Number(env.OPT_IV_SPIKE_PREMIUM_PCT ?? 25);
   if (
     Number.isFinite(absUBps) &&
     absUBps <= neutralBps &&
     Number.isFinite(spikePct) &&
     pPct >= spikePct
   ) {
-    const spikeTrailPct = Number(env.OPT_IV_SPIKE_TRAIL_PCT || 10);
+    const spikeTrailPct = Number(env.OPT_IV_SPIKE_TRAIL_PCT ?? 10);
     if (side === "BUY") {
       const lockSL = roundToTick(ltp * (1 - spikeTrailPct / 100), tick, "down");
       newSL = Math.max(newSL, lockSL);
 
       if (String(env.OPT_IV_SPIKE_TP_TO_BID || "true") === "true") {
-        const bidTicks = Number(env.OPT_IV_SPIKE_TP_BID_TICKS || 1);
+        const bidTicks = Number(env.OPT_IV_SPIKE_TP_BID_TICKS ?? 1);
         const mktable = roundToTick(
           ltp - Math.max(1, bidTicks) * tick,
           tick,
@@ -1013,7 +1013,7 @@ function optionExitFallback({
       newSL = Math.min(newSL, lockSL);
 
       if (String(env.OPT_IV_SPIKE_TP_TO_BID || "true") === "true") {
-        const bidTicks = Number(env.OPT_IV_SPIKE_TP_BID_TICKS || 1);
+        const bidTicks = Number(env.OPT_IV_SPIKE_TP_BID_TICKS ?? 1);
         const mktable = roundToTick(
           ltp + Math.max(1, bidTicks) * tick,
           tick,
@@ -1038,7 +1038,7 @@ function optionExitFallback({
   else newSL = Math.min(newSL, floorSL);
 
   // ===== Decide whether to send modifications =====
-  const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 20);
+  const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS ?? 20);
   const step = stepTicks * tick;
 
   const slMove = Number.isFinite(curSL)
@@ -1096,10 +1096,10 @@ function computeDynamicExitPlan({
   underlyingLtp = undefined,
 }) {
   const side = String(trade?.side || "").toUpperCase();
-  const tick = Number(trade?.instrument?.tick_size || 0.05);
+  const tick = Number(trade?.instrument?.tick_size ?? 0.05);
 
   const { entry, sl0, risk } = computeBaseRisk(trade);
-  const rr = Number(trade?.rr || env.RR_TARGET || 1.0);
+  const rr = Number(trade?.rr ?? env.RR_TARGET ?? 1.0);
 
   // Required
   if (
@@ -1110,7 +1110,7 @@ function computeDynamicExitPlan({
   )
     return { ok: false, reason: "missing_prices" };
 
-  const now = Number(nowTs || Date.now());
+  const now = Number(nowTs ?? Date.now());
   const beInfo = estimateTrueBreakeven({ trade, entry, side, tick, env });
 
   let basePlan = null;
@@ -1155,17 +1155,17 @@ function computeDynamicExitPlan({
     const pr = profitR({ side, entry, ltp, risk });
 
     // ---------- trailing stop ----------
-    const atrPeriod = Number(env.DYN_ATR_PERIOD || 14);
+    const atrPeriod = Number(env.DYN_ATR_PERIOD ?? 14);
     const a = atr(candles, atrPeriod);
-    const atrMult = Number(env.DYN_TRAIL_ATR_MULT || 1.2);
+    const atrMult = Number(env.DYN_TRAIL_ATR_MULT ?? 1.2);
 
     // Start ATR trailing only after X R in profit
-    const trailStartR = Number(env.DYN_TRAIL_START_R || 1.0);
+    const trailStartR = Number(env.DYN_TRAIL_START_R ?? 1.0);
 
     // Move SL to "true breakeven" after Y R in profit
-    const beAtR = Number(env.DYN_MOVE_SL_TO_BE_AT_R || 0.8);
+    const beAtR = Number(env.DYN_MOVE_SL_TO_BE_AT_R ?? 0.8);
 
-    const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS || 20); // minimum move before modifying
+    const stepTicks = Number(env.DYN_TRAIL_STEP_TICKS ?? 20); // minimum move before modifying
     const step = stepTicks * tick;
 
     // candles since entry
@@ -1180,7 +1180,7 @@ function computeDynamicExitPlan({
     const lo = minLow(slice);
 
     // Current stop in DB (may already be trailed)
-    const curSL = Number(trade.stopLoss || sl0);
+    const curSL = Number(trade.stopLoss ?? sl0);
     let newSL = curSL;
 
     // Break-even move (fee-safe BE)
@@ -1211,15 +1211,15 @@ function computeDynamicExitPlan({
 
     // ---------- dynamic target ----------
     const mode = String(env.DYN_TARGET_MODE || "STATIC").toUpperCase(); // STATIC|FOLLOW_RR|TIGHTEN_VWAP
-    const rrFollow = Number(env.DYN_TARGET_RR || rr);
-    const tightenVwapFrac = Number(env.DYN_TARGET_TIGHTEN_FRAC || 0.6); // how aggressively to pull target in
+    const rrFollow = Number(env.DYN_TARGET_RR ?? rr);
+    const tightenVwapFrac = Number(env.DYN_TARGET_TIGHTEN_FRAC ?? 0.6); // how aggressively to pull target in
 
-    const curTarget = Number(trade.targetPrice || 0);
+    const curTarget = Number(trade.targetPrice ?? 0);
     let newTarget = curTarget > 0 ? curTarget : null;
 
     const allowTargetTighten =
       String(env.DYN_ALLOW_TARGET_TIGHTEN || "false") === "true" ||
-      pr >= Number(env.DYN_TARGET_TIGHTEN_AFTER_R || 1.5);
+      pr >= Number(env.DYN_TARGET_TIGHTEN_AFTER_R ?? 1.5);
 
     if (mode === "FOLLOW_RR" && allowTargetTighten) {
       // Keep RR aligned to the *current* stop (as SL trails up, target tightens too)
@@ -1236,7 +1236,7 @@ function computeDynamicExitPlan({
 
     if (mode === "TIGHTEN_VWAP" && allowTargetTighten) {
       // If price comes back to VWAP, tighten target to get out quicker (only after enough profit).
-      const vwap = rollingVWAP(candles, Number(env.DYN_VWAP_LOOKBACK || 120));
+      const vwap = rollingVWAP(candles, Number(env.DYN_VWAP_LOOKBACK ?? 120));
       if (Number.isFinite(vwap) && vwap > 0) {
         const dist = Math.abs(ltp - vwap);
         // If we're close to VWAP relative to initial risk, reduce target to secure profit.
