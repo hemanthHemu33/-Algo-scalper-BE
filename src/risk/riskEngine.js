@@ -157,6 +157,11 @@ class RiskEngine {
     }
 
     if (this.kill) return { ok: false, reason: "kill_switch" };
+    const maxTradesPerDay = Number(
+      (this.limits?.maxTradesPerDay ?? env.MAX_TRADES_PER_DAY) ?? 8,
+    );
+    if (Number.isFinite(maxTradesPerDay) && this.tradesToday >= maxTradesPerDay)
+      return { ok: false, reason: "max_trades_day" };
     const maxOpenTrades = Number(
       (this.limits?.maxOpenTrades ?? env.MAX_OPEN_POSITIONS) ?? 1,
     );

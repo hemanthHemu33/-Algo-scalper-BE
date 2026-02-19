@@ -599,6 +599,7 @@ const schema = z.object({
   LOT_RISK_CAP_APPLY_IN_MARGIN_MODE: z.string().default("true"),
   // Tolerance to avoid micro blocks due to rounding (e.g., 0.02 = 2%)
   LOT_RISK_CAP_EPS_PCT: z.coerce.number().default(0.02),
+  MAX_TRADES_PER_DAY: z.coerce.number().default(5),
   MAX_OPEN_POSITIONS: z.coerce.number().default(1),
   SYMBOL_COOLDOWN_SECONDS: z.coerce.number().default(180),
   SYMBOL_COOLDOWN_AFTER_SL_SEC: z.coerce.number().default(300),
