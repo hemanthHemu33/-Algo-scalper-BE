@@ -106,6 +106,12 @@ function dayRange() {
   return { start: start.toJSDate(), end: end.toJSDate() };
 }
 
+
+function toFiniteOrNaN(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : NaN;
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -1208,7 +1214,7 @@ class TradeManager {
         }
       }
 
-      const peakLtp = Number(trade?.peakLtp || NaN);
+      const peakLtp = toFiniteOrNaN(trade?.peakLtp);
       if (Number.isFinite(peakLtp) && peakLtp > 0) {
         this._dynPeakLtpByTrade.set(tradeId, peakLtp);
       }
@@ -1305,7 +1311,7 @@ class TradeManager {
     if (side !== "BUY" && side !== "SELL") return;
 
     const tradeId = String(this.activeTradeId);
-    const prev = Number(this._dynPeakLtpByTrade.get(tradeId) || NaN);
+    const prev = toFiniteOrNaN(this._dynPeakLtpByTrade.get(tradeId));
     let next = prev;
     if (!Number.isFinite(prev)) next = ltp;
     else if (side === "BUY") next = Math.max(prev, ltp);
@@ -5604,7 +5610,7 @@ class TradeManager {
         return;
       }
 
-      const peakFromTick = Number(this._dynPeakLtpByTrade.get(tradeId) || NaN);
+      const peakFromTick = toFiniteOrNaN(this._dynPeakLtpByTrade.get(tradeId));
       const tradeForPlan = Number.isFinite(peakFromTick)
         ? { ...trade, peakLtp: peakFromTick }
         : trade;
@@ -5717,7 +5723,7 @@ class TradeManager {
 
       let peakPatch = null;
       if (Number.isFinite(peakFromTick)) {
-        const dbPeak = Number(trade?.peakLtp || NaN);
+        const dbPeak = toFiniteOrNaN(trade?.peakLtp);
         const side = String(trade?.side || "").toUpperCase();
         const isBetter =
           side === "BUY"

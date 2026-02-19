@@ -24,9 +24,14 @@ function clamp(n, lo, hi) {
 }
 
 function safeNum(v, fb = null) {
-  if (v == null) return fb;
+  if (v === null || v === undefined || v === "") return fb;
   const n = Number(v);
   return Number.isFinite(n) ? n : fb;
+}
+
+function toFiniteOrNaN(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : NaN;
 }
 
 function tsFrom(v) {
@@ -80,7 +85,7 @@ function profitR({ side, entry, ltp, risk }) {
 }
 
 function bestPeakLtp({ trade, ltp, side }) {
-  const dbPeak = Number(trade?.peakLtp || NaN);
+  const dbPeak = toFiniteOrNaN(trade?.peakLtp);
   if (Number.isFinite(dbPeak)) {
     if (side === "BUY") return Number.isFinite(ltp) ? Math.max(dbPeak, ltp) : dbPeak;
     if (side === "SELL") return Number.isFinite(ltp) ? Math.min(dbPeak, ltp) : dbPeak;
@@ -130,7 +135,7 @@ function computeTargetFromRisk({ side, entry, risk, rr, tick }) {
 function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
   const qty = Number(trade.qty || trade.initialQty || 0);
   const mult = Number(env.DYN_BE_COST_MULT || 1.0);
-  const spreadBps = Number(trade?.quoteAtEntry?.bps || 0);
+  const spreadBps = Number(trade?.quoteAtEntry?.bps ?? 0);
 
   // Fallback: breakeven defaults to entry when qty/entry is unavailable.
   if (!Number.isFinite(entry) || entry <= 0 || !(qty > 0)) {
@@ -144,6 +149,7 @@ function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
     entryPrice: entry,
     qty,
     spreadBps,
+    includeSpread: true,
     env,
     instrument: trade?.instrument || null,
   });
@@ -207,11 +213,10 @@ function applyMinGreenExitRules({
   const peakPnlFromPriceInr = Number.isFinite(peakLtpNow)
     ? unrealizedPnlInr({ side, entry, ltp: peakLtpNow, qty })
     : null;
-  const finiteOrNaN = (v) => (Number.isFinite(v) ? Number(v) : NaN);
-  const prevPeakPnlInr = Number(trade?.peakPnlInr || NaN);
+  const prevPeakPnlInr = toFiniteOrNaN(trade?.peakPnlInr);
   const peakPnlInr = Number.isFinite(prevPeakPnlInr)
-    ? Math.max(prevPeakPnlInr, pnlInr, finiteOrNaN(peakPnlFromPriceInr))
-    : Math.max(pnlInr, finiteOrNaN(peakPnlFromPriceInr));
+    ? Math.max(prevPeakPnlInr, pnlInr, toFiniteOrNaN(peakPnlFromPriceInr))
+    : Math.max(pnlInr, toFiniteOrNaN(peakPnlFromPriceInr));
   const peakPnlR =
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
       ? peakPnlInr / riskPerTradeInr
@@ -219,7 +224,7 @@ function applyMinGreenExitRules({
   const peakPriceR = Number.isFinite(peakLtpNow)
     ? profitR({ side, entry, ltp: peakLtpNow, risk: priceRisk })
     : null;
-  const mfeR = Math.max(finiteOrNaN(peakPnlR), finiteOrNaN(peakPriceR));
+  const mfeR = Math.max(toFiniteOrNaN(peakPnlR), toFiniteOrNaN(peakPriceR));
   const peakRForRules = Number.isFinite(mfeR)
     ? mfeR
     : Number.isFinite(peakPnlR)
@@ -271,7 +276,7 @@ function applyMinGreenExitRules({
   const pnlStepInr = Number.isFinite(qty) && qty > 0 && Number.isFinite(tick) && tick > 0
     ? qty * tick
     : 0;
-  const estCostInr = Number(basePlan?.meta?.trueBEMeta?.estCostInr || NaN);
+  const estCostInr = toFiniteOrNaN(basePlan?.meta?.trueBEMeta?.estCostInr);
   const beLockAtFromR =
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0 ? beArmR * riskPerTradeInr : null;
   const beLockAtFromCost =
@@ -302,10 +307,15 @@ function applyMinGreenExitRules({
   const absUnderlyingMoveBps = Number.isFinite(underlyingMoveBpsNow)
     ? Math.abs(underlyingMoveBpsNow)
     : null;
-  const prevPeakUnderlyingMoveBps = Number(trade?.peakUnderlyingMoveBps || NaN);
+  const prevPeakUnderlyingMoveBps = toFiniteOrNaN(trade?.peakUnderlyingMoveBps);
   const peakUnderlyingMoveBps = Number.isFinite(prevPeakUnderlyingMoveBps)
-    ? Math.max(prevPeakUnderlyingMoveBps, Number(absUnderlyingMoveBps || NaN))
+    ? Math.max(prevPeakUnderlyingMoveBps, toFiniteOrNaN(absUnderlyingMoveBps))
     : absUnderlyingMoveBps;
+  const hasUnderlyingMove = Number.isFinite(absUnderlyingMoveBps);
+  const noProgressUnderlyingSatisfied =
+    !noProgressUnderlyingConfirm ||
+    !Number.isFinite(noProgressUnderlyingBps) ||
+    (hasUnderlyingMove && absUnderlyingMoveBps < noProgressUnderlyingBps);
   if (
     Number.isFinite(peakUnderlyingMoveBps) &&
     (!Number.isFinite(prevPeakUnderlyingMoveBps) ||
@@ -353,10 +363,7 @@ function applyMinGreenExitRules({
     Number.isFinite(noProgressMfeR) &&
     Number.isFinite(mfeR) &&
     mfeR < noProgressMfeR &&
-    (!noProgressUnderlyingConfirm ||
-      !Number.isFinite(noProgressUnderlyingBps) ||
-      !Number.isFinite(absUnderlyingMoveBps) ||
-      absUnderlyingMoveBps < noProgressUnderlyingBps)
+    noProgressUnderlyingSatisfied
   ) {
     return {
       ...basePlan,
@@ -376,6 +383,11 @@ function applyMinGreenExitRules({
         noProgressMfeR,
         noProgressUnderlyingConfirm,
         noProgressUnderlyingBps,
+        noProgressUnderlyingStatus: noProgressUnderlyingConfirm
+          ? hasUnderlyingMove
+            ? "KNOWN"
+            : "UNKNOWN"
+          : "BYPASSED",
         mfeR,
         underlyingMoveBps: underlyingMoveBpsNow,
         absUnderlyingMoveBps,
@@ -490,10 +502,10 @@ function applyMinGreenExitRules({
   const trailGapPostBePctTight = Number(env.TRAIL_GAP_POST_BE_PCT_TIGHT || trailGapPostBePct);
   const trailGapMinPts = Number(env.TRAIL_GAP_MIN_PTS || 2);
   const trailGapMaxPts = Number(env.TRAIL_GAP_MAX_PTS || 10);
-  const beBufferTicks = Number(env.BE_BUFFER_TICKS || env.DYN_BE_BUFFER_TICKS || 1);
+  const beBufferTicks = safeNum(env.BE_BUFFER_TICKS, safeNum(env.DYN_BE_BUFFER_TICKS, 1));
   const triggerBufferTicks = Number(env.TRIGGER_BUFFER_TICKS || 1);
 
-  const trueBE = Number(basePlan?.meta?.trueBE || NaN);
+  const trueBE = toFiniteOrNaN(basePlan?.meta?.trueBE);
   let beFloor = null;
   let beProfitLockFloor = null;
   if (beLockedNow && Number.isFinite(trueBE)) {
@@ -568,7 +580,7 @@ function applyMinGreenExitRules({
     allowTrail &&
     Number.isFinite(ltp)
   ) {
-    const prevPeak = Number(trade?.peakLtp || NaN);
+    const prevPeak = toFiniteOrNaN(trade?.peakLtp);
     let peakLtp = prevPeak;
     if (side === "BUY") {
       peakLtp = Number.isFinite(prevPeak) ? Math.max(prevPeak, ltp) : ltp;
@@ -799,11 +811,10 @@ function premiumVolPct(candles, lookback = 20) {
 
 function underlyingMoveBps({ trade, underlyingLtp }) {
   const uEntry = safeNum(
-    trade?.underlying_ltp || trade?.option_meta?.underlyingLtp,
+    trade?.underlying_ltp ?? trade?.option_meta?.underlyingLtp,
   );
   const uNow = safeNum(underlyingLtp);
-  if (!(uEntry > 0) || !(uNow > 0))
-    return null;
+  if (!(uEntry > 0) || !(uNow > 0)) return null;
   return ((uNow - uEntry) / uEntry) * 10000;
 }
 
