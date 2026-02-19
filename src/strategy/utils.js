@@ -1,12 +1,12 @@
 function avg(arr) {
   if (!arr || !arr.length) return 0;
-  const s = arr.reduce((a, b) => a + Number(b || 0), 0);
+  const s = arr.reduce((a, b) => a + Number(b ?? 0), 0);
   return s / arr.length;
 }
 
 function avgVolume(candles, lookback = 20) {
   const slice = (candles || []).slice(-lookback);
-  return avg(slice.map((c) => Number(c.volume || 0)));
+  return avg(slice.map((c) => Number(c.volume ?? 0)));
 }
 
 function rollingVWAP(candles, lookback = 120) {
@@ -14,12 +14,12 @@ function rollingVWAP(candles, lookback = 120) {
   let tpv = 0;
   let v = 0;
   for (const c of slice) {
-    const vol = Number(c.volume || 0);
+    const vol = Number(c.volume ?? 0);
     const tp = (Number(c.high) + Number(c.low) + Number(c.close)) / 3;
     tpv += tp * vol;
     v += vol;
   }
-  return v > 0 ? tpv / v : Number(slice[slice.length - 1]?.close || 0);
+  return v > 0 ? tpv / v : Number(slice[slice.length - 1]?.close ?? 0);
 }
 
 /**
@@ -28,7 +28,7 @@ function rollingVWAP(candles, lookback = 120) {
  */
 function maxHigh(candles, lookback = 0) {
   const arr = Array.isArray(candles) ? candles : [];
-  const lb = Number(lookback || 0);
+  const lb = Number(lookback ?? 0);
   const use = lb > 0 ? arr.slice(-lb) : arr;
 
   let m = -Infinity;
@@ -42,7 +42,7 @@ function maxHigh(candles, lookback = 0) {
 
 function minLow(candles, lookback = 0) {
   const arr = Array.isArray(candles) ? candles : [];
-  const lb = Number(lookback || 0);
+  const lb = Number(lookback ?? 0);
   const use = lb > 0 ? arr.slice(-lb) : arr;
 
   let m = Infinity;

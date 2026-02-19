@@ -62,23 +62,23 @@ async function checkTopOfBookStability({
   const sym = instrument?.tradingsymbol;
   const key = `${safeUpper(ex)}:${safeUpper(sym)}`;
 
-  const n = Math.max(2, Number(snapshots || env.ENTRY_QUOTE_STABILITY_SNAPSHOTS || 3));
-  const totalWindow = Math.max(0, Number(windowMs || env.ENTRY_QUOTE_STABILITY_WINDOW_MS || 1500));
+  const n = Math.max(2, Number(snapshots ?? env.ENTRY_QUOTE_STABILITY_SNAPSHOTS ?? 3));
+  const totalWindow = Math.max(0, Number(windowMs ?? env.ENTRY_QUOTE_STABILITY_WINDOW_MS ?? 1500));
   const stepMs = n > 1 ? Math.floor(totalWindow / (n - 1)) : 0;
 
   const maxBps = Number.isFinite(Number(maxSpreadBps))
     ? Number(maxSpreadBps)
-    : Number(env.MAX_SPREAD_BPS || 15);
+    : Number(env.MAX_SPREAD_BPS ?? 15);
 
   const jitterBps = Number.isFinite(Number(maxSpreadJitterBps))
     ? Number(maxSpreadJitterBps)
-    : Number(env.ENTRY_QUOTE_STABILITY_MAX_SPREAD_JITTER_BPS || 4);
+    : Number(env.ENTRY_QUOTE_STABILITY_MAX_SPREAD_JITTER_BPS ?? 4);
 
   const minQty = Number.isFinite(Number(minTopQty)) ? Number(minTopQty) : 0;
 
   const maxDropPct = Number.isFinite(Number(maxTopQtyDropPct))
     ? Number(maxTopQtyDropPct)
-    : Number(env.ENTRY_QUOTE_STABILITY_MAX_TOP_QTY_DROP_PCT || 40);
+    : Number(env.ENTRY_QUOTE_STABILITY_MAX_TOP_QTY_DROP_PCT ?? 40);
 
   const s = safeUpper(side || "BUY");
   const qtyField = s === "SELL" ? "bidQty" : "askQty";
@@ -120,8 +120,8 @@ async function checkTopOfBookStability({
 
     const bps = calcSpreadBps(t.bid, t.ask);
 
-    const sideQty = Number(t[qtyField] || 0);
-    const depthQtyTop = Number(t.bidQty || 0) + Number(t.askQty || 0);
+    const sideQty = Number(t[qtyField] ?? 0);
+    const depthQtyTop = Number(t.bidQty ?? 0) + Number(t.askQty ?? 0);
 
 
     samples.push({
@@ -193,8 +193,8 @@ async function checkTopOfBookStability({
   }
 
   // Liquidity pull check: compare first sideQty to min sideQty across snapshots
-  const firstQty = Number(samples?.[0]?.sideQty || 0);
-  const minQtySeen = Math.min(...samples.map((x) => Number(x.sideQty || 0)));
+  const firstQty = Number(samples?.[0]?.sideQty ?? 0);
+  const minQtySeen = Math.min(...samples.map((x) => Number(x.sideQty ?? 0)));
 
   if (!(firstQty > 0)) {
     return {

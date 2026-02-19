@@ -125,7 +125,7 @@ async function pickNearestFuture(kite, underlying, exchanges, nowMs = Date.now()
         tradingsymbol: best.tradingsymbol,
         segment: best.segment,
         expiry: best.expiry,
-        lot_size: Number(best.lot_size || 1),
+        lot_size: Number(best.lot_size ?? 1),
         tick_size: normalizeTickSize(best.tick_size),
       };
     }
@@ -230,7 +230,7 @@ async function buildFnoUniverse({ kite, nowMs = Date.now() }) {
         ? {
             ...signalContract,
             strike_ref_token: Number(
-              strikeRefContract?.instrument_token ||
+              strikeRefContract?.instrument_token ??
                 signalContract.instrument_token,
             ),
             strike_ref_exchange:

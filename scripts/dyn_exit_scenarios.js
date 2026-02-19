@@ -216,7 +216,7 @@ const scenarios = [
       assert.equal(plan.ok, true);
       assert.equal(plan.meta?.skipReason?.includes('be_priority_sl_move'), true);
       assert.equal(Number(plan.sl?.stopLoss) > Number(trade.stopLoss), true);
-      assert.equal(Number(plan.meta?.desiredStopLoss) >= Number(plan.meta?.beFloor || 0), true);
+      assert.equal(Number(plan.meta?.desiredStopLoss) >= Number(plan.meta?.beFloor ?? 0), true);
     },
   },
   {
@@ -242,7 +242,7 @@ const scenarios = [
       assert.equal(plan.tradePatch?.profitLockInr, 25);
       assert.equal(plan.tradePatch?.profitLockR, 0.25);
       assert.ok(Number(plan.meta?.desiredStopLoss) >= 102.5);
-      assert.ok(Number(plan.meta?.desiredStopLoss) >= Number(plan.meta?.beFloor || 0));
+      assert.ok(Number(plan.meta?.desiredStopLoss) >= Number(plan.meta?.beFloor ?? 0));
       assert.ok(Number(plan.sl?.stopLoss) < ltp, 'SL trigger must stay below LTP for BUY');
       assert.ok(Number(plan.sl?.stopLoss) > trade.stopLoss, 'SL must tighten, not loosen');
     },

@@ -17,9 +17,9 @@ function pnlForTrade(t) {
   const gross = Number(t?.pnlGrossInr);
   if (Number.isFinite(gross)) return gross;
 
-  const entry = Number(t?.entryPrice || 0);
-  const exit = Number(t?.exitPrice || 0);
-  const qty = Number(t?.qty || 0);
+  const entry = Number(t?.entryPrice ?? 0);
+  const exit = Number(t?.exitPrice ?? 0);
+  const qty = Number(t?.qty ?? 0);
   const side = String(t?.side || "BUY").toUpperCase();
   if (!(entry > 0) || !(exit > 0) || !(qty > 0)) return null;
   return side === "BUY" ? (exit - entry) * qty : (entry - exit) * qty;
@@ -43,19 +43,19 @@ function anomalyTags(trade, pnl) {
     tags.push("ENTRY_LATENCY_HIGH");
   }
 
-  const entrySlip = Number(trade?.costPayload?.entrySlippage || 0);
-  const exitSlip = Number(trade?.costPayload?.exitSlippage || 0);
+  const entrySlip = Number(trade?.costPayload?.entrySlippage ?? 0);
+  const exitSlip = Number(trade?.costPayload?.exitSlippage ?? 0);
   if (entrySlip > 0 || exitSlip > 0) {
     const slippageTotal = entrySlip + exitSlip;
-    const feeBase = Math.abs(Number(trade?.pnlGrossInr || pnl || 0));
+    const feeBase = Math.abs(Number(trade?.pnlGrossInr ?? pnl ?? 0));
     if (slippageTotal >= 250 || (feeBase > 0 && slippageTotal / feeBase > 0.4)) {
       tags.push("SLIPPAGE_SPIKE");
     }
   }
 
-  const fees = Number(trade?.costPayload?.feesTotal || trade?.estCostsInr || 0);
+  const fees = Number(trade?.costPayload?.feesTotal ?? trade?.estCostsInr ?? 0);
   if (Number.isFinite(fees)) {
-    const pnlAbs = Math.abs(Number(pnl || 0));
+    const pnlAbs = Math.abs(Number(pnl ?? 0));
     if (fees > 0 && pnlAbs > 0 && fees / pnlAbs >= 0.75) {
       tags.push("FEES_DOMINANT");
     }

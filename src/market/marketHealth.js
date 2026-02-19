@@ -10,11 +10,11 @@ class MarketHealth {
   }
 
   onTicks(ticks) {
-    const expectedGapMs = Number(env.MARKET_HEALTH_GAP_MS || 2000);
+    const expectedGapMs = Number(env.MARKET_HEALTH_GAP_MS ?? 2000);
     const now = Date.now();
 
     for (const t of ticks || []) {
-      const token = Number(t?.instrument_token || t?.instrumentToken);
+      const token = Number(t?.instrument_token ?? t?.instrumentToken);
       if (!Number.isFinite(token) || token <= 0) continue;
 
       this.totalTicks += 1;

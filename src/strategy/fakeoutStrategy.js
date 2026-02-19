@@ -19,7 +19,7 @@ function fakeoutStrategy({ candles, lookback = 20, volLookback = 20, volMult = 1
   const curOpen = Number(cur.open);
 
   const av = avgVolume(candles, volLookback) || 1;
-  const v = Number(cur.volume || 0);
+  const v = Number(cur.volume ?? 0);
   if (v < av * volMult) return null;
 
   // upside fakeout -> SELL

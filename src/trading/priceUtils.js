@@ -5,7 +5,7 @@ function tickDecimals(tickSize) {
   const s = String(t);
   if (s.includes('e-')) {
     // e.g. 1e-7
-    return Number(s.split('e-')[1] || 0);
+    return Number(s.split('e-')[1] ?? 0);
   }
   const dot = s.indexOf('.');
   return dot >= 0 ? (s.length - dot - 1) : 0;

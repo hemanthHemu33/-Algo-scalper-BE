@@ -12,7 +12,7 @@ function volumeSpikeStrategy({ candles, volLookback = 20, volMult = 1.6, bodyFra
   const c = Number(last.close);
   const h = Number(last.high);
   const l = Number(last.low);
-  const v = Number(last.volume || 0);
+  const v = Number(last.volume ?? 0);
 
   const range = candleRange(last);
   if (range <= 0) return null;

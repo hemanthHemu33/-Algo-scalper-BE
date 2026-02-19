@@ -12,7 +12,7 @@ const http = require("http");
 
 async function main() {
   const host = process.env.HEALTH_HOST || "localhost";
-  const port = Number(process.env.HEALTH_PORT || process.env.PORT || 4001);
+  const port = Number(process.env.HEALTH_PORT ?? process.env.PORT ?? 4001);
   const headers = {};
   if (process.env.ADMIN_API_KEY) headers["x-api-key"] = process.env.ADMIN_API_KEY;
 

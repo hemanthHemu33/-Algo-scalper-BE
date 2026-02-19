@@ -32,7 +32,7 @@ function safeKey(s, maxLen = 180) {
 function inc(obj, key, n = 1) {
   if (!obj) return;
   const k = safeKey(key);
-  obj[k] = (obj[k] || 0) + Number(n || 0);
+  obj[k] = (obj[k] || 0) + Number(n ?? 0);
 }
 
 function bucketFeeMultiple(x) {
@@ -51,8 +51,8 @@ class TradeTelemetry {
       String(env.TELEMETRY_ENABLED || "true") === "true" &&
       String(env.TELEMETRY_TRADES_ENABLED || "true") === "true";
 
-    this._ringSize = Number(env.TELEMETRY_TRADES_RING_SIZE || 300);
-    this._flushSec = Number(env.TELEMETRY_FLUSH_SEC || 60);
+    this._ringSize = Number(env.TELEMETRY_TRADES_RING_SIZE ?? 300);
+    this._flushSec = Number(env.TELEMETRY_FLUSH_SEC ?? 60);
     this._dailyCollection =
       env.TELEMETRY_TRADES_DAILY_COLLECTION || "telemetry_trades_daily";
 
@@ -137,9 +137,9 @@ class TradeTelemetry {
       this._state.countFeeMultiple += 1;
     }
 
-    const g = Number(grossPnlInr || 0);
-    const c = Number(estCostInr || 0);
-    const n = Number(netAfterEstCostsInr || 0);
+    const g = Number(grossPnlInr ?? 0);
+    const c = Number(estCostInr ?? 0);
+    const n = Number(netAfterEstCostsInr ?? 0);
     if (Number.isFinite(g)) this._state.sumGrossPnlInr += g;
     if (Number.isFinite(c)) this._state.sumEstCostsInr += c;
     if (Number.isFinite(n)) this._state.sumNetAfterEstCostsInr += n;

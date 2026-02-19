@@ -390,7 +390,7 @@ async function ensureActivePositionSubscriptions({
 
 function startOcoReconcileLoop() {
   if (ocoReconcileTimer) return;
-  const everySec = Number(env.OCO_RECONCILE_INTERVAL_SEC || 5);
+  const everySec = Number(env.OCO_RECONCILE_INTERVAL_SEC ?? 5);
   if (!Number.isFinite(everySec) || everySec <= 0) return;
 
   ocoReconcileTimer = setInterval(
@@ -645,7 +645,7 @@ function wireEvents() {
     const dedupeTtlMs = 2500;
 
     for (const [k, ts] of recentOrderUpdateKeys.entries()) {
-      if (now - Number(ts || 0) > dedupeTtlMs) recentOrderUpdateKeys.delete(k);
+      if (now - Number(ts ?? 0) > dedupeTtlMs) recentOrderUpdateKeys.delete(k);
     }
     if (orderId && status && exTs && recentOrderUpdateKeys.has(dedupeKey)) {
       logger.info({ order_id: orderId, status, exTs }, "[ticker] duplicate order_update ignored");

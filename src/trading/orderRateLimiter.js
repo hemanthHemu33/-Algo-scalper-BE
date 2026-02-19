@@ -21,10 +21,10 @@ class OrderRateLimiter {
 
     this.maxPerSec = Number.isFinite(Number(maxPerSec))
       ? Number(maxPerSec)
-      : Number(env.MAX_ORDERS_PER_SEC || 10);
+      : Number(env.MAX_ORDERS_PER_SEC ?? 10);
     this.maxPerMin = Number.isFinite(Number(maxPerMin))
       ? Number(maxPerMin)
-      : Number(env.MAX_ORDERS_PER_MIN || 200);
+      : Number(env.MAX_ORDERS_PER_MIN ?? 200);
   }
 
   _bucketStartMs(now, sizeMs) {

@@ -155,7 +155,7 @@ async function main() {
   const tokenInstrument = await db.collection("instruments_cache").findOne({ instrument_token: Number(token) });
 
   const dataQuality = dataQualityMode === "off" ? null : assessDataQuality({ candles, intervalMin, timezone });
-  const dataIssues = Number(dataQuality?.summary?.totalIssues || 0);
+  const dataIssues = Number(dataQuality?.summary?.totalIssues ?? 0);
   if (dataIssues > 0 && dataQualityMode === "strict") {
     throw new Error(`Data quality validation failed (${dataIssues} issues). Re-run with --dataQuality=warn to inspect.`);
   }
@@ -219,7 +219,7 @@ async function main() {
           minPartialFillRatio,
           eventBroker,
           latencyBars: 0,
-          tickSize: Number(pendingEntry.selectedContract?.selected?.instrument?.tick_size || 0.05),
+          tickSize: Number(pendingEntry.selectedContract?.selected?.instrument?.tick_size ?? 0.05),
         };
         const exec = execRealism
           ? eventBroker
@@ -242,8 +242,8 @@ async function main() {
               })
           : null;
 
-        const entryPrice = Number(exec?.avgFillPrice || rawEntry);
-        const filledQty = Number(exec?.filledQty || pendingEntry.qty);
+        const entryPrice = Number(exec?.avgFillPrice ?? rawEntry);
+        const filledQty = Number(exec?.filledQty ?? pendingEntry.qty);
         if (filledQty > 0 && Number.isFinite(entryPrice) && entryPrice > 0) {
           const riskPts = Math.max(0.05, entryPrice * (slPct / 100));
           const stopLoss = pendingEntry.side === "BUY" ? entryPrice - riskPts : entryPrice + riskPts;
@@ -272,7 +272,7 @@ async function main() {
             targetPrice,
             rr: rrTarget,
             strategyId: pendingEntry.sig.strategyId,
-            confidence: Number(pendingEntry.sig.confidence || 0),
+            confidence: Number(pendingEntry.sig.confidence ?? 0),
             signalReason: pendingEntry.sig.reason || null,
             mode,
             contractToken: pendingEntry.selectedContract?.selectedToken || Number(token),
@@ -281,7 +281,7 @@ async function main() {
               mode === "OPT"
                 ? {
                     optType: optionType,
-                    strike: Number(pendingEntry.selectedContract?.selected?.strike || 0) || null,
+                    strike: Number(pendingEntry.selectedContract?.selected?.strike ?? 0) || null,
                     expiry: pendingEntry.selectedContract?.selected?.expiryISO || null,
                     underlyingToken: Number(token),
                   }
@@ -364,13 +364,13 @@ async function main() {
           const basePx = forceExit
             ? Number.isFinite(ltp) && ltp > 0
               ? ltp
-              : Number(openTrade.lastLtp || underlyingCandle.close)
+              : Number(openTrade.lastLtp ?? underlyingCandle.close)
             : pathExit.price;
           const exitBasePx =
             eodBoundary?.shouldExitNow && !pathExit.hit && !forceExit
               ? Number.isFinite(ltp) && ltp > 0
                 ? ltp
-                : Number(openTrade.lastLtp || underlyingCandle.close)
+                : Number(openTrade.lastLtp ?? underlyingCandle.close)
               : basePx;
           const latencyBars = Math.max(0, Math.round((execCalibration?.avgFillLatencyMs || 0) / (intervalMin * 60 * 1000)));
           pendingExit = {
@@ -417,8 +417,8 @@ async function main() {
               })
           : null;
 
-        const exitPrice = Number(exec?.avgFillPrice || pendingExit.basePx);
-        const filledQty = Math.max(0, Math.min(Number(openTrade.qty || 0), Number(exec?.filledQty || openTrade.qty)));
+        const exitPrice = Number(exec?.avgFillPrice ?? pendingExit.basePx);
+        const filledQty = Math.max(0, Math.min(Number(openTrade.qty ?? 0), Number(exec?.filledQty ?? openTrade.qty)));
         if (filledQty > 0 && Number.isFinite(exitPrice)) {
           const signed = openTrade.side === "BUY" ? 1 : -1;
           const grossPnl = (exitPrice - openTrade.entryPrice) * filledQty * signed;
@@ -429,12 +429,12 @@ async function main() {
             env,
             instrument: openTrade.instrument,
           });
-          const netPnl = grossPnl - Number(costs.estCostInr || 0);
+          const netPnl = grossPnl - Number(costs.estCostInr ?? 0);
 
           openTrade.qty -= filledQty;
-          openTrade.realizedGrossPnl = Number(openTrade.realizedGrossPnl || 0) + grossPnl;
-          openTrade.realizedCostInr = Number(openTrade.realizedCostInr || 0) + Number(costs.estCostInr || 0);
-          openTrade.realizedNetPnl = Number(openTrade.realizedNetPnl || 0) + netPnl;
+          openTrade.realizedGrossPnl = Number(openTrade.realizedGrossPnl ?? 0) + grossPnl;
+          openTrade.realizedCostInr = Number(openTrade.realizedCostInr ?? 0) + Number(costs.estCostInr ?? 0);
+          openTrade.realizedNetPnl = Number(openTrade.realizedNetPnl ?? 0) + netPnl;
           openTrade.exitFills.push({
             ts: underlyingCandle.ts,
             qty: filledQty,
@@ -454,14 +454,14 @@ async function main() {
             delete finalizedTrade._lastManagedTs;
             trades.push({
               ...finalizedTrade,
-              qty: Number(openTrade.initialQty || 0),
+              qty: Number(openTrade.initialQty ?? 0),
               remainingQty: 0,
               exitTs: underlyingCandle.ts,
               exitReason: pendingExit.reason,
               exitPrice,
-              grossPnl: Number(openTrade.realizedGrossPnl || 0),
-              estCostInr: Number(openTrade.realizedCostInr || 0),
-              netPnl: Number(openTrade.realizedNetPnl || 0),
+              grossPnl: Number(openTrade.realizedGrossPnl ?? 0),
+              estCostInr: Number(openTrade.realizedCostInr ?? 0),
+              netPnl: Number(openTrade.realizedNetPnl ?? 0),
               executionModel: exec || null,
               holdCandles: i - openTrade.entryIdx,
             });
@@ -510,8 +510,8 @@ async function main() {
 
   if (openTrade && forceEodExit) {
     const last = candles[candles.length - 1] || null;
-    const exitPrice = Number(last?.close || openTrade.lastLtp || openTrade.entryPrice);
-    const filledQty = Number(openTrade.qty || 0);
+    const exitPrice = Number(last?.close ?? openTrade.lastLtp ?? openTrade.entryPrice);
+    const filledQty = Number(openTrade.qty ?? 0);
     if (filledQty > 0 && Number.isFinite(exitPrice) && exitPrice > 0) {
       const signed = openTrade.side === "BUY" ? 1 : -1;
       const grossPnl = (exitPrice - openTrade.entryPrice) * filledQty * signed;
@@ -522,7 +522,7 @@ async function main() {
         env,
         instrument: openTrade.instrument,
       });
-      const netPnl = grossPnl - Number(costs.estCostInr || 0);
+      const netPnl = grossPnl - Number(costs.estCostInr ?? 0);
 
       equity += netPnl;
       peak = Math.max(peak, equity);
@@ -534,15 +534,15 @@ async function main() {
       delete finalizedTrade._lastManagedTs;
       trades.push({
         ...finalizedTrade,
-        qty: Number(openTrade.initialQty || openTrade.qty || 0),
+        qty: Number(openTrade.initialQty ?? openTrade.qty ?? 0),
         remainingQty: 0,
         exitTs: last?.ts || new Date(),
         exitReason: "FORCE_EOD_END",
         exitPrice,
         grossPnl,
-        estCostInr: Number(costs.estCostInr || 0),
+        estCostInr: Number(costs.estCostInr ?? 0),
         netPnl,
-        holdCandles: candles.length - 1 - Number(openTrade.entryIdx || 0),
+        holdCandles: candles.length - 1 - Number(openTrade.entryIdx ?? 0),
       });
     }
     openTrade = null;
@@ -551,8 +551,8 @@ async function main() {
 
   const wins = trades.filter((t) => Number(t.netPnl) > 0).length;
   const losses = trades.filter((t) => Number(t.netPnl) <= 0).length;
-  const totalNet = trades.reduce((a, t) => a + Number(t.netPnl || 0), 0);
-  const totalCost = trades.reduce((a, t) => a + Number(t.estCostInr || 0), 0);
+  const totalNet = trades.reduce((a, t) => a + Number(t.netPnl ?? 0), 0);
+  const totalCost = trades.reduce((a, t) => a + Number(t.estCostInr ?? 0), 0);
 
   const run = {
     runAt: new Date().toISOString(),
@@ -625,9 +625,9 @@ function aggregatePerDay(trades) {
     const row = map.get(key);
     row.trades += 1;
     if (Number(t.netPnl) > 0) row.wins += 1;
-    row.netPnl += Number(t.netPnl || 0);
-    row.grossPnl += Number(t.grossPnl || 0);
-    row.costs += Number(t.estCostInr || 0);
+    row.netPnl += Number(t.netPnl ?? 0);
+    row.grossPnl += Number(t.grossPnl ?? 0);
+    row.costs += Number(t.estCostInr ?? 0);
   }
   return Array.from(map.values()).map((r) => ({ ...r, winRate: r.trades ? (r.wins / r.trades) * 100 : 0 }));
 }
@@ -640,7 +640,7 @@ function aggregatePerStrategy(trades) {
     const row = map.get(key);
     row.trades += 1;
     if (Number(t.netPnl) > 0) row.wins += 1;
-    row.netPnl += Number(t.netPnl || 0);
+    row.netPnl += Number(t.netPnl ?? 0);
   }
   return Array.from(map.values()).map((r) => ({ ...r, winRate: r.trades ? (r.wins / r.trades) * 100 : 0 }));
 }
@@ -772,9 +772,9 @@ function upsertOptionManagedCandles({ optionProvider, token, ts, trade }) {
 function instrumentFromContract({ fallbackToken, fallbackInstrument, selected, mode }) {
   const selectedInstrument = selected?.instrument || null;
   const inferredMode = String(mode || "").toUpperCase();
-  const token = Number(selected?.token || fallbackInstrument?.instrument_token || fallbackToken);
-  const tick = Number(selectedInstrument?.tick_size || fallbackInstrument?.tick_size || 0.05);
-  const lot = Number(selectedInstrument?.lot_size || fallbackInstrument?.lot_size || 1);
+  const token = Number(selected?.token ?? fallbackInstrument?.instrument_token ?? fallbackToken);
+  const tick = Number(selectedInstrument?.tick_size ?? fallbackInstrument?.tick_size ?? 0.05);
+  const lot = Number(selectedInstrument?.lot_size ?? fallbackInstrument?.lot_size ?? 1);
   const tradingsymbol =
     String(selectedInstrument?.tradingsymbol || fallbackInstrument?.tradingsymbol || "").toUpperCase() || null;
   const segmentRaw =

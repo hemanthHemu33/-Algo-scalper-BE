@@ -50,7 +50,7 @@ function _dteDays(expiryISO, nowMs = Date.now()) {
 }
 
 function roundToStep(price, step) {
-  const s = Number(step || 1);
+  const s = Number(step ?? 1);
   if (!Number.isFinite(s) || s <= 0) return Math.round(price);
   return Math.round(Number(price) / s) * s;
 }
@@ -63,9 +63,9 @@ function finiteNumberOrNull(value) {
 
 function strikeStepFallback(underlying) {
   const u = String(underlying || "").toUpperCase();
-  if (u === "NIFTY") return Number(env.OPT_STRIKE_STEP_NIFTY || 50);
-  if (u === "BANKNIFTY") return Number(env.OPT_STRIKE_STEP_BANKNIFTY || 100);
-  if (u === "SENSEX") return Number(env.OPT_STRIKE_STEP_SENSEX || 100);
+  if (u === "NIFTY") return Number(env.OPT_STRIKE_STEP_NIFTY ?? 50);
+  if (u === "BANKNIFTY") return Number(env.OPT_STRIKE_STEP_BANKNIFTY ?? 100);
+  if (u === "SENSEX") return Number(env.OPT_STRIKE_STEP_SENSEX ?? 100);
   return 50;
 }
 
@@ -102,7 +102,7 @@ function getPremiumBandForUnderlying(underlying) {
 }
 
 function buildCandidateOffsets(radius) {
-  const r = Math.max(0, Number(radius || 2));
+  const r = Math.max(0, Number(radius ?? 2));
   const offsets = [0];
   for (let i = 1; i <= r; i++) offsets.push(i, -i);
   return offsets;
@@ -172,7 +172,7 @@ async function buildOptionSubscriptionCandidates({
 
   const step = detectStrikeStepFromRows(slice, strikeStepFallback(underlying));
   const atm = roundToStep(Number(underlyingLtp), step);
-  const radius = Math.max(0, Number(env.OPT_ATM_SCAN_STEPS || 2));
+  const radius = Math.max(0, Number(env.OPT_ATM_SCAN_STEPS ?? 2));
   const picks = [];
   for (const offset of buildCandidateOffsets(radius)) {
     const strike = atm + offset * step;
@@ -289,9 +289,9 @@ function scoreCandidate({
   const spread = Number.isFinite(bps) ? bps : 1e6;
   const dSteps = Number.isFinite(distSteps) ? distSteps : 999;
 
-  const dep = Math.max(0, Number(depthQty || 0));
-  const vol = Math.max(0, Number(volume || 0));
-  const openInt = Math.max(0, Number(oi || 0));
+  const dep = Math.max(0, Number(depthQty ?? 0));
+  const vol = Math.max(0, Number(volume ?? 0));
+  const openInt = Math.max(0, Number(oi ?? 0));
 
   // Lower is better.
   // Penalize spread & distance, reward depth/volume/OI using log for stability.
@@ -320,7 +320,7 @@ function scoreCandidate({
 
   // IV: avoid very high IV unless you expect a larger move.
   if (Number.isFinite(ivPts)) {
-    const over = Math.max(0, ivPts - Number(ivNeutralPts || 20));
+    const over = Math.max(0, ivPts - Number(ivNeutralPts ?? 20));
     s += Number(w.iv ?? 0.06) * over;
   }
 
@@ -403,15 +403,15 @@ function isOiWallBlockedStrike({ rowStrike, optType, wallStrike }) {
 
 function liquidityGateScoreRow({ row, spreadCapBps }) {
   const spreadBps = Number(row?.spread_bps);
-  const depthQty = Math.max(0, Number(row?.depth_qty_top || 0));
-  const volume = Math.max(0, Number(row?.volume || 0));
-  const oi = Math.max(0, Number(row?.oi || 0));
+  const depthQty = Math.max(0, Number(row?.depth_qty_top ?? 0));
+  const volume = Math.max(0, Number(row?.volume ?? 0));
+  const oi = Math.max(0, Number(row?.oi ?? 0));
   const health = Number(row?.health_score);
 
   // Higher is better. Wide spread hurts sharply; depth/volume/OI improve score.
   let score = 0;
   if (Number.isFinite(spreadBps)) {
-    const cap = Math.max(1, Number(spreadCapBps || 35));
+    const cap = Math.max(1, Number(spreadCapBps ?? 35));
     const spreadRatio = Math.max(0, Math.min(2, spreadBps / cap));
     score += (1 - Math.min(1, spreadRatio)) * 45;
   }
@@ -582,14 +582,14 @@ async function pickOptionContractForSignal({
   const step = detectStrikeStepFromRows(slice, strikeStepFallback(underlying));
   const atm = roundToStep(Number(underlyingLtp), step);
 
-  const offsetSteps = Number(env.OPT_STRIKE_OFFSET_STEPS || 0);
+  const offsetSteps = Number(env.OPT_STRIKE_OFFSET_STEPS ?? 0);
   const baseDesiredStrike = atm + offsetSteps * step;
 
-  const radius = Number(env.OPT_ATM_SCAN_STEPS || 2);
+  const radius = Number(env.OPT_ATM_SCAN_STEPS ?? 2);
   const offsets = buildCandidateOffsets(radius);
 
   // For cache + ranking: scan a wider band around desired strike.
-  const wide = Math.max(radius, Number(env.OPT_CHAIN_STRIKES_AROUND_ATM || 10));
+  const wide = Math.max(radius, Number(env.OPT_CHAIN_STRIKES_AROUND_ATM ?? 10));
 
   // Build candidate strike set
   const strikeSet = new Set();
@@ -661,7 +661,7 @@ async function pickOptionContractForSignal({
     };
   }
 
-  const ttlMs = Number(env.OPT_CHAIN_TTL_MS || 1500);
+  const ttlMs = Number(env.OPT_CHAIN_TTL_MS ?? 1500);
   const chain = await getOptionChainSnapshot({
     kite,
     env,
@@ -691,11 +691,11 @@ async function pickOptionContractForSignal({
   const maxBpsRaw = Number(
     Number.isFinite(Number(maxSpreadBpsOverride))
       ? maxSpreadBpsOverride
-      : env.OPT_MAX_SPREAD_BPS || 35,
+      : env.OPT_MAX_SPREAD_BPS ?? 35,
   );
-  const minDepth = Number(env.OPT_MIN_DEPTH_QTY || 0);
+  const minDepth = Number(env.OPT_MIN_DEPTH_QTY ?? 0);
 
-  const stage = Math.max(0, Number(gateStage || 0));
+  const stage = Math.max(0, Number(gateStage ?? 0));
   const maxBps = stage >= 1 ? maxBpsRaw * 1.25 : maxBpsRaw;
   const premiumSlack = stage >= 2 ? 25 : 0;
   const deltaGateEnabled =
@@ -746,9 +746,9 @@ async function pickOptionContractForSignal({
     .map((r) => {
       const liqScore = liquidityGateScoreRow({ row: r, spreadCapBps: liqGateMaxSpreadBps });
       const spreadBps = Number(r?.spread_bps);
-      const depthQty = Number(r?.depth_qty_top || 0);
-      const vol = Number(r?.volume || 0);
-      const oi = Number(r?.oi || 0);
+      const depthQty = Number(r?.depth_qty_top ?? 0);
+      const vol = Number(r?.volume ?? 0);
+      const oi = Number(r?.oi ?? 0);
       const liqGateOk =
         (!liqGateEnabled || liqScore >= liqGateMinScore) &&
         (Number.isFinite(spreadBps) ? spreadBps <= liqGateMaxSpreadBps : false) &&
@@ -792,7 +792,7 @@ async function pickOptionContractForSignal({
   // Set OPT_PICK_DEBUG_TOP_N=5 (max 10) to include a small top-candidates list in the pick metadata.
   const debugTopN = Math.max(
     0,
-    Math.min(Number(env.OPT_PICK_DEBUG_TOP_N || 0), 10),
+    Math.min(Number(env.OPT_PICK_DEBUG_TOP_N ?? 0), 10),
   );
 
   const scored = (chain?.snapshot?.rows || [])
@@ -809,17 +809,17 @@ async function pickOptionContractForSignal({
       const spreadTrendOk = Number.isFinite(bpsCh)
         ? bpsCh <= spreadRiseBlockBps
         : true;
-      const flicker = Number(r.book_flicker || 0);
+      const flicker = Number(r.book_flicker ?? 0);
       const flickerOk = flicker <= flickerBlock;
       const health = Number(r.health_score);
       const healthOk = Number.isFinite(health) ? health >= minHealthScore : true;
 
-      const depthTopQty = Number(r.depth_qty_top || 0);
+      const depthTopQty = Number(r.depth_qty_top ?? 0);
       const hasAnyDepth = Number.isFinite(depthTopQty) && depthTopQty > 0;
       const depthOk =
         Number(minDepth) > 0 ? depthTopQty >= Number(minDepth) : hasAnyDepth; // require depth even if minDepth not configured
 
-      const liqScore = Number(liqMeta?.liqScore || 0);
+      const liqScore = Number(liqMeta?.liqScore ?? 0);
       const liquidityGateOk = liqGateEnabled ? !!liqMeta?.liqGateOk : true;
 
       const delta = finiteNumberOrNull(r.delta);
@@ -955,8 +955,8 @@ async function pickOptionContractForSignal({
       !!env.OPT_PREMIUM_BAND_FALLBACK && requireOk && enforcePremBand;
 
     if (allowPremiumFallback) {
-      const slackDown = Number(env.OPT_PREMIUM_BAND_FALLBACK_SLACK_DOWN || 20);
-      const slackUp = Number(env.OPT_PREMIUM_BAND_FALLBACK_SLACK_UP || 150);
+      const slackDown = Number(env.OPT_PREMIUM_BAND_FALLBACK_SLACK_DOWN ?? 20);
+      const slackUp = Number(env.OPT_PREMIUM_BAND_FALLBACK_SLACK_UP ?? 150);
 
       // Find best contract that passes ALL gates except premium band.
       // Choose by score then ATM distance.
@@ -998,7 +998,7 @@ async function pickOptionContractForSignal({
               strike: Number(bestHard.row.strike),
               ltp: Number(bestHard.row.ltp),
               bps: Number(bestHard.row.spread_bps),
-              depth: Number(bestHard.row.depth_qty_top || 0),
+              depth: Number(bestHard.row.depth_qty_top ?? 0),
               delta: finiteNumberOrNull(bestHard.row.delta),
               gamma: Number(bestHard.row.gamma),
             },
@@ -1024,14 +1024,14 @@ async function pickOptionContractForSignal({
               strike: Number(x.row.strike),
               ltp: Number(x.row.ltp),
               spread_bps: Number(x.row.spread_bps),
-              depth_qty_top: Number(x.row.depth_qty_top || 0),
-              liq_score: Number(x.liqScore || 0),
+              depth_qty_top: Number(x.row.depth_qty_top ?? 0),
+              liq_score: Number(x.liqScore ?? 0),
               liquidityGateOk: !!x.liquidityGateOk,
               delta: finiteNumberOrNull(x.row.delta),
               gamma: Number(x.row.gamma),
               iv_pts: Number(x.row.iv_pts),
               health_score: Number(x.row.health_score),
-              book_flicker: Number(x.row.book_flicker || 0),
+              book_flicker: Number(x.row.book_flicker ?? 0),
               score: Number(x.score),
               ok: !!x.ok,
               hardOk: !!x.hardOk,
@@ -1152,11 +1152,11 @@ async function pickOptionContractForSignal({
           ltp: Number(x.row.ltp),
           spread_bps: Number(x.row.spread_bps),
           spread_bps_change: Number(x.row.spread_bps_change),
-          depth_qty_top: Number(x.row.depth_qty_top || 0),
-          liq_score: Number(x.liqScore || 0),
+          depth_qty_top: Number(x.row.depth_qty_top ?? 0),
+          liq_score: Number(x.liqScore ?? 0),
           liquidityGateOk: !!x.liquidityGateOk,
-          volume: Number(x.row.volume || 0),
-          oi: Number(x.row.oi || 0),
+          volume: Number(x.row.volume ?? 0),
+          oi: Number(x.row.oi ?? 0),
           oi_change: Number(x.row.oi_change),
           delta: finiteNumberOrNull(x.row.delta),
           gamma: Number(x.row.gamma),
@@ -1165,7 +1165,7 @@ async function pickOptionContractForSignal({
           vega_1pct: Number(x.row.vega_1pct),
           theta_per_day: Number(x.row.theta_per_day),
           health_score: Number(x.row.health_score),
-          book_flicker: Number(x.row.book_flicker || 0),
+          book_flicker: Number(x.row.book_flicker ?? 0),
           impact_cost_bps: Number(x.row.impact_cost_bps),
           distSteps: Number(x.distSteps),
           score: Number(x.score),
@@ -1198,7 +1198,7 @@ async function pickOptionContractForSignal({
     exchange: best.row.exchange,
     tradingsymbol: best.row.tradingsymbol,
     segment: best.row.segment,
-    lot_size: Number(best.row.lot_size || 1),
+    lot_size: Number(best.row.lot_size ?? 1),
     tick_size: normalizeTickSize(best.row.tick_size),
     strike: Number(best.row.strike),
     pickedAt: new Date().toISOString(),
@@ -1206,7 +1206,7 @@ async function pickOptionContractForSignal({
     // attach greeks & microstructure metrics for downstream risk/plan logic
     ltp: Number(best.row.ltp),
     bps: Number(best.row.spread_bps),
-    depth: Number(best.row.depth_qty_top || 0),
+    depth: Number(best.row.depth_qty_top ?? 0),
     iv: Number.isFinite(Number(best.row.iv)) ? Number(best.row.iv) : null,
     iv_pts: Number.isFinite(Number(best.row.iv_pts)) ? Number(best.row.iv_pts) : null,
     iv_change_pts: Number.isFinite(Number(best.row.iv_change_pts)) ? Number(best.row.iv_change_pts) : null,
@@ -1214,7 +1214,7 @@ async function pickOptionContractForSignal({
     gamma: Number.isFinite(Number(best.row.gamma)) ? Number(best.row.gamma) : null,
     vega_1pct: Number.isFinite(Number(best.row.vega_1pct)) ? Number(best.row.vega_1pct) : null,
     theta_per_day: Number.isFinite(Number(best.row.theta_per_day)) ? Number(best.row.theta_per_day) : null,
-    oi: Number(best.row.oi || 0),
+    oi: Number(best.row.oi ?? 0),
     oi_change: Number.isFinite(Number(best.row.oi_change)) ? Number(best.row.oi_change) : null,
     spread_bps_change: Number.isFinite(Number(best.row.spread_bps_change)) ? Number(best.row.spread_bps_change) : null,
 
@@ -1229,8 +1229,8 @@ async function pickOptionContractForSignal({
       },
       premiumBandFallback: premiumBandFallbackUsed
         ? {
-            slackDown: Number(env.OPT_PREMIUM_BAND_FALLBACK_SLACK_DOWN || 20),
-            slackUp: Number(env.OPT_PREMIUM_BAND_FALLBACK_SLACK_UP || 150),
+            slackDown: Number(env.OPT_PREMIUM_BAND_FALLBACK_SLACK_DOWN ?? 20),
+            slackUp: Number(env.OPT_PREMIUM_BAND_FALLBACK_SLACK_UP ?? 150),
           }
         : null,
       gammaGateActive,
@@ -1257,7 +1257,7 @@ async function pickOptionContractForSignal({
       oiContext,
       weights,
       fromCache: !!chain?.fromCache,
-      chainCount: Number(chain?.snapshot?.count || 0),
+      chainCount: Number(chain?.snapshot?.count ?? 0),
       topCandidates,
     },
   };

@@ -39,7 +39,7 @@ function safeKey(s, maxLen = 180) {
 function inc(obj, key, n = 1) {
   if (!obj) return;
   const k = safeKey(key);
-  obj[k] = (obj[k] || 0) + Number(n || 0);
+  obj[k] = (obj[k] || 0) + Number(n ?? 0);
 }
 
 function deepInc(root, pathArr, n = 1) {
@@ -95,9 +95,9 @@ class SignalTelemetry {
     this._enabled = String(env.TELEMETRY_ENABLED || "true") === "true";
     this._rejEnabled =
       String(env.TELEMETRY_REJECTIONS_ENABLED || "true") === "true";
-    this._rejTopKeys = Number(env.TELEMETRY_REJECTIONS_TOP_KEYS || 200);
-    this._ringSize = Number(env.TELEMETRY_RING_SIZE || 300);
-    this._flushSec = Number(env.TELEMETRY_FLUSH_SEC || 60);
+    this._rejTopKeys = Number(env.TELEMETRY_REJECTIONS_TOP_KEYS ?? 200);
+    this._ringSize = Number(env.TELEMETRY_RING_SIZE ?? 300);
+    this._flushSec = Number(env.TELEMETRY_FLUSH_SEC ?? 60);
     this._dailyCollection =
       env.TELEMETRY_DB_DAILY_COLLECTION || "telemetry_signals_daily";
 

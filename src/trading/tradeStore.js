@@ -139,7 +139,7 @@ async function updateTrade(tradeId, patch) {
     throw new Error(`[trade] updateTrade not acknowledged for tradeId=${tradeId}`);
   }
 
-  if (Number(result?.matchedCount || 0) === 0) {
+  if (Number(result?.matchedCount ?? 0) === 0) {
     const err = new Error(`[trade] updateTrade found no trade row: tradeId=${tradeId}`);
     logger.error(
       { tradeId, patchKeys: Object.keys(update) },

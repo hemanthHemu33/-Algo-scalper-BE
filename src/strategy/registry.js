@@ -57,8 +57,8 @@ function enabledStrategyIds() {
 
 function runStrategy(strategyId, candles, ctx = {}) {
   const id = String(strategyId || "").trim();
-  const fast = Number(env.EMA_FAST || 9);
-  const slow = Number(env.EMA_SLOW || 21);
+  const fast = Number(env.EMA_FAST ?? 9);
+  const slow = Number(env.EMA_SLOW ?? 21);
 
   switch (id) {
     case "ema_cross": {
@@ -78,7 +78,7 @@ function runStrategy(strategyId, candles, ctx = {}) {
           candles,
           fast,
           slow,
-          pullbackBars: Number(env.PULLBACK_BARS || 5),
+          pullbackBars: Number(env.PULLBACK_BARS ?? 5),
         }),
       );
     }
@@ -87,8 +87,8 @@ function runStrategy(strategyId, candles, ctx = {}) {
         "breakout",
         breakoutStrategy({
           candles,
-          lookback: Number(env.BREAKOUT_LOOKBACK || 20),
-          volMult: Number(env.BREAKOUT_VOL_MULT || 1.2),
+          lookback: Number(env.BREAKOUT_LOOKBACK ?? 20),
+          volMult: Number(env.BREAKOUT_VOL_MULT ?? 1.2),
           volLookback: 20,
         }),
       );
@@ -98,9 +98,9 @@ function runStrategy(strategyId, candles, ctx = {}) {
         "vwap_reclaim",
         vwapReclaimStrategy({
           candles,
-          lookback: Number(env.VWAP_LOOKBACK || 120),
+          lookback: Number(env.VWAP_LOOKBACK ?? 120),
           volLookback: 20,
-          volMult: Number(env.VWAP_VOL_MULT || 1.0),
+          volMult: Number(env.VWAP_VOL_MULT ?? 1.0),
           fast,
           slow,
         }),
@@ -111,10 +111,10 @@ function runStrategy(strategyId, candles, ctx = {}) {
         "orb",
         orbStrategy({
           candles,
-          intervalMin: Number(ctx.intervalMin || 1),
-          orbMinutes: Number(env.ORB_MINUTES || 15),
+          intervalMin: Number(ctx.intervalMin ?? 1),
+          orbMinutes: Number(env.ORB_MINUTES ?? 15),
           volLookback: 20,
-          volMult: Number(env.ORB_VOL_MULT || 1.2),
+          volMult: Number(env.ORB_VOL_MULT ?? 1.2),
         }),
       );
     }
@@ -123,7 +123,7 @@ function runStrategy(strategyId, candles, ctx = {}) {
         "bb_squeeze",
         bollingerSqueezeStrategy({
           candles,
-          period: Number(env.BB_PERIOD || 20),
+          period: Number(env.BB_PERIOD ?? 20),
           stdDev: Number(env.BB_STDDEV ?? env.BB_STD ?? 2),
           squeezePct: Number(env.SQUEEZE_PCT ?? env.BB_SQUEEZE_PCT ?? 0.012),
           volLookback: 20,
@@ -138,7 +138,7 @@ function runStrategy(strategyId, candles, ctx = {}) {
         "rsi_fade",
         rsiFadeStrategy({
           candles,
-          period: Number(env.RSI_PERIOD || 14),
+          period: Number(env.RSI_PERIOD ?? 14),
           overbought: Number(env.RSI_OVERBOUGHT ?? env.RSI_OB ?? 70),
           oversold: Number(env.RSI_OVERSOLD ?? env.RSI_OS ?? 30),
         }),
@@ -150,8 +150,8 @@ function runStrategy(strategyId, candles, ctx = {}) {
         "volume_spike",
         volumeSpikeStrategy({
           candles,
-          lookback: Number(env.VOL_SPIKE_LOOKBACK || 20),
-          mult: Number(env.VOL_SPIKE_MULT || 2),
+          lookback: Number(env.VOL_SPIKE_LOOKBACK ?? 20),
+          mult: Number(env.VOL_SPIKE_MULT ?? 2),
         }),
       );
     }
@@ -160,9 +160,9 @@ function runStrategy(strategyId, candles, ctx = {}) {
         "fakeout",
         fakeoutStrategy({
           candles,
-          lookback: Number(env.FAKEOUT_LOOKBACK || 20),
-          wickFrac: Number(env.FAKEOUT_WICK_FRAC || 0.6),
-          minRangeFrac: Number(env.FAKEOUT_MIN_RANGE_FRAC || 0.004),
+          lookback: Number(env.FAKEOUT_LOOKBACK ?? 20),
+          wickFrac: Number(env.FAKEOUT_WICK_FRAC ?? 0.6),
+          minRangeFrac: Number(env.FAKEOUT_MIN_RANGE_FRAC ?? 0.004),
         }),
       );
     }
@@ -171,8 +171,8 @@ function runStrategy(strategyId, candles, ctx = {}) {
         "wick_reversal",
         wickReversalStrategy({
           candles,
-          lookback: Number(env.WICK_LOOKBACK || 20),
-          minWickFrac: Number(env.WICK_MIN_WICK_FRAC || 0.6),
+          lookback: Number(env.WICK_LOOKBACK ?? 20),
+          minWickFrac: Number(env.WICK_MIN_WICK_FRAC ?? 0.6),
         }),
       );
     }

@@ -88,7 +88,7 @@ async function main() {
     });
 
     if (!sig) continue;
-    if (Number(sig.confidence || 0) < minConfidence) continue;
+    if (Number(sig.confidence ?? 0) < minConfidence) continue;
 
     results.push({
       idx: i,
@@ -98,7 +98,7 @@ async function main() {
       side: sig.side,
       confidence: sig.confidence,
       reason: sig.reason,
-      close: Number(last?.close || 0),
+      close: Number(last?.close ?? 0),
       regime: sig.regime || null,
     });
   }

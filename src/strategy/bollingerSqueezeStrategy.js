@@ -21,7 +21,7 @@ function bollingerSqueezeStrategy({
 
   const last = candles[candles.length - 1];
   const close = Number(last.close);
-  const vol = Number(last.volume || 0);
+  const vol = Number(last.volume ?? 0);
   const av = avgVolume(candles, volLookback) || 1;
 
   if (close > bb.upper && vol >= av * volMult) {

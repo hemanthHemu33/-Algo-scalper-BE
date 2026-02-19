@@ -16,7 +16,7 @@ function toIsoDate(v) {
 }
 
 function roundToStep(price, step) {
-  const s = Math.max(1, Number(step || 1));
+  const s = Math.max(1, Number(step ?? 1));
   return Math.round(Number(price) / s) * s;
 }
 
@@ -127,8 +127,8 @@ async function buildOptionBacktestProvider({
     const expiryISO = pickExpiry(tsMs);
     if (!expiryISO) return [];
     const atm = roundToStep(underlyingPrice, strikeStep);
-    const minStrike = atm - Math.max(0, Number(scanSteps || 0)) * strikeStep;
-    const maxStrike = atm + Math.max(0, Number(scanSteps || 0)) * strikeStep;
+    const minStrike = atm - Math.max(0, Number(scanSteps ?? 0)) * strikeStep;
+    const maxStrike = atm + Math.max(0, Number(scanSteps ?? 0)) * strikeStep;
     const strikes = strikeByExpiry.get(expiryISO) || [];
 
     return strikes
@@ -143,12 +143,12 @@ async function buildOptionBacktestProvider({
         const dteYears = Math.max(1 / 365, ((parseExpiryTs(expiryISO) || tsMs) - tsMs) / (365 * 24 * 60 * 60 * 1000));
         const g = greeks?.enabled
           ? computeGreeksFromMarket({
-              S: Math.max(0.01, Number(underlyingPrice || 0)),
-              K: Number(r.strike || 0),
+              S: Math.max(0.01, Number(underlyingPrice ?? 0)),
+              K: Number(r.strike ?? 0),
               r: 0.06,
               T: dteYears,
               isCall: String(optionType).toUpperCase() === 'CE',
-              marketPrice: Math.max(0.01, Number(close || 0)),
+              marketPrice: Math.max(0.01, Number(close ?? 0)),
             })
           : null;
 
@@ -169,8 +169,8 @@ async function buildOptionBacktestProvider({
   }
 
   function scoreRow(row, underlyingPrice) {
-    const distance = Math.abs(Number(row.strike || 0) - Number(underlyingPrice || 0));
-    const liquidityBoost = Math.log(Number(row.volume || 0) + 1);
+    const distance = Math.abs(Number(row.strike ?? 0) - Number(underlyingPrice ?? 0));
+    const liquidityBoost = Math.log(Number(row.volume ?? 0) + 1);
     return distance - liquidityBoost * 5;
   }
 

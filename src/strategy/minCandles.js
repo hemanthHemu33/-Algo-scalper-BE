@@ -18,7 +18,7 @@ function parseMinByInterval(value) {
 }
 
 function getMinCandlesForSignal(env, intervalMin) {
-  const fallback = Number(env.MIN_CANDLES_FOR_SIGNAL || DEFAULT_MIN);
+  const fallback = Number(env.MIN_CANDLES_FOR_SIGNAL ?? DEFAULT_MIN);
   const interval = Number(intervalMin);
   if (!Number.isFinite(interval) || interval <= 0) return fallback;
 
@@ -29,7 +29,7 @@ function getMinCandlesForSignal(env, intervalMin) {
 
 function getMinCandlesForRegime(env) {
   return Number(
-    env.MIN_CANDLES_FOR_REGIME || env.MIN_CANDLES_FOR_SIGNAL || DEFAULT_MIN,
+    env.MIN_CANDLES_FOR_REGIME ?? env.MIN_CANDLES_FOR_SIGNAL ?? DEFAULT_MIN,
   );
 }
 

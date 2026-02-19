@@ -28,7 +28,7 @@ function vwapReclaimStrategy({
   const vwapPrev = rollingVWAP(candles.slice(0, n - 1), lookback);
   const vwapCur = rollingVWAP(candles, lookback);
 
-  const curVol = Number(candles[n - 1].volume || 0);
+  const curVol = Number(candles[n - 1].volume ?? 0);
   const av = avgVolume(candles, volLookback);
   if (!Number.isFinite(av) || av <= 0) return null;
 

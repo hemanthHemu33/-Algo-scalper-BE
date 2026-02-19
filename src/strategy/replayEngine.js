@@ -61,7 +61,7 @@ function evaluateOnCandles({
   if (!signals.length) return null;
 
   // Pick the highest-confidence signal (tie-breaker: earliest in STRATEGIES list)
-  signals.sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+  signals.sort((a, b) => Number(b.confidence ?? 0) - Number(a.confidence ?? 0));
   const best = signals[0];
 
   // Reject synthetic candles if requested
@@ -83,7 +83,7 @@ function evaluateOnCandles({
       stage: "selector",
       reason: best.reason,
       meta: {
-        confidence: Number(best.confidence || 0),
+        confidence: Number(best.confidence ?? 0),
         regime: sel?.regime || null,
         replay: true,
       },
@@ -94,7 +94,7 @@ function evaluateOnCandles({
     strategyId: best.strategyId || env.STRATEGY_ID,
     strategyStyle: best.strategyStyle || null,
     strategyFamily: best.strategyFamily || null,
-    confidence: Number(best.confidence || 0),
+    confidence: Number(best.confidence ?? 0),
     instrument_token: instrument_token == null ? null : Number(instrument_token),
     intervalMin: Number(intervalMin),
     regime: sel?.regime || null,

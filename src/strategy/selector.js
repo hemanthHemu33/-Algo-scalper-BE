@@ -27,7 +27,7 @@ function detectRegime({ candles, env, now = new Date() }) {
     zone: tz,
   }).set({ year: dt.year, month: dt.month, day: dt.day });
 
-  const openWinMin = Number(env.SELECTOR_OPEN_WINDOW_MIN || 20);
+  const openWinMin = Number(env.SELECTOR_OPEN_WINDOW_MIN ?? 20);
   const minsFromOpen = open.isValid ? dt.diff(open, "minutes").minutes : 9999;
 
   if (minsFromOpen >= 0 && minsFromOpen <= openWinMin) {
@@ -35,10 +35,10 @@ function detectRegime({ candles, env, now = new Date() }) {
   }
 
   // ---- Trend vs Range ----
-  const fast = Number(env.SELECTOR_FAST_EMA || 9);
-  const slow = Number(env.SELECTOR_SLOW_EMA || 21);
-  const lookback = Number(env.SELECTOR_RANGE_LOOKBACK || 30);
-  const atrPeriod = Number(env.SELECTOR_ATR_PERIOD || 14);
+  const fast = Number(env.SELECTOR_FAST_EMA ?? 9);
+  const slow = Number(env.SELECTOR_SLOW_EMA ?? 21);
+  const lookback = Number(env.SELECTOR_RANGE_LOOKBACK ?? 30);
+  const atrPeriod = Number(env.SELECTOR_ATR_PERIOD ?? 14);
 
   const closes = candles.map((c) => Number(c.close)).filter(Number.isFinite);
   if (closes.length < slow + 5) {
@@ -58,12 +58,12 @@ function detectRegime({ candles, env, now = new Date() }) {
   const lo = minLow(candles, lookback);
   const rangePct = cur > 0 ? (hi - lo) / cur : 0;
 
-  const vwap = rollingVWAP(candles, Number(env.SELECTOR_VWAP_LOOKBACK || 120));
+  const vwap = rollingVWAP(candles, Number(env.SELECTOR_VWAP_LOOKBACK ?? 120));
   const vwapDist = cur > 0 ? Math.abs(cur - vwap) / cur : 0;
 
-  const trendDiffAtr = Number(env.SELECTOR_TREND_DIFF_ATR || 0.6);
-  const rangePctMax = Number(env.SELECTOR_RANGE_PCT_MAX || 0.012);
-  const rangeDiffAtrMax = Number(env.SELECTOR_RANGE_DIFF_ATR_MAX || 0.25);
+  const trendDiffAtr = Number(env.SELECTOR_TREND_DIFF_ATR ?? 0.6);
+  const rangePctMax = Number(env.SELECTOR_RANGE_PCT_MAX ?? 0.012);
+  const rangeDiffAtrMax = Number(env.SELECTOR_RANGE_DIFF_ATR_MAX ?? 0.25);
 
   if (diffInAtr >= trendDiffAtr) {
     return {

@@ -34,7 +34,7 @@ async function listCandleCollections() {
 
 async function describeRetention() {
   const enabled = String(env.CANDLE_TTL_ENABLED || "false") === "true";
-  const defDays = Number(env.CANDLE_TTL_DEFAULT_DAYS || 90);
+  const defDays = Number(env.CANDLE_TTL_DEFAULT_DAYS ?? 90);
   const mapStr = String(env.CANDLE_TTL_MAP || "");
   const cols = await listCandleCollections();
 
