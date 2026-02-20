@@ -26,6 +26,7 @@ const { getMarketCalendarMeta } = require("../market/marketCalendar");
 const { getLastFnoUniverse } = require("../fno/fnoUniverse");
 const { getQuoteGuardStats } = require("../kite/quoteGuard");
 const { getRecentCandles, getCandlesSince } = require("../market/candleStore");
+const { reportFault } = require("../runtime/errorBus");
 const { ltpStream, getLatestLtp } = require("../market/ltpStream");
 const {
   normalizeActiveTrade,
@@ -186,7 +187,7 @@ async function buildCriticalHealthSnapshot() {
   let pipeline = null;
   try {
     pipeline = getPipeline();
-  } catch {}
+  } catch (err) { reportFault({ code: "SOCKET_SOCKETSERVER_CATCH", err, message: "[src/socket/socketServer.js] caught and continued" }); }
 
   const killSwitch =
     !!pipeline?.trader?.risk?.getKillSwitch?.() ||
@@ -498,7 +499,7 @@ function attachSocketServer(httpServer) {
         if (pipeline?.getLiveCandle) {
           return pipeline.getLiveCandle(sub.token, sub.intervalMin);
         }
-      } catch {}
+      } catch (err) { reportFault({ code: "SOCKET_SOCKETSERVER_CATCH", err, message: "[src/socket/socketServer.js] caught and continued" }); }
       return null;
     };
 
@@ -680,27 +681,27 @@ function attachSocketServer(httpServer) {
     );
 
     const bootstrapSnapshots = () => {
-      sendStatus().catch(() => {});
-      sendSubs().catch(() => {});
-      sendTradesRecentSnapshot(tradesRecentLimit).catch(() => {});
-      sendEquitySnapshot().catch(() => {});
-      sendPositionsSnapshot().catch(() => {});
-      sendOrdersSnapshot().catch(() => {});
-      sendRiskLimitsSnapshot().catch(() => {});
-      sendStrategyKpisSnapshot().catch(() => {});
-      sendExecutionQualitySnapshot().catch(() => {});
-      sendMarketHealthSnapshot().catch(() => {});
-      sendAuditLogsSnapshot().catch(() => {});
-      sendAlertsChannelsSnapshot().catch(() => {});
-      sendAlertsIncidentsSnapshot().catch(() => {});
-      sendTelemetrySnapshot().catch(() => {});
-      sendTradeTelemetrySnapshot().catch(() => {});
-      sendOptimizerSnapshot().catch(() => {});
-      sendRejectionsSnapshot().catch(() => {});
-      sendCostCalibrationSnapshot().catch(() => {});
-      sendMarketCalendarSnapshot().catch(() => {});
-      sendFnoSnapshot().catch(() => {});
-      sendHealthCriticalSnapshot().catch(() => {});
+      sendStatus().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendSubs().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendTradesRecentSnapshot(tradesRecentLimit).catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendEquitySnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendPositionsSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendOrdersSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendRiskLimitsSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendStrategyKpisSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendExecutionQualitySnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendMarketHealthSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendAuditLogsSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendAlertsChannelsSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendAlertsIncidentsSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendTelemetrySnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendTradeTelemetrySnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendOptimizerSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendRejectionsSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendCostCalibrationSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendMarketCalendarSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendFnoSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
+      sendHealthCriticalSnapshot().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
     };
 
     bootstrapSnapshots();
@@ -832,12 +833,12 @@ function attachSocketServer(httpServer) {
 
     socket.on("status:subscribe", (payload = {}) => {
       const intervalMs = Number(payload.intervalMs ?? env.WS_STATUS_INTERVAL_MS ?? 2000);
-      sendStatus().catch(() => {});
+      sendStatus().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
       startTimer("status", intervalMs, sendStatus);
     });
 
     socket.on("status:request", () => {
-      sendStatus().catch(() => {});
+      sendStatus().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
     });
 
     socket.on("status:unsubscribe", () => {
@@ -846,12 +847,12 @@ function attachSocketServer(httpServer) {
 
     socket.on("subs:subscribe", (payload = {}) => {
       const intervalMs = Number(payload.intervalMs ?? env.WS_SUBS_INTERVAL_MS ?? 5000);
-      sendSubs().catch(() => {});
+      sendSubs().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
       startTimer("subs", intervalMs, sendSubs);
     });
 
     socket.on("subs:request", () => {
-      sendSubs().catch(() => {});
+      sendSubs().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
     });
 
     socket.on("subs:unsubscribe", () => {

@@ -234,7 +234,7 @@ class TradeManager {
     this.risk = riskEngine;
     if (this.risk?.setStateChangeHandler) {
       this.risk.setStateChangeHandler((state) => {
-        this._persistRiskState(state).catch(() => {});
+        this._persistRiskState(state).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
       });
     }
 
@@ -707,7 +707,7 @@ class TradeManager {
       if (targetOrderId && !targetIsVirtualMarket) {
         try {
           this.expectedCancelOrderIds.add(String(targetOrderId));
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
         try {
           await this._safeCancelOrder(
             env.DEFAULT_ORDER_VARIETY,
@@ -1355,7 +1355,7 @@ class TradeManager {
       now - this._lastFlattenCheckAt >= flattenEveryMs
     ) {
       this._lastFlattenCheckAt = now;
-      this._forceFlattenIfNeeded().catch(() => {});
+      this._forceFlattenIfNeeded().catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
     }
 
     if (!this._portfolioRiskInFlight) {
@@ -1376,22 +1376,22 @@ class TradeManager {
     // Tick-accurate peak tracking for live trade
     try {
       this._maybeUpdatePeakFromTick(token, ltp);
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     // SL watchdog: track trigger crossings in fast moves (especially for SL-L fallback)
     try {
       this._maybeTriggerSlWatchFromTick(token, ltp, now);
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     // Virtual target watcher: exit when target price is hit without resting order
     try {
       this._maybeTriggerVirtualTargetFromTick(token, ltp, now);
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     // TARGET watchdog: if target touched but still OPEN -> chase fill
     try {
       this._maybeTriggerTargetWatchFromTick(token, ltp, now);
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
   }
 
   _syncActiveTradeState(trade) {
@@ -1441,7 +1441,7 @@ class TradeManager {
         clearTimeout(st.timer);
       }
       this._slWatch.delete(id);
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
   }
 
   _registerSlWatchFromTrade(trade) {
@@ -1484,7 +1484,7 @@ class TradeManager {
         lastLtp: existing.lastLtp || null,
         timer: existing.timer || null,
       });
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
   }
 
   _updateSlWatchTrigger(tradeId, triggerPrice) {
@@ -1494,7 +1494,7 @@ class TradeManager {
       const tp = Number(triggerPrice);
       if (!st || !Number.isFinite(tp) || tp <= 0) return;
       this._slWatch.set(id, { ...st, triggerPrice: tp });
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
   }
 
   _slWatchIsBreached(ltp, triggerPrice, exitSide) {
@@ -1538,16 +1538,16 @@ class TradeManager {
           meta: { context: "trade_manager" },
         }),
       );
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
       const openSec = Number(env.SL_WATCHDOG_OPEN_SEC ?? 8);
       const ms = Math.max(1000, openSec * 1000);
       if (st.timer) clearTimeout(st.timer);
       st.timer = setTimeout(() => {
-        this._slWatchdogFire(id, "timeout").catch(() => {});
+        this._slWatchdogFire(id, "timeout").catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
       }, ms);
       this._slWatch.set(id, st);
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
   }
 
   _maybeTriggerSlWatchFromTick(token, ltp, nowMs) {
@@ -1598,7 +1598,7 @@ class TradeManager {
       const st = this._targetWatch.get(id);
       if (st?.timer) clearTimeout(st.timer);
       this._targetWatch.delete(id);
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
   }
 
   _registerTargetWatchFromTrade(trade) {
@@ -1645,7 +1645,7 @@ class TradeManager {
         lastLtp: existing.lastLtp || null,
         timer: existing.timer || null,
       });
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
   }
 
   _targetWatchIsHit(ltp, targetPrice, exitSide) {
@@ -1679,7 +1679,7 @@ class TradeManager {
       if (Number.isFinite(Number(ltp))) {
         this._maybeTriggerTargetWatchFromTick(st.token, ltp, Date.now());
       }
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
   }
 
   _armTargetWatchTimer(tradeId, st, openSec) {
@@ -1687,7 +1687,7 @@ class TradeManager {
     if (st.timer) clearTimeout(st.timer);
     const ms = Math.max(500, Number(openSec ?? 2) * 1000);
     st.timer = setTimeout(() => {
-      this._targetWatchdogFire(tradeId, "timeout").catch(() => {});
+      this._targetWatchdogFire(tradeId, "timeout").catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
     }, ms);
     this._targetWatch.set(tradeId, st);
   }
@@ -1726,7 +1726,7 @@ class TradeManager {
           meta: { context: "trade_manager" },
         }),
       );
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
       const openSec = Number(env.TARGET_WATCHDOG_OPEN_SEC ?? 2);
       this._armTargetWatchTimer(tradeId, st, openSec);
@@ -1764,7 +1764,7 @@ class TradeManager {
       const ltp = this.lastPriceByToken.get(Number(st.token));
       if (!Number.isFinite(Number(ltp))) return;
       this._maybeTriggerTargetWatchFromTick(st.token, ltp, nowMs);
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
   }
 
   async _getBestBidAsk(instrument) {
@@ -2097,7 +2097,7 @@ class TradeManager {
               tradeId: id,
             },
           );
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
         const after = await this._getOrderStatus(targetOrderId);
         const afterStatus = String(after?.status || "").toUpperCase();
@@ -2118,7 +2118,7 @@ class TradeManager {
               },
             );
           }
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
         const out = await this._safePlaceOrder(
           env.DEFAULT_ORDER_VARIETY,
@@ -2149,7 +2149,7 @@ class TradeManager {
           role: "TARGET",
         });
         await this._replayOrphanUpdates(newOrderId);
-        this._watchExitLeg(id, newOrderId, "TARGET").catch(() => {});
+        this._watchExitLeg(id, newOrderId, "TARGET").catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
         this._clearTargetWatch(id);
         return;
       }
@@ -2247,13 +2247,13 @@ class TradeManager {
         armedAtMs: existing.armedAtMs || Date.now(),
         firedAtMs: existing.firedAtMs || 0,
       });
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
   }
 
   _clearVirtualTarget(tradeId) {
     try {
       this._virtualTargetWatch.delete(String(tradeId || ""));
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
   }
 
   _maybeTriggerVirtualTargetFromTick(token, ltp, nowMs) {
@@ -2369,7 +2369,7 @@ class TradeManager {
       if (fresh.slOrderId) {
         try {
           this.expectedCancelOrderIds.add(String(fresh.slOrderId));
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
         await this._safeCancelOrder(
           env.DEFAULT_ORDER_VARIETY,
           fresh.slOrderId,
@@ -2412,7 +2412,7 @@ class TradeManager {
         role: "TARGET",
       });
       await this._replayOrphanUpdates(targetOrderId);
-      this._watchExitLeg(tradeId, targetOrderId, "TARGET").catch(() => {});
+      this._watchExitLeg(tradeId, targetOrderId, "TARGET").catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
       this._clearVirtualTarget(tradeId);
     } catch (e) {
       const msg = String(e?.message || e);
@@ -2450,7 +2450,7 @@ class TradeManager {
       tradeId,
       targetPrice,
       reason,
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
   }
 
   _slWatchdogHeartbeat(trade, netQty, source = "reconcile") {
@@ -2485,7 +2485,7 @@ class TradeManager {
       if (st.triggeredAtMs && !st.firedAtMs) {
         const overdue = nowMs - Number(st.triggeredAtMs) >= openSec * 1000;
         if (overdue) {
-          this._slWatchdogFire(tradeId, `heartbeat_${source}`).catch(() => {});
+          this._slWatchdogFire(tradeId, `heartbeat_${source}`).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
           return;
         }
       }
@@ -2495,7 +2495,7 @@ class TradeManager {
       if (!Number.isFinite(Number(ltp))) return;
 
       this._maybeTriggerSlWatchFromTick(st.token, ltp, nowMs);
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
   }
 
   async _getOrderStatus(orderId) {
@@ -2508,7 +2508,7 @@ class TradeManager {
       const last = Array.isArray(hist) ? hist[hist.length - 1] : null;
       const st = String(last?.status || "").toUpperCase();
       return { status: st, order: last };
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     // 2) Fallback to getOrders() and find by order_id
     try {
@@ -2518,7 +2518,7 @@ class TradeManager {
         : null;
       const st = String(o?.status || "").toUpperCase();
       return { status: st, order: o };
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     return null;
   }
@@ -2622,7 +2622,7 @@ class TradeManager {
         if (inGraceByTimestamp && inFlightStatuses.has(st)) {
           return { benign: true, reason: `history_in_grace_${st}` };
         }
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
     }
 
     return {
@@ -2878,7 +2878,7 @@ class TradeManager {
           purpose: "PANIC_EXIT_TIMEOUT_CANCEL",
           tradeId: id,
         });
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
       const after = await this._getOrderStatus(oid);
       const afterStatus = String(after?.status || "").toUpperCase();
@@ -3031,7 +3031,7 @@ class TradeManager {
             ? Number(st.lastLtp)
             : null,
         });
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
       logger.error(
         {
@@ -3073,7 +3073,7 @@ class TradeManager {
       // Cancel any remaining exits (best effort), then panic exit to guarantee flat
       try {
         await this._cancelRemainingExitsOnce(fresh, "SL_WATCHDOG");
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
       await this._panicExit(
         fresh,
         "SL_WATCHDOG_" + String(cause || "timeout"),
@@ -3453,7 +3453,7 @@ class TradeManager {
     );
     alert("warn", "⏰ FORCE_FLATTEN triggered (closing position)", {
       tradeId: trade.tradeId,
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
     this.risk.setKillSwitch(true);
     await upsertDailyRisk(todayKey(), {
       kill: true,
@@ -3676,7 +3676,7 @@ class TradeManager {
       let instrument = null;
       try {
         instrument = await ensureInstrument(this.kite, token);
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
       const exitSide = qty > 0 ? "SELL" : "BUY";
       const orderParams = {
@@ -3838,7 +3838,7 @@ class TradeManager {
     );
     alert("error", "🛑 HARD_FLAT_ON_RESTART active; flattening positions", {
       count: open.length,
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
     this.risk.setKillSwitch(true);
     await upsertDailyRisk(todayKey(), {
       kill: true,
@@ -3998,7 +3998,7 @@ class TradeManager {
       role,
       reason: reason.code,
       message: msg || null,
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
   }
 
   async _safeCancelOrder(variety, orderId, { purpose, tradeId } = {}) {
@@ -4541,7 +4541,7 @@ class TradeManager {
                 status = String(
                   st?.status || st?.order?.status || "",
                 ).toUpperCase();
-              } catch {}
+              } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
             }
 
             if (status && !cancellableStatuses.has(status)) {
@@ -4554,14 +4554,14 @@ class TradeManager {
 
             try {
               this.expectedCancelOrderIds.add(id);
-            } catch {}
+            } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
             await this._safeCancelOrder(variety, id, {
               purpose: "PANIC_CANCEL",
               tradeId,
             });
-          } catch {}
+          } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
         }
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
       // Use live net qty if possible to avoid over-exiting (which can flip the position)
       let netQty = Number(fresh.qty ?? 0);
@@ -4585,7 +4585,7 @@ class TradeManager {
           : null;
         const q = Number(p?.quantity ?? p?.net_quantity ?? 0);
         if (Number.isFinite(q)) netQty = q;
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
       if (!Number.isFinite(netQty) || netQty === 0) {
         // Nothing to exit -> close the trade record to unblock signals
@@ -4619,7 +4619,7 @@ class TradeManager {
         { tradeId, reason, exitSide, qty, isTimeStopReason, preferLimit },
         "[panic] placing exit",
       );
-      alert("warn", `PANIC EXIT: ${reason}`, { tradeId }).catch(() => {});
+      alert("warn", `PANIC EXIT: ${reason}`, { tradeId }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
 
       let exitOrderId = null;
       const attemptLimit = async (marketError = "MARKET_SKIPPED") => {
@@ -4853,7 +4853,7 @@ class TradeManager {
     alert("warn", `🚨 PANIC EXIT fallback (LIMIT): ${reason}`, {
       tradeId,
       marketError,
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
 
     const { orderId } = await this._safePlaceOrder(
       env.DEFAULT_ORDER_VARIETY,
@@ -4980,7 +4980,7 @@ class TradeManager {
             "error",
             "⚠️ OPEN POSITION FOUND without active trade (adopting recovery trade)",
             this.recoveredPosition,
-          ).catch(() => {});
+          ).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
 
           this.risk.setOpenPosition(trade.riskKey || String(token), {
             tradeId,
@@ -5105,7 +5105,7 @@ class TradeManager {
       "error",
       "🚨 OCO DOUBLE-FILL detected (exit race) -> flatten + halt",
       { tradeId, token, filledRole, orderId, status: trade?.status },
-    ).catch(() => {});
+    ).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
 
     try {
       await updateTrade(tradeId, {
@@ -5114,7 +5114,7 @@ class TradeManager {
         ocoDoubleFillOrderId: orderId ? String(orderId) : null,
         ocoDoubleFillAt: new Date(),
       });
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     await this.setKillSwitch(true, "OCO_DOUBLE_FILL");
     await this._panicExit(trade, "OCO_DOUBLE_FILL", { allowWhenHalted: true });
@@ -5193,10 +5193,10 @@ class TradeManager {
         // SL watchdog heartbeat (handles restarts / tick gaps): if SL-L triggered but not filled -> flatten.
         try {
           this._slWatchdogHeartbeat(trade, netQty, source);
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
         try {
           this._targetWatchdogHeartbeat(trade, netQty, source);
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
         if (netQty === 0) {
           // cancel any remaining exits ASAP (reduces accidental re-entry via dangling SL/TGT)
@@ -5385,7 +5385,7 @@ class TradeManager {
           token,
           status: trade.status,
         },
-      ).catch(() => {});
+      ).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
       this.risk.setKillSwitch(true);
       await upsertDailyRisk(todayKey(), {
         kill: true,
@@ -5411,7 +5411,7 @@ class TradeManager {
             purpose: `CANCEL_${role}_ON_FLAT`,
             tradeId,
           });
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
       }
 
       await updateTrade(tradeId, {
@@ -5597,7 +5597,7 @@ class TradeManager {
       if (this._isTargetRequired() && !trade.targetOrderId) {
         try {
           await this._placeTargetOnly(trade);
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
       }
       return;
     }
@@ -5794,7 +5794,7 @@ class TradeManager {
               const instU = await ensureInstrument(this.kite, uTok);
               const ul = await this._getLtp(uTok, instU);
               if (Number.isFinite(ul)) underlyingLtp = ul;
-            } catch {}
+            } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
           }
         }
       }
@@ -5926,7 +5926,7 @@ class TradeManager {
         if (Object.keys(patch).length) {
           try {
             await updateTrade(tradeId, patch);
-          } catch {}
+          } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
         }
         if (isTimeStop) await this._timeStopExit(trade, exitReason);
         else
@@ -5982,11 +5982,11 @@ class TradeManager {
             );
           }
           await updateTrade(tradeId, patch);
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
       } else if (peakPatch) {
         try {
           await updateTrade(tradeId, peakPatch);
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
       }
 
       let did = false;
@@ -6083,7 +6083,7 @@ class TradeManager {
             });
             try {
               this._updateSlWatchTrigger(tradeId, appliedTrigger);
-            } catch {}
+            } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
             did = true;
             logger.info(
               { tradeId, stopLoss: appliedTrigger, meta: plan.meta },
@@ -6123,7 +6123,7 @@ class TradeManager {
                 this._dynExitFailBackoffUntil.delete(tradeId);
                 return;
               }
-            } catch {}
+            } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
             // Treat rate-limit / transient broker errors as soft-failures.
             // Pro behavior: backoff but keep trailing alive (do NOT permanently disable).
@@ -6131,7 +6131,7 @@ class TradeManager {
               const nextBeApplyFails = Math.max(0, Number(trade?.beApplyFails ?? 0)) + 1;
               try {
                 await updateTrade(tradeId, { beApplyFails: nextBeApplyFails });
-              } catch {}
+              } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
             }
 
             const msg = String(e?.message || e || "");
@@ -6187,7 +6187,7 @@ class TradeManager {
                     failCount: fails,
                   }),
                 });
-              } catch {}
+              } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
               alert("error", "🛑 Trailing disabled after modify failures", {
                 tradeId,
                 failCount: fails,
@@ -6252,7 +6252,7 @@ class TradeManager {
                 { ...trade, targetPrice: plan.target.targetPrice },
                 plan.target.targetPrice,
               );
-            } catch {}
+            } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
             did = true;
             logger.info(
               {
@@ -7283,7 +7283,7 @@ class TradeManager {
         atr = a;
         usedLen = cs.length;
         break;
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
     }
 
     // Hard fallback to base interval candle ATR if everything failed
@@ -7298,7 +7298,7 @@ class TradeManager {
             usedLen = cs.length;
           }
         }
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
     }
 
     let scaleFactor = 1;
@@ -7361,7 +7361,7 @@ class TradeManager {
         usedIntervalMin = iv;
         candles = cs;
         break;
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
     }
 
     if (!candles) return { ok: true, note: "multi_tf_no_data" };
@@ -9233,7 +9233,7 @@ class TradeManager {
       qty,
       stopLoss,
       strategyId: s.strategyId,
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
 
     let entryOrderId = null;
     try {
@@ -9356,7 +9356,7 @@ class TradeManager {
         status,
         payload: order,
       });
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
     if (!hit) {
       if (status === "COMPLETE") {
         try {
@@ -9399,7 +9399,7 @@ class TradeManager {
         tradeId: trade.tradeId,
         role: link?.role || "UNKNOWN",
       });
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
     try {
       await upsertLiveOrderSnapshot({
         tradeId: trade.tradeId,
@@ -9408,7 +9408,7 @@ class TradeManager {
         order,
         source: "order_update",
       });
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     this._scheduleReconcile("order_update");
 
@@ -9524,7 +9524,7 @@ class TradeManager {
             status,
             msg: msg || null,
           },
-        ).catch(() => {});
+        ).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
 
         // IMPORTANT: do NOT finalizeClosed here. Broker position may still be open.
         await updateTrade(trade.tradeId, {
@@ -9993,7 +9993,7 @@ class TradeManager {
             status,
             msg: order.status_message_raw || order.status_message || null,
           },
-        ).catch(() => {});
+        ).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
         if (isRejected) {
           const fail = this.risk.markFailure("ENTRY_" + status);
           if (fail.killed) {
@@ -10123,7 +10123,7 @@ class TradeManager {
           targetOrderStatus: status || null,
           targetOrderStatusUpdatedAt: new Date(),
         });
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
       // Partial exit fills are dangerous (remaining qty may be unprotected or double-exited).
       const filledNow = Number(order.filled_quantity ?? 0);
@@ -10246,7 +10246,7 @@ class TradeManager {
           slOrderStatus: status || null,
           slOrderStatusUpdatedAt: new Date(),
         });
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
       const orderType = String(order.order_type || trade.slOrderType || "")
         .toUpperCase()
@@ -10867,7 +10867,7 @@ class TradeManager {
       targetPrice,
       qty: trade.qty,
       order_type: targetParams.order_type,
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
 
     if (isHalted()) {
       logger.warn("[trade] TARGET skipped (halted)");
@@ -10909,7 +10909,7 @@ class TradeManager {
     });
     await this._replayOrphanUpdates(targetOrderId);
 
-    this._watchExitLeg(tradeId, targetOrderId, "TARGET").catch(() => {});
+    this._watchExitLeg(tradeId, targetOrderId, "TARGET").catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
   }
   _scaleOutEligible(trade) {
     const enabled = String(env.SCALE_OUT_ENABLED) === "true";
@@ -11012,7 +11012,7 @@ class TradeManager {
       tp1Qty: sizing.tp1Qty,
       runnerQty: sizing.runnerQty,
       tp1R: Number(env.TP1_R ?? 1),
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
 
     if (isHalted()) {
       logger.warn("[trade] TP1 skipped (halted)");
@@ -11036,7 +11036,7 @@ class TradeManager {
     await linkOrder({ order_id: String(tp1OrderId), tradeId, role: "TP1" });
     await this._replayOrphanUpdates(tp1OrderId);
 
-    this._watchExitLeg(tradeId, tp1OrderId, "TP1").catch(() => {});
+    this._watchExitLeg(tradeId, tp1OrderId, "TP1").catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
   }
 
   async _placeRunnerTargetOnly(trade) {
@@ -11095,7 +11095,7 @@ class TradeManager {
       qty: trade.qty,
       mode: plan.mode,
       meta: plan.meta,
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
 
     if (isHalted()) {
       logger.warn("[trade] RUNNER TARGET skipped (halted)");
@@ -11139,7 +11139,7 @@ class TradeManager {
     });
     await this._replayOrphanUpdates(targetOrderId);
 
-    this._watchExitLeg(tradeId, targetOrderId, "TARGET").catch(() => {});
+    this._watchExitLeg(tradeId, targetOrderId, "TARGET").catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
   }
 
   async _bookPartialPnlLeg({
@@ -11253,7 +11253,7 @@ class TradeManager {
         });
         tp1QuoteAt = spTp1?.meta || null;
       }
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     const tp1SlippageBpsWorse = worseSlippageBps({
       side: fresh.side,
@@ -11286,7 +11286,7 @@ class TradeManager {
               tradeId,
             },
           );
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
       }
 
       await updateTrade(tradeId, {
@@ -11366,7 +11366,7 @@ class TradeManager {
       if (Number.isFinite(estCostInr) && estCostInr > 0 && remaining > 0) {
         costPerShare = estCostInr / remaining;
       }
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     const rawBe =
       fresh.side === "BUY"
@@ -11398,7 +11398,7 @@ class TradeManager {
         });
         try {
           this._updateSlWatchTrigger(tradeId, newSL);
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
         logger.info(
           { tradeId, stopLoss: newSL, remaining },
           "[tp1] SL moved to BE+buffer and resized",
@@ -11639,7 +11639,7 @@ class TradeManager {
             slOrderType: slOrderTypeUsed,
             slLimitPrice: slLimitPriceUsed,
           });
-        } catch {}
+        } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
         await linkOrder({ order_id: String(slOrderId), tradeId, role: "SL" });
         await this._replayOrphanUpdates(slOrderId);
         alert("info", "✅ SL placed", {
@@ -11657,7 +11657,7 @@ class TradeManager {
       );
 
         // Immediate verification for SL
-        this._watchExitLeg(tradeId, slOrderId, "SL").catch(() => {});
+        this._watchExitLeg(tradeId, slOrderId, "SL").catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
         this._armStopLossSla({
           tradeId,
           slOrderId,
@@ -11957,7 +11957,7 @@ class TradeManager {
         });
         exitQuoteAt = spExit?.meta || null;
       }
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     const exitSlippageBpsWorse = worseSlippageBps({
       side: trade.side,
@@ -11991,7 +11991,7 @@ class TradeManager {
       ),
       exitOrderRole: "TARGET",
     });
-    alert("info", "🏁 TARGET HIT", { tradeId, exitPrice }).catch(() => {});
+    alert("info", "🏁 TARGET HIT", { tradeId, exitPrice }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
     this.risk.resetFailures();
     await this._bookRealizedPnl(tradeId);
     await this._finalizeClosed(tradeId, trade.instrument_token);
@@ -12051,7 +12051,7 @@ class TradeManager {
         });
         exitQuoteAt = spExit?.meta || null;
       }
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     const exitSlippageBpsWorse = worseSlippageBps({
       side: trade.side,
@@ -12084,7 +12084,7 @@ class TradeManager {
       ),
       exitOrderRole: "SL",
     });
-    alert("warn", "🛑 SL HIT", { tradeId, exitPrice }).catch(() => {});
+    alert("warn", "🛑 SL HIT", { tradeId, exitPrice }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
     this.risk.resetFailures();
     await this._bookRealizedPnl(tradeId);
     await this._finalizeClosed(tradeId, trade.instrument_token);
@@ -12107,7 +12107,7 @@ class TradeManager {
           : null;
         const q = Number(p?.quantity ?? p?.net_quantity ?? 0);
         isFlat = Number.isFinite(q) && q === 0;
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
       if (panicPlaced || isFlat) {
         logger.warn(
@@ -12130,7 +12130,7 @@ class TradeManager {
     alert("error", "GUARD FAIL (exit leg failed) -> kill switch", {
       tradeId: trade.tradeId,
       reason,
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
     const f = this.risk.markFailure(reason);
     if (f.killed)
       alert("error", "🛑 Failure limit reached -> kill switch", f).catch(
@@ -12158,7 +12158,7 @@ class TradeManager {
           tradeId: trade.tradeId,
         });
       }
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     // SL/exit leg failed => panic exit immediately (safety critical)
     await this._panicExit(trade, reason);
@@ -12192,7 +12192,7 @@ class TradeManager {
 
     try {
       this._updateStrategyLossStreak({ trade: t, pnl });
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
     logger.info(
       { tradeId, pnl, realizedPnl: realized + pnl },
       "[pnl] booked realized",
@@ -12282,7 +12282,7 @@ class TradeManager {
       });
       estCostInr = Number(est?.estCostInr ?? 0);
       costMeta = est?.meta || null;
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     const feeMultiple =
       Number.isFinite(estCostInr) && estCostInr > 0
@@ -12321,14 +12321,14 @@ class TradeManager {
           feesTotal: Number.isFinite(feesTotal) ? feesTotal : null,
         },
       });
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     try {
       this._recordSlippageFeedback({
         entrySlippageBps: t.entrySlippageBps,
         pnlSlippageDeltaInr,
       });
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     // Pro observability: aggregate fee-multiple by strategy and keep a ring of recent trades.
     try {
@@ -12360,8 +12360,8 @@ class TradeManager {
             : Date.now(),
           nowTs: Date.now(),
         });
-      } catch {}
-    } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     logger.info(
       {
@@ -12400,7 +12400,7 @@ class TradeManager {
     if (t && [STATUS.EXITED_TARGET, STATUS.EXITED_SL].includes(t.status)) {
       try {
         await this._computeAndPersistFeeMultiple(tradeId);
-      } catch {}
+      } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
     }
 
     if (t && terminal.includes(t.status)) {
@@ -12417,7 +12417,7 @@ class TradeManager {
       this.lastClosedTradeId = tradeId;
       this.lastClosedToken = Number(instrument_token);
       this.lastClosedAt = Date.now();
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     this.activeTradeId = null;
     this.recoveredPosition = null;

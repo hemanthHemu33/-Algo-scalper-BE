@@ -1,6 +1,7 @@
 const { getDb } = require("../db");
 const { ObjectId } = require("mongodb");
 const { alert } = require("./alertService");
+const { reportFault } = require("../runtime/errorBus");
 
 const CHANNELS = "notification_channels";
 const INCIDENTS = "notification_incidents";
@@ -59,7 +60,7 @@ async function emitNotification({ type, message, severity, meta }) {
 
   try {
     await alert(severity, message, meta);
-  } catch {}
+  } catch (err) { reportFault({ code: "ALERTS_NOTIFICATIONCENTER_CATCH", err, message: "[src/alerts/notificationCenter.js] caught and continued" }); }
 
   let db;
   try {

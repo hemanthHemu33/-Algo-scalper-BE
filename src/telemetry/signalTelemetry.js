@@ -2,6 +2,7 @@ const { DateTime } = require("luxon");
 const { env } = require("../config");
 const { logger } = require("../logger");
 const { getDb } = require("../db");
+const { reportFault } = require("../runtime/errorBus");
 
 /**
  * Pro-level observability for signal->trade pipeline.
@@ -134,7 +135,7 @@ class SignalTelemetry {
     if (dk === this._state.dayKey) return;
 
     // try to flush previous day before rotating
-    this.flush().catch(() => {});
+    this.flush().catch((err) => { reportFault({ code: "TELEMETRY_SIGNALTELEMETRY_ASYNC", err, message: "[src/telemetry/signalTelemetry.js] async task failed" }); });
     this._state = this._freshState(dk);
   }
 
@@ -144,7 +145,7 @@ class SignalTelemetry {
 
     if (Number.isFinite(this._flushSec) && this._flushSec > 0) {
       this._timer = setInterval(() => {
-        this.flush().catch(() => {});
+        this.flush().catch((err) => { reportFault({ code: "TELEMETRY_SIGNALTELEMETRY_ASYNC", err, message: "[src/telemetry/signalTelemetry.js] async task failed" }); });
       }, this._flushSec * 1000);
       this._timer.unref?.();
     }

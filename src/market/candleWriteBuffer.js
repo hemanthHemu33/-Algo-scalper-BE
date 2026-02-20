@@ -1,6 +1,7 @@
 const { env } = require("../config");
 const { insertManyCandles } = require("./candleStore");
 const { logger } = require("../logger");
+const { reportFault } = require("../runtime/errorBus");
 
 function _bool(v, def = false) {
   if (v === undefined || v === null) return def;
@@ -34,7 +35,7 @@ class CandleWriteBuffer {
     if (this._timer) return;
     const ms = Math.max(250, this.flushMs);
     this._timer = setInterval(() => {
-      this.flush().catch(() => {});
+      this.flush().catch((err) => { reportFault({ code: "MARKET_CANDLEWRITEBUFFER_ASYNC", err, message: "[src/market/candleWriteBuffer.js] async task failed" }); });
     }, ms);
   }
 
@@ -43,7 +44,7 @@ class CandleWriteBuffer {
       clearInterval(this._timer);
       this._timer = null;
     }
-    await this.flush().catch(() => {});
+    await this.flush().catch((err) => { reportFault({ code: "MARKET_CANDLEWRITEBUFFER_ASYNC", err, message: "[src/market/candleWriteBuffer.js] async task failed" }); });
   }
 
   enqueue(candle) {

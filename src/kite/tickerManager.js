@@ -1,4 +1,5 @@
 const { env, subscribeTokens, subscribeSymbols } = require("../config");
+const { reportFault } = require("../runtime/errorBus");
 const {
   resolveSubscribeTokens,
   ensureInstrument,
@@ -183,7 +184,7 @@ function _applyMode(tokens, modeStr) {
   if (!mode) return;
   try {
     ticker.setMode(mode, arr);
-  } catch {}
+  } catch (err) { reportFault({ code: "KITE_TICKERMANAGER_CATCH", err, message: "[src/kite/tickerManager.js] caught and continued" }); }
   const m = _modeStrSafe(modeStr, "full");
   for (const t of arr) tokenModeByToken.set(Number(t), m);
 }
@@ -397,7 +398,7 @@ function startOcoReconcileLoop() {
     () => {
       if (!tickerConnected) return;
       if (!pipeline || typeof pipeline.ocoReconcile !== "function") return;
-      pipeline.ocoReconcile().catch(() => {});
+      pipeline.ocoReconcile().catch((err) => { reportFault({ code: "KITE_TICKERMANAGER_ASYNC", err, message: "[src/kite/tickerManager.js] async task failed" }); });
     },
     Math.max(1, everySec) * 1000,
   );
@@ -477,7 +478,7 @@ async function setSession(accessToken) {
   if (ticker) {
     try {
       ticker.disconnect();
-    } catch {}
+    } catch (err) { reportFault({ code: "KITE_TICKERMANAGER_CATCH", err, message: "[src/kite/tickerManager.js] caught and continued" }); }
     ticker = null;
     tickerConnected = false;
   }
@@ -597,7 +598,7 @@ function wireEvents() {
       );
       alert("error", "❌ Kite connect handler failed", {
         message: e?.message || String(e),
-      }).catch(() => {});
+      }).catch((err) => { reportFault({ code: "KITE_TICKERMANAGER_ASYNC", err, message: "[src/kite/tickerManager.js] async task failed" }); });
     }
   });
 
@@ -677,7 +678,7 @@ function wireEvents() {
     logger.warn({ err }, "[kite] ticker error");
     alert("warn", "⚠️ Kite ticker error", {
       err: String(err?.message || err),
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "KITE_TICKERMANAGER_ASYNC", err, message: "[src/kite/tickerManager.js] async task failed" }); });
   });
 
   ticker.on("reconnect", () => {
@@ -702,7 +703,7 @@ function wireEvents() {
     void ensureActivePositionSubscriptions({
       force: true,
       reason: "reconnect",
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "KITE_TICKERMANAGER_ASYNC", err, message: "[src/kite/tickerManager.js] async task failed" }); });
   });
 
   ticker.on("close", () => {
@@ -710,7 +711,7 @@ function wireEvents() {
     lastDisconnect = new Date().toISOString();
     stopReconcileLoop();
     logger.warn("[kite] ticker closed");
-    alert("warn", "⚠️ Kite ticker closed").catch(() => {});
+    alert("warn", "⚠️ Kite ticker closed").catch((err) => { reportFault({ code: "KITE_TICKERMANAGER_ASYNC", err, message: "[src/kite/tickerManager.js] async task failed" }); });
   });
 
   ticker.on("disconnect", (err) => {
@@ -720,7 +721,7 @@ function wireEvents() {
     logger.warn({ err }, "[kite] ticker disconnected");
     alert("warn", "⚠️ Kite ticker disconnected", {
       err: String(err?.message || err),
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "KITE_TICKERMANAGER_ASYNC", err, message: "[src/kite/tickerManager.js] async task failed" }); });
   });
 }
 

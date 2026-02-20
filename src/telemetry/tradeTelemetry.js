@@ -2,6 +2,7 @@ const { DateTime } = require("luxon");
 const { env } = require("../config");
 const { logger } = require("../logger");
 const { getDb } = require("../db");
+const { reportFault } = require("../runtime/errorBus");
 
 /**
  * Trade outcome telemetry (pro tuning support).
@@ -87,7 +88,7 @@ class TradeTelemetry {
     const dk = dayKey(now);
     if (dk === this._state.dayKey) return;
 
-    this.flush().catch(() => {});
+    this.flush().catch((err) => { reportFault({ code: "TELEMETRY_TRADETELEMETRY_ASYNC", err, message: "[src/telemetry/tradeTelemetry.js] async task failed" }); });
     this._state = this._freshState(dk);
   }
 
@@ -97,7 +98,7 @@ class TradeTelemetry {
 
     if (Number.isFinite(this._flushSec) && this._flushSec > 0) {
       this._timer = setInterval(() => {
-        this.flush().catch(() => {});
+        this.flush().catch((err) => { reportFault({ code: "TELEMETRY_TRADETELEMETRY_ASYNC", err, message: "[src/telemetry/tradeTelemetry.js] async task failed" }); });
       }, this._flushSec * 1000);
       this._timer.unref?.();
     }

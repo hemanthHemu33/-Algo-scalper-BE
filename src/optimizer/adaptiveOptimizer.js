@@ -2,6 +2,7 @@ const { DateTime } = require("luxon");
 const { env } = require("../config");
 const { logger } = require("../logger");
 const { getDb } = require("../db");
+const { reportFault } = require("../runtime/errorBus");
 const {
   enabled: optimizerStateEnabled,
   readState: readOptimizerState,
@@ -171,7 +172,7 @@ class AdaptiveOptimizer {
     if (!this._logDecisions) return;
     try {
       logger.info(payload || {}, msg);
-    } catch {}
+    } catch (err) { reportFault({ code: "OPTIMIZER_ADAPTIVEOPTIMIZER_CATCH", err, message: "[src/optimizer/adaptiveOptimizer.js] caught and continued" }); }
   }
 
   _markStateDirty() {
@@ -187,7 +188,7 @@ class AdaptiveOptimizer {
     if (!(sec > 0)) return;
 
     this._stateTimer = setInterval(() => {
-      this.flushState().catch(() => {});
+      this.flushState().catch((err) => { reportFault({ code: "OPTIMIZER_ADAPTIVEOPTIMIZER_ASYNC", err, message: "[src/optimizer/adaptiveOptimizer.js] async task failed" }); });
     }, sec * 1000);
     this._stateTimer.unref?.();
   }
@@ -711,7 +712,7 @@ class AdaptiveOptimizer {
         if (loadedFromState) {
           logger.info(r, "[optimizer] loaded persisted state");
         }
-      } catch {}
+      } catch (err) { reportFault({ code: "OPTIMIZER_ADAPTIVEOPTIMIZER_CATCH", err, message: "[src/optimizer/adaptiveOptimizer.js] caught and continued" }); }
     }
 
     const wantBootstrap =
