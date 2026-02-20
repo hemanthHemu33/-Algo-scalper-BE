@@ -111,6 +111,16 @@ function _tickTapEnabled() {
   return _bool(env.TICK_TAP_LOG, false);
 }
 
+const _alertCooldown = new Map();
+
+function alertWithCooldown(key, minMs, level, message, meta) {
+  const now = Date.now();
+  const last = Number(_alertCooldown.get(key) || 0);
+  if (now - last < minMs) return;
+  _alertCooldown.set(key, now);
+  alert(level, message, meta).catch((err) => { reportFault({ code: "KITE_TICKERMANAGER_ASYNC", err, message: "[src/kite/tickerManager.js] async task failed" }); });
+}
+
 function startMarketGate() {
   if (marketGate) return marketGate;
   marketGate = new MarketGate({
@@ -149,6 +159,13 @@ function startTickWatchdog() {
     if (age <= maxAgeMs) return;
     const tokens = Array.from(subscribedTokens);
     logger.warn({ age, tokens: tokens.length }, "[ticks] no ticks -> resubscribing");
+    alertWithCooldown(
+      "tick_watchdog_no_ticks",
+      300_000,
+      "warn",
+      "⚠️ Tick stream stale, re-subscribing",
+      { ageMs: age, tokens: tokens.length },
+    );
     try {
       ticker.subscribe(tokens);
       _applyModesFromCache(tokens);
@@ -537,6 +554,18 @@ function wireEvents() {
               },
               "[fno] universe active",
             );
+            alertWithCooldown(
+              "fno_universe_active",
+              60_000,
+              "info",
+              "🧭 F&O universe activated",
+              {
+                mode: u.mode,
+                underlyings: u.underlyings,
+                tokens: (u.tokens || []).length,
+                symbols: u.symbols,
+              },
+            );
           }
         } catch (e) {
           logger.error(
@@ -571,6 +600,17 @@ function wireEvents() {
             posTokensAdded: (posTokens || []).length,
           },
           "[kite] subscribed",
+        );
+
+        alertWithCooldown(
+          "kite_subscribed",
+          60_000,
+          "info",
+          "📡 Kite subscriptions active",
+          {
+            subscribedTokens: allTokens.length,
+            posTokensAdded: (posTokens || []).length,
+          },
         );
 
         await pipeline.initForTokens(allTokens);

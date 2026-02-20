@@ -35,12 +35,18 @@ function postJson(hostname, path, bodyObj) {
 async function sendTelegramMessage(text) {
   if (!isEnabled()) return { skipped: true };
   const path = `/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const parseMode = String(env.TELEGRAM_PARSE_MODE || "HTML").toUpperCase();
+  const payload = {
+    chat_id: env.TELEGRAM_CHAT_ID,
+    text,
+    disable_web_page_preview: true,
+  };
+  if (["HTML", "MARKDOWN", "MARKDOWNV2"].includes(parseMode)) {
+    payload.parse_mode = parseMode;
+  }
+
   try {
-    const res = await postJson("api.telegram.org", path, {
-      chat_id: env.TELEGRAM_CHAT_ID,
-      text,
-      disable_web_page_preview: true,
-    });
+    const res = await postJson("api.telegram.org", path, payload);
     if (res.status >= 400) {
       logger.warn({ status: res.status, data: res.data }, "[telegram] send failed");
     }
