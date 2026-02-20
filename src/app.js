@@ -55,7 +55,7 @@ const {
   normalizeTradeRow,
 } = require("./trading/tradeNormalization");
 const { STATUS } = require("./trading/tradeStateMachine");
-const { snapshotFaults } = require("./runtime/errorBus");
+const { reportFault, snapshotFaults } = require("./runtime/errorBus");
 
 function buildAdminAuth() {
   const expected = env.ADMIN_API_KEY;
@@ -402,7 +402,7 @@ function buildApp() {
       let pipeline = null;
       try {
         pipeline = getPipeline();
-      } catch {}
+      } catch (err) { reportFault({ code: "APP_CATCH", err, message: "[src/app.js] caught and continued" }); }
 
       const killSwitch =
         !!pipeline?.trader?.risk?.getKillSwitch?.() ||
@@ -664,7 +664,7 @@ function buildApp() {
               rows = rows.concat(liveRow);
             }
           }
-        } catch {}
+        } catch (err) { reportFault({ code: "APP_CATCH", err, message: "[src/app.js] caught and continued" }); }
       }
 
       return res.json({ ok: true, rows });

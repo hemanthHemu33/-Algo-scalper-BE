@@ -1,5 +1,6 @@
 const { logger } = require("../logger");
 const { alert } = require("../alerts/alertService");
+const { reportFault } = require("./errorBus");
 
 let halted = false;
 let haltInfo = null;
@@ -10,7 +11,7 @@ async function halt(reason, meta) {
   haltInfo = { reason: String(reason || "unknown"), at: new Date().toISOString(), meta: meta || null };
   logger.error(haltInfo, "[halt] trading halted");
   // fire-and-forget
-  alert("error", `🛑 TRADING HALTED: ${haltInfo.reason}`, haltInfo).catch(() => {});
+  alert("error", `🛑 TRADING HALTED: ${haltInfo.reason}`, haltInfo).catch((err) => { reportFault({ code: "RUNTIME_HALT_ASYNC", err, message: "[src/runtime/halt.js] async task failed" }); });
 }
 
 function isHalted() {

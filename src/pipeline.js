@@ -1,5 +1,6 @@
 const { env } = require("./config");
 const { DateTime } = require("luxon");
+const { reportFault } = require("./runtime/errorBus");
 const {
   getSessionForDateTime,
   buildBoundsForToday,
@@ -481,7 +482,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   async function processTicksOnce(ticks) {
     try {
       marketHealth.onTicks(ticks || []);
-    } catch {}
+    } catch (err) { reportFault({ code: "PIPELINE_CATCH", err, message: "[src/pipeline.js] caught and continued" }); }
     // tick->trader (LTP updates + throttled risk checks)
     for (const t of ticks || []) {
       try {
@@ -551,7 +552,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   if (String(env.CANDLE_TIMER_FINALIZER_ENABLED || "true") === "true") {
     const everyMs = Number(env.CANDLE_FINALIZER_INTERVAL_MS ?? 1000);
     setInterval(() => {
-      enqueue(() => candleFinalizerTick(), "candleFinalizer").catch(() => {});
+      enqueue(() => candleFinalizerTick(), "candleFinalizer").catch((err) => { reportFault({ code: "PIPELINE_ASYNC", err, message: "[src/pipeline.js] async task failed" }); });
     }, everyMs);
   }
   return {

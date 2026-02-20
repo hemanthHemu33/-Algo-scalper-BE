@@ -15,6 +15,7 @@ const { tradeTelemetry } = require("./telemetry/tradeTelemetry");
 const { optimizer } = require("./optimizer/adaptiveOptimizer");
 const http = require("http");
 const { attachSocketServer } = require("./socket/socketServer");
+const { reportFault } = require("./runtime/errorBus");
 
 function applyWindowsSrvDnsWorkaround() {
   // Workaround for Node.js Windows SRV DNS regressions that can manifest as:
@@ -75,7 +76,7 @@ async function persistKill(reason, meta) {
       meta: meta || null,
       updatedAt: new Date(),
     });
-  } catch {}
+  } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
 }
 
 function exitAfterCrash(delayMs = 750) {
@@ -93,14 +94,14 @@ async function main() {
         log: String(env.CANDLE_TTL_LOG || "true") === "true",
       });
     }
-  } catch {}
+  } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
 
   telemetry.start();
   tradeTelemetry.start();
   // Adaptive optimizer (auto-block weak strategy×symbol×bucket + dynamic RR)
   try {
     await optimizer.start();
-  } catch {}
+  } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
 
   await watchLatestToken({
     onToken: async (accessToken, doc, reason) => {
@@ -115,7 +116,7 @@ async function main() {
         alert("error", "🔐 Kite access token missing — please login to Kite", {
           reason,
           hint: "Login via your token generator/scanner app or insert/update a doc with access_token in TOKENS_COLLECTION",
-        }).catch(() => {});
+        }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
         await halt("KITE_TOKEN_MISSING", { reason, updatedAt });
         return;
       }
@@ -124,7 +125,7 @@ async function main() {
       alert("info", "🔑 Kite token loaded/updated", {
         reason,
         updatedAt,
-      }).catch(() => {});
+      }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
 
       try {
         await setSession(accessToken);
@@ -138,7 +139,7 @@ async function main() {
           reason,
           ...err,
           hint: "Re-login to Kite to refresh the access_token",
-        }).catch(() => {});
+        }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
         await halt("KITE_SESSION_INIT_FAILED", { reason, ...err });
         // Do NOT throw — avoid killing the process; tokenWatcher will keep polling.
       }
@@ -153,18 +154,18 @@ async function main() {
     alert("info", "🚀 Scalper engine started", {
       port: env.PORT,
       env: env.NODE_ENV || "dev",
-    }).catch(() => {});
+    }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
   });
 
   const shutdown = async (signal) => {
     logger.warn({ signal }, "shutdown");
-    alert("warn", `🧯 Shutdown signal: ${signal}`, { signal }).catch(() => {});
+    alert("warn", `🧯 Shutdown signal: ${signal}`, { signal }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
     try {
       try {
         if (io) io.close();
-      } catch {}
+      } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
       server.close(() => logger.warn("server closed"));
-    } catch {}
+    } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
     setTimeout(() => process.exit(0), 500).unref();
   };
 
@@ -177,7 +178,7 @@ process.on("unhandledRejection", async (reason) => {
   logger.error({ reason: msg }, "unhandledRejection");
   alert("error", "💥 unhandledRejection (trading halted)", {
     message: msg,
-  }).catch(() => {});
+  }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
   await halt("UNHANDLED_REJECTION", { message: msg });
   await persistKill("UNHANDLED_REJECTION", { message: msg });
   exitAfterCrash();
@@ -188,7 +189,7 @@ process.on("uncaughtException", async (err) => {
   logger.error({ err: msg, stack: err?.stack }, "uncaughtException");
   alert("error", "💥 uncaughtException (trading halted)", {
     message: msg,
-  }).catch(() => {});
+  }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
   await halt("UNCAUGHT_EXCEPTION", { message: msg, stack: err?.stack });
   await persistKill("UNCAUGHT_EXCEPTION", { message: msg });
   exitAfterCrash();
@@ -198,6 +199,6 @@ main().catch((e) => {
   const err = describeErr(e);
   // Use a structured object that preserves error details (pino won't serialize Error well under key "e").
   logger.error({ err }, "fatal");
-  alert("error", "💥 Scalper engine crashed (fatal)", err).catch(() => {});
+  alert("error", "💥 Scalper engine crashed (fatal)", err).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
   process.exit(1);
 });

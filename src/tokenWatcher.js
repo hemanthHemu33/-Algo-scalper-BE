@@ -4,6 +4,7 @@ const { logger } = require("./logger");
 const { alert } = require("./alerts/alertService");
 const { getDb } = require("./db");
 const { readLatestTokenDoc } = require("./tokenStore");
+const { reportFault } = require("./runtime/errorBus");
 
 async function watchLatestToken({ onToken }) {
   const db = getDb();
@@ -34,7 +35,7 @@ async function watchLatestToken({ onToken }) {
       "warn",
       "🔑 Kite access token missing. Please login to Kite and sync token to Mongo.",
       details
-    ).catch(() => {});
+    ).catch((err) => { reportFault({ code: "TOKENWATCHER_ASYNC", err, message: "[src/tokenWatcher.js] async task failed" }); });
   };
 
   const refreshAndNotify = async (reason = "manual") => {
@@ -69,7 +70,7 @@ async function watchLatestToken({ onToken }) {
       { reason, updatedAt: res?.doc?.updatedAt || null },
       "[token] loaded/updated"
     );
-    alert("info", "🔑 Kite token loaded/updated").catch(() => {});
+    alert("info", "🔑 Kite token loaded/updated").catch((err) => { reportFault({ code: "TOKENWATCHER_ASYNC", err, message: "[src/tokenWatcher.js] async task failed" }); });
     await onToken(accessToken, res?.doc || null, reason);
   };
 
@@ -107,7 +108,7 @@ async function watchLatestToken({ onToken }) {
   // Polling fallback: keeps working even if change streams are not supported
   const pollMs = Math.max(5000, Number(env.TOKEN_POLL_INTERVAL_MS ?? 30000));
   const interval = setInterval(() => {
-    refreshAndNotify("poll").catch(() => {});
+    refreshAndNotify("poll").catch((err) => { reportFault({ code: "TOKENWATCHER_ASYNC", err, message: "[src/tokenWatcher.js] async task failed" }); });
   }, pollMs);
 
   return () => {
@@ -115,7 +116,7 @@ async function watchLatestToken({ onToken }) {
     if (changeStream) {
       try {
         changeStream.close();
-      } catch {}
+      } catch (err) { reportFault({ code: "TOKENWATCHER_CATCH", err, message: "[src/tokenWatcher.js] caught and continued" }); }
     }
   };
 }

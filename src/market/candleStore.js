@@ -1,6 +1,7 @@
 const { env } = require("../config");
 const { getDb } = require("../db");
 const { logger } = require("../logger");
+const { reportFault } = require("../runtime/errorBus");
 
 function collectionName(intervalMin) {
   const prefix = env.CANDLE_COLLECTION_PREFIX || "candles_";
@@ -76,7 +77,7 @@ async function ensureTtlIndex(col, expireAfterSeconds) {
 
     try {
       await col.dropIndex(tsAsc.name);
-    } catch {}
+    } catch (err) { reportFault({ code: "MARKET_CANDLESTORE_CATCH", err, message: "[src/market/candleStore.js] caught and continued" }); }
   }
 
   await col.createIndex(

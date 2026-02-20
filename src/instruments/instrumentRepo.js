@@ -3,6 +3,7 @@ const { normalizeTickSize } = require("../utils/tickSize");
 const { logger } = require("../logger");
 const { getDb } = require("../db");
 const { alert } = require("../alerts/alertService");
+const { reportFault } = require("../runtime/errorBus");
 
 const COLLECTION = "instruments_cache";
 
@@ -311,7 +312,7 @@ async function resolveSubscribeTokens(
       alert("warn", "⚠️ Subscribe symbol skipped", {
         symbol: String(sym),
         error: msg,
-      }).catch(() => {});
+      }).catch((err) => { reportFault({ code: "INSTRUMENTS_INSTRUMENTREPO_ASYNC", err, message: "[src/instruments/instrumentRepo.js] async task failed" }); });
       if (String(env.STRICT_SUBSCRIBE_SYMBOLS || "").toLowerCase() === "true")
         throw e;
     }

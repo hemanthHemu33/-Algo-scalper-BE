@@ -2,6 +2,7 @@ const { z } = require("zod");
 const { Settings } = require("luxon");
 const fs = require("fs");
 const path = require("path");
+const { reportFault } = require("./runtime/errorBus");
 
 // dotenv is for local development. In production, set env vars in the host (Render/PM2/Docker/K8s).
 // We load .env only if it exists and DOTENV_ENABLED is not "false".
@@ -33,12 +34,12 @@ try {
             )}`,
           );
         }
-      } catch {}
+      } catch (err) { reportFault({ code: "CONFIG_CATCH", err, message: "[src/config.js] caught and continued" }); }
       // eslint-disable-next-line global-require
       require("dotenv").config({ path: dotenvPath });
     }
   }
-} catch {}
+} catch (err) { reportFault({ code: "CONFIG_CATCH", err, message: "[src/config.js] caught and continued" }); }
 
 const defaultTimezone = "Asia/Kolkata";
 const resolvedTimezone =

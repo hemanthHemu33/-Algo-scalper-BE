@@ -1,5 +1,6 @@
 const { env } = require("../config");
 const { logger } = require("../logger");
+const { reportFault } = require("../runtime/errorBus");
 const {
   enabled: storeEnabled,
   readAllCalibration,
@@ -151,7 +152,7 @@ class CostCalibrator {
           runMeta,
         });
       }
-    } catch {}
+    } catch (err) { reportFault({ code: "TRADING_COSTCALIBRATOR_CATCH", err, message: "[src/trading/costCalibrator.js] caught and continued" }); }
 
     return { ok: true, enabled: true, updated, updates };
   }

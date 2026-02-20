@@ -2,6 +2,7 @@ const KiteConnect = require("kiteconnect").KiteConnect;
 const KiteTicker = require("kiteconnect").KiteTicker;
 const { logger } = require("../logger");
 const { halt } = require("../runtime/halt");
+const { reportFault } = require("../runtime/errorBus");
 
 function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
@@ -83,7 +84,7 @@ function createTicker({ apiKey, accessToken }) {
   try {
     // enable auto-reconnect (delay=5s, retries=50)
     t.autoReconnect(true, 5, 50);
-  } catch {}
+  } catch (err) { reportFault({ code: "KITE_KITECLIENTS_CATCH", err, message: "[src/kite/kiteClients.js] caught and continued" }); }
   return t;
 }
 
