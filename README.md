@@ -367,7 +367,12 @@ TELEGRAM_ENABLED=true
 TELEGRAM_BOT_TOKEN=<token>
 TELEGRAM_CHAT_ID=<chat_id>
 TELEGRAM_MIN_LEVEL=info
+TELEGRAM_DETAILED=true
+TELEGRAM_PARSE_MODE=HTML
+TELEGRAM_MAX_META_CHARS=1500
 ```
+
+When `TELEGRAM_DETAILED=true`, alerts are sent with severity badge, timestamp, host and a structured meta block to make operational triage easier.
 
 ---
 

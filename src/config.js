@@ -689,6 +689,9 @@ const schema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().optional(),
   TELEGRAM_CHAT_ID: z.string().optional(),
   TELEGRAM_MIN_LEVEL: z.string().default("info"), // info|warn|error
+  TELEGRAM_DETAILED: z.string().default("true"),
+  TELEGRAM_MAX_META_CHARS: z.coerce.number().default(1500),
+  TELEGRAM_PARSE_MODE: z.string().default("HTML"),
 
   STRATEGY_ID: z.string().default("ema_cross"),
 
