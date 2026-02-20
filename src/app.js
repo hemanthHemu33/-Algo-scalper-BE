@@ -403,7 +403,9 @@ function buildApp() {
         pipeline = getPipeline();
       } catch {}
 
-      const killSwitch = !!pipeline?.trader?.risk?.killSwitch;
+      const killSwitch =
+        !!pipeline?.trader?.risk?.getKillSwitch?.() ||
+        !!pipeline?.trader?.risk?.kill;
 
       const checks = [];
 

@@ -188,7 +188,9 @@ async function buildCriticalHealthSnapshot() {
     pipeline = getPipeline();
   } catch {}
 
-  const killSwitch = !!pipeline?.trader?.risk?.killSwitch;
+  const killSwitch =
+    !!pipeline?.trader?.risk?.getKillSwitch?.() ||
+    !!pipeline?.trader?.risk?.kill;
   const checks = [];
 
   if (env.CRITICAL_HEALTH_REQUIRE_TICKER_CONNECTED && !ticker?.connected) {
