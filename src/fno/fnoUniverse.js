@@ -13,12 +13,21 @@ let lastUniverse = null;
 
 function parseDate(v) {
   if (!v) return null;
-  try {
-    const d = v instanceof Date ? v : new Date(v);
-    return Number.isNaN(d.getTime()) ? null : d;
-  } catch {
-    return null;
+  if (v instanceof Date) {
+    return Number.isNaN(v.getTime()) ? null : v;
   }
+
+  const tz = env.CANDLE_TZ || "Asia/Kolkata";
+  const s = String(v).trim();
+  if (!s) return null;
+
+  const dateOnly = DateTime.fromFormat(s, "yyyy-MM-dd", { zone: tz });
+  if (dateOnly.isValid) return dateOnly.startOf("day").toJSDate();
+
+  const iso = DateTime.fromISO(s, { zone: tz });
+  if (iso.isValid) return iso.toJSDate();
+
+  return null;
 }
 
 function underlyingAliases(underlying) {

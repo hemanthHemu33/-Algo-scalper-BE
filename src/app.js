@@ -404,9 +404,8 @@ function buildApp() {
         pipeline = getPipeline();
       } catch (err) { reportFault({ code: "APP_CATCH", err, message: "[src/app.js] caught and continued" }); }
 
-      const killSwitch =
-        !!pipeline?.trader?.risk?.getKillSwitch?.() ||
-        !!pipeline?.trader?.risk?.kill;
+      const risk = pipeline?.trader?.risk;
+      const killSwitch = !!(risk?.getKillSwitch?.() ?? risk?.kill);
 
       const checks = [];
 
@@ -431,7 +430,7 @@ function buildApp() {
       const breakerUntilRaw = quoteGuard?.breakerOpenUntil ?? null;
       const breakerUntil =
         typeof breakerUntilRaw === "string"
-          ? Date.parse(breakerUntilRaw)
+          ? Date.parse(breakerUntilRaw) || 0
           : Number.isFinite(Number(breakerUntilRaw))
             ? Number(breakerUntilRaw)
             : 0;
@@ -442,7 +441,7 @@ function buildApp() {
           code: "QUOTE_BREAKER_OPEN",
           meta: {
             breakerOpenUntil: breakerUntil,
-            failStreak: quoteGuard?.stats?.failStreak || 0,
+            failStreak: quoteGuard?.failStreak || 0,
             lastError: quoteGuard?.stats?.lastError || null,
           },
         });
