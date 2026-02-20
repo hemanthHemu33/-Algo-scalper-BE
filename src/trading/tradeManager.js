@@ -25,6 +25,7 @@ const {
 const { computePacingPolicy } = require("../policy/pacingPolicy");
 const { buildTradePlan } = require("./planBuilder");
 const { roundToTick } = require("./priceUtils");
+const { reportFault, reportWindowedFault, snapshotFaults } = require("../runtime/errorBus");
 const {
   fitStopLossToLotRiskCap,
   computeTargetFromRR,
@@ -259,6 +260,7 @@ class TradeManager {
 
     // Throttle expensive DB-based checks (avoid per-tick Mongo hammering)
     this._lastDailyLossCheckAt = 0;
+    this._dailyLossInFlight = false;
     this._lastFlattenCheckAt = 0;
     this._lastEodConvertCheckAt = 0;
     this._eodConvertAttempted = new Set();
@@ -362,6 +364,7 @@ class TradeManager {
 
     // Portfolio risk checks
     this._lastPortfolioRiskCheckAt = 0;
+    this._portfolioRiskInFlight = false;
 
     // Execution quality feedback loop
     this._slippageCooldownUntil = 0;
@@ -749,6 +752,36 @@ class TradeManager {
     }
   }
 
+  _normalizeUnderlyingName(value) {
+    const raw = String(value || "").trim().toUpperCase();
+    if (!raw) return "";
+    const cleaned = raw.replace(/\s+/g, "");
+    const m = cleaned.match(/[A-Z]+/);
+    return m ? m[0] : cleaned;
+  }
+
+  _buildRiskKey({ strategyId, underlying, token }) {
+    const base = this._normalizeUnderlyingName(underlying);
+    if (base) {
+      const strat = String(strategyId || "").trim();
+      return strat ? `${base}:${strat}` : base;
+    }
+    const n = Number(token);
+    return Number.isFinite(n) && n > 0 ? String(n) : String(token || "UNKNOWN");
+  }
+
+  _riskKeyForTrade(trade) {
+    return this._buildRiskKey({
+      strategyId: trade?.strategyId,
+      underlying:
+        trade?.underlying_symbol ||
+        trade?.option_meta?.underlying ||
+        trade?.instrument?.name ||
+        trade?.instrument?.tradingsymbol,
+      token: trade?.instrument_token,
+    });
+  }
+
   _shouldFallbackToVirtualTarget(msg) {
     const s = String(msg || "").toLowerCase();
     return (
@@ -765,7 +798,13 @@ class TradeManager {
     // Patch-6: load persisted cost calibration multipliers (if enabled)
     try {
       await costCalibrator.start();
-    } catch {}
+    } catch (err) {
+      reportFault({
+        code: "COST_CALIBRATOR_START_FAILED",
+        err,
+        message: "[init] cost calibrator start failed; continuing in degraded mode",
+      });
+    }
     await this._ensureDailyRisk();
     await this._hydrateRiskStateFromDb();
     if (String(env.RESET_FAILURES_ON_START || "false") === "true") {
@@ -886,7 +925,13 @@ class TradeManager {
 
     this._exitLoopTimer = setInterval(
       () => {
-        this._exitLoopTick().catch(() => {});
+        this._exitLoopTick().catch((err) =>
+          reportFault({
+            code: "EXIT_LOOP_TICK_FAILED",
+            err,
+            message: "[exit] exit loop tick failed",
+          }),
+        );
       },
       Math.max(250, everyMs),
     );
@@ -992,19 +1037,43 @@ class TradeManager {
           state,
           reason,
           total,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       } else if (state === "HARD_STOP") {
         alert("error", "🛑 Daily hard stop reached", {
           state,
           reason,
           total,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       } else if (state === "RUNNING") {
         alert("info", "✅ Daily risk state reset to RUNNING", {
           state,
           reason,
           total,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       }
     }
 
@@ -1236,7 +1305,7 @@ class TradeManager {
 
     for (const t of actives) {
       if (!t?.instrument_token) continue;
-      this.risk.setOpenPosition(Number(t.instrument_token), {
+      this.risk.setOpenPosition(this._riskKeyForTrade(t), {
         tradeId: t.tradeId,
         side: t.side,
         qty: Number(t.qty ?? 0),
@@ -1263,7 +1332,20 @@ class TradeManager {
       now - this._lastDailyLossCheckAt >= lossEveryMs
     ) {
       this._lastDailyLossCheckAt = now;
-      this._checkDailyLoss().catch(() => {});
+      if (!this._dailyLossInFlight) {
+        this._dailyLossInFlight = true;
+        this._checkDailyLoss()
+          .catch((err) =>
+            reportFault({
+              code: "DAILY_LOSS_CHECK_FAILED",
+              err,
+              message: "[risk] daily loss check failed",
+            }),
+          )
+          .finally(() => {
+            this._dailyLossInFlight = false;
+          });
+      }
     }
 
     const flattenEveryMs = Number(env.FORCE_FLATTEN_CHECK_MS ?? 1000);
@@ -1276,7 +1358,20 @@ class TradeManager {
       this._forceFlattenIfNeeded().catch(() => {});
     }
 
-    this._monitorPortfolioRisk("tick").catch(() => {});
+    if (!this._portfolioRiskInFlight) {
+      this._portfolioRiskInFlight = true;
+      this._monitorPortfolioRisk("tick")
+        .catch((err) =>
+          reportFault({
+            code: "PORTFOLIO_RISK_CHECK_FAILED",
+            err,
+            message: "[risk] portfolio check failed",
+          }),
+        )
+        .finally(() => {
+          this._portfolioRiskInFlight = false;
+        });
+    }
 
     // Tick-accurate peak tracking for live trade
     try {
@@ -1434,7 +1529,15 @@ class TradeManager {
         updateTrade(id, {
           slTriggeredAt: new Date(st.triggeredAtMs),
           slTriggeredSource: st.triggeredBy,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       } catch {}
 
       const openSec = Number(env.SL_WATCHDOG_OPEN_SEC ?? 8);
@@ -1614,7 +1717,15 @@ class TradeManager {
       try {
         updateTrade(tradeId, {
           targetTouchedAt: new Date(st.triggeredAtMs),
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       } catch {}
 
       const openSec = Number(env.TARGET_WATCHDOG_OPEN_SEC ?? 2);
@@ -1957,7 +2068,15 @@ class TradeManager {
           targetOrderId,
           retryCount,
           cause,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
 
         const filledQty = Number(order?.filled_quantity ?? 0);
         const totalQty = Number(order?.quantity ?? fresh.qty ?? 0);
@@ -2235,7 +2354,15 @@ class TradeManager {
       tradeId,
       targetPrice: st.targetPrice,
       ltp,
-    }).catch(() => {});
+    }).catch((err) =>
+      reportWindowedFault({
+        code: "ALERT_SEND_FAILED",
+        windowKey: "alert_send_failed",
+        err,
+        message: "[alert] failed to dispatch notification",
+        meta: { context: "trade_manager" },
+      }),
+    );
 
     try {
       // Cancel SL to avoid margin blocks from overlapping exit orders
@@ -2926,7 +3053,15 @@ class TradeManager {
         ltp: st.lastLtp,
         trigger: st.triggerPrice,
         cause,
-      }).catch(() => {});
+      }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
 
       // Optional kill-switch on watchdog fire (safest)
       const killOnFire =
@@ -3119,7 +3254,15 @@ class TradeManager {
           total,
           realized,
           openPnl,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       }
       this.risk.setKillSwitch(true);
       await upsertDailyRisk(todayKey(), {
@@ -3141,7 +3284,15 @@ class TradeManager {
           total,
           realized,
           openPnl,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       }
     }
   }
@@ -3231,7 +3382,15 @@ class TradeManager {
       alert("warn", "⏰ EOD carry conversion done (MIS → NRML)", {
         tradeId,
         qty,
-      }).catch(() => {});
+      }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
     } catch (e) {
       this._eodConvertAttempted.add(tradeId);
       logger.error(
@@ -3241,7 +3400,15 @@ class TradeManager {
       alert("error", "🛑 EOD MIS → NRML conversion failed", {
         tradeId,
         message: e?.message || String(e),
-      }).catch(() => {});
+      }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
     }
   }
 
@@ -3334,7 +3501,7 @@ class TradeManager {
     const state = this.risk?.getState ? this.risk.getState() : null;
     const currentTokens = new Set(
       Array.isArray(state?.openPositions)
-        ? state.openPositions.map((p) => Number(p.token))
+        ? state.openPositions.map((p) => String(p.token))
         : [],
     );
 
@@ -3342,16 +3509,17 @@ class TradeManager {
       const qty = Number(qtyRaw ?? 0);
       if (!Number.isFinite(qty) || qty === 0) continue;
       const trade = activeByToken.get(Number(token));
-      this.risk.setOpenPosition(Number(token), {
+      const riskKey = trade?.riskKey || this._riskKeyForTrade(trade) || String(token);
+      this.risk.setOpenPosition(riskKey, {
         tradeId: trade?.tradeId || null,
         side: qty > 0 ? "BUY" : "SELL",
         qty: Math.abs(qty),
       });
-      currentTokens.delete(Number(token));
+      currentTokens.delete(String(riskKey));
     }
 
     for (const token of currentTokens) {
-      this.risk.clearOpenPosition(Number(token));
+      this.risk.clearOpenPosition(String(token));
     }
   }
 
@@ -3461,7 +3629,15 @@ class TradeManager {
       alert("error", "🛑 Portfolio risk breach", {
         reason: breach.reason,
         meta: breach.meta,
-      }).catch(() => {});
+      }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       this.risk.setKillSwitch(true);
       await upsertDailyRisk(todayKey(), {
         kill: true,
@@ -3578,7 +3754,15 @@ class TradeManager {
         maxEntryBps,
         maxExitInr,
         cooldownMin,
-      }).catch(() => {});
+      }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       logger.error(
         {
           avgEntryBps: avgEntry,
@@ -3619,7 +3803,15 @@ class TradeManager {
         strategyId,
         lossStreak: next,
         cooldownMin,
-      }).catch(() => {});
+      }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       logger.warn(
         { strategyId, lossStreak: next, cooldownMin },
         "[strategy] cooldown triggered",
@@ -3765,7 +3957,8 @@ class TradeManager {
       Number(env.CIRCUIT_BREAKER_COOLDOWN_MINUTES ?? 5),
     );
     if (Number.isFinite(token) && token > 0) {
-      this.risk.setCooldown(token, cooldownMin * 60, reason.code);
+      const riskKey = this._riskKeyForTrade(trade) || this._buildRiskKey({ token });
+      this.risk.setCooldown(riskKey, cooldownMin * 60, reason.code);
     }
     logger.warn(
       { tradeId, purpose, reason: reason.code, msg },
@@ -3793,7 +3986,12 @@ class TradeManager {
       Number(env.CIRCUIT_BREAKER_COOLDOWN_MINUTES ?? 5),
     );
     if (Number.isFinite(token) && token > 0) {
-      this.risk.setCooldown(token, cooldownMin * 60, reason.code);
+      const riskKey = this._buildRiskKey({
+        strategyId: params?.strategyId,
+        underlying: params?.underlying_symbol,
+        token,
+      });
+      this.risk.setCooldown(riskKey, cooldownMin * 60, reason.code);
     }
     alert("warn", "⚠️ Circuit breaker / exchange protection detected", {
       tradeId: trade?.tradeId || null,
@@ -4784,7 +4982,7 @@ class TradeManager {
             this.recoveredPosition,
           ).catch(() => {});
 
-          this.risk.setOpenPosition(token, {
+          this.risk.setOpenPosition(trade.riskKey || String(token), {
             tradeId,
             side,
             qty: Math.abs(qty),
@@ -5710,7 +5908,15 @@ class TradeManager {
               peakPnlR: plan?.meta?.peakPnlR,
               peakPriceR: plan?.meta?.peakPriceR,
               mfeR: plan?.meta?.mfeR,
-            }).catch(() => {});
+            }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
             logger.warn(
               { tradeId, reason: exitReason, meta: plan?.meta || null },
               "[dyn_exit] time stop triggered",
@@ -5761,7 +5967,15 @@ class TradeManager {
               beLockedAtPrice: patch.beLockedAtPrice,
               minGreenPts: trade?.minGreenPts,
               minGreenInr: trade?.minGreenInr,
-            }).catch(() => {});
+            }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
             logger.info(
               { tradeId, beLockedAtPrice: patch.beLockedAtPrice },
               "[dyn_exit] BE lock active",
@@ -5878,7 +6092,15 @@ class TradeManager {
             alert("info", "🧭 SL trailed", {
               tradeId,
               stopLoss: appliedTrigger,
-            }).catch(() => {});
+            }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
             this._dynExitFailCount.set(tradeId, 0);
             this._dynExitFailBackoffUntil.delete(tradeId);
           } catch (e) {
@@ -5969,7 +6191,15 @@ class TradeManager {
               alert("error", "🛑 Trailing disabled after modify failures", {
                 tradeId,
                 failCount: fails,
-              }).catch(() => {});
+              }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
               logger.error(
                 { tradeId, failCount: fails },
                 "[dyn_exit] trailing disabled after failures",
@@ -6035,7 +6265,15 @@ class TradeManager {
             alert("info", "🎯 TARGET adjusted", {
               tradeId,
               targetPrice: plan.target.targetPrice,
-            }).catch(() => {});
+            }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
           } catch (e) {
             logger.warn(
               { tradeId, e: e.message, targetPrice: plan.target.targetPrice },
@@ -6777,7 +7015,15 @@ class TradeManager {
       await updateTrade(tradeId, {
         entryFallbackInFlight: false,
         entryFallbackLastCompletedAt: new Date(),
-      }).catch(() => {});
+      }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
     }
   }
 
@@ -6876,7 +7122,7 @@ class TradeManager {
           Number(env.SL_SLA_BREACH_COOLDOWN_MIN ?? 5),
         );
         if (Number.isFinite(token) && token > 0 && this.risk?.setCooldown) {
-          this.risk.setCooldown(token, cooldownMin * 60, "SL_SLA_BREACH");
+          this.risk.setCooldown(trade?.riskKey || String(token), cooldownMin * 60, "SL_SLA_BREACH");
         }
 
         logger.error(
@@ -7808,6 +8054,7 @@ class TradeManager {
         side: "BUY", // long options only (BUY CE/PE)
         underlying_token: underlyingToken,
         underlying_side: underlyingSide,
+        underlying_symbol: picked?.underlying || null,
         underlying_ltp: underLtp,
         option_meta: picked,
         confidence: Number.isFinite(finalConfidence)
@@ -7819,6 +8066,11 @@ class TradeManager {
     }
 
     const token = Number(s.instrument_token);
+    const riskKey = this._buildRiskKey({
+      strategyId: s.strategyId,
+      underlying: s.underlying_symbol || s.option_meta?.underlying,
+      token,
+    });
 
     const trackDecision = (outcome, stage, reason, meta) => {
       telemetry.recordDecision({
@@ -7853,7 +8105,7 @@ class TradeManager {
       logger.warn({ token, dailyState }, "[trade] blocked (daily hard stop)");
       return;
     }
-    const check = this.risk.canTrade(token);
+    const check = this.risk.canTrade(riskKey);
     if (!check.ok) {
       logger.info({ token, reason: check.reason }, "[trade] blocked");
       return;
@@ -8594,7 +8846,15 @@ class TradeManager {
         token,
         qty,
         freezeQty: freezeCheck.freeze,
-      }).catch(() => {});
+      }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       return;
     }
     if (freezeCheck.freeze && freezeCheck.qty !== qty) {
@@ -8876,6 +9136,7 @@ class TradeManager {
       intervalMin,
       instrument,
       strategyId: s.strategyId,
+      riskKey,
       side: side,
       qty,
       candle: s.candle,
@@ -8987,7 +9248,15 @@ class TradeManager {
       alert("error", "❌ ENTRY rejected/failed", {
         tradeId,
         message: e.message,
-      }).catch(() => {});
+      }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       this.risk.markFailure("ENTRY_PLACE_FAILED");
       await updateTrade(tradeId, {
         status: STATUS.ENTRY_FAILED,
@@ -9192,7 +9461,15 @@ class TradeManager {
         alert("warn", "PANIC EXIT filled", {
           tradeId: trade.tradeId,
           exitPrice: exitPrice > 0 ? exitPrice : null,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
         await this._bookRealizedPnl(trade.tradeId);
         await this._finalizeClosed(trade.tradeId, trade.instrument_token);
         return;
@@ -9212,7 +9489,15 @@ class TradeManager {
             tradeId: trade.tradeId,
             status,
             filledQty: filledNow,
-          }).catch(() => {});
+          }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
         }
         return;
       }
@@ -9435,7 +9720,15 @@ class TradeManager {
             maxBps,
             tick,
             ticksAllowance,
-          }).catch(() => {});
+          }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
 
           if (slipAbs >= effKillBps && entryType === "MARKET") {
             this.risk.setKillSwitch(true);
@@ -9527,7 +9820,15 @@ class TradeManager {
           avg,
           filledQty,
           slipBps,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
         this.risk.resetFailures();
 
         // PATCH-10: Post-fill risk recheck (actual fill can make ₹ risk exceed cap)
@@ -9649,7 +9950,15 @@ class TradeManager {
         alert("warn", "⚠️ ENTRY partial fill (protecting filled qty)", {
           tradeId: trade.tradeId,
           filledQty: filledNow,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
         return;
       }
 
@@ -10192,7 +10501,15 @@ class TradeManager {
         alert("error", "🛑 SL qty modify failed -> PANIC EXIT", {
           tradeId,
           message: e.message,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
         this.risk.setKillSwitch(true);
         await upsertDailyRisk(todayKey(), {
           kill: true,
@@ -10225,7 +10542,15 @@ class TradeManager {
         alert("warn", "⚠️ TARGET qty modify failed", {
           tradeId,
           message: e.message,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       }
     }
   }
@@ -10338,7 +10663,15 @@ class TradeManager {
           qty: q,
           trueRiskInr,
           capInr,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
 
         return { ok: true, refit: true, stopLoss: fit.stopLoss };
       }
@@ -10371,7 +10704,15 @@ class TradeManager {
           trueRiskInr,
           capInr,
           reason: fit.reason || "CANNOT_FIT",
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
 
         const fresh = (await getTrade(tradeId)) || t;
         await this._panicExit(
@@ -10450,7 +10791,15 @@ class TradeManager {
           alert("warn", "⚠️ TARGET price modify failed post-fill", {
             tradeId,
             message: e.message,
-          }).catch(() => {});
+          }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
         }
       }
 
@@ -11058,7 +11407,15 @@ class TradeManager {
           tradeId,
           stopLoss: newSL,
           remaining,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
       } catch (e) {
         logger.error(
           { tradeId, e: e.message },
@@ -11119,7 +11476,15 @@ class TradeManager {
             tradeId,
             ltp: ltpNow,
             stopLoss: liveStopLoss,
-          }).catch(() => {});
+          }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
           this.risk.setKillSwitch(true);
           await upsertDailyRisk(todayKey(), {
             kill: true,
@@ -11161,7 +11526,15 @@ class TradeManager {
           tradeId,
           stopLoss: liveStopLoss,
           qty: liveQty,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
 
         if (isHalted()) {
           logger.warn("[trade] SL skipped (halted)");
@@ -11227,7 +11600,15 @@ class TradeManager {
             alert("error", "🛑 SL place failed -> PANIC EXIT", {
               tradeId,
               message: msg,
-            }).catch(() => {});
+            }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
             this.risk.setKillSwitch(true);
             await upsertDailyRisk(todayKey(), {
               kill: true,
@@ -11265,7 +11646,15 @@ class TradeManager {
           tradeId,
           slOrderId,
           stopLoss: liveStopLoss,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
 
         // Immediate verification for SL
         this._watchExitLeg(tradeId, slOrderId, "SL").catch(() => {});
@@ -11318,7 +11707,15 @@ class TradeManager {
         alert("info", "🎯 OPT_TARGET_MODE=VIRTUAL -> tracking virtual target", {
           tradeId,
           targetPrice: fresh2.targetPrice,
-        }).catch(() => {});
+        }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
         if (shouldMarkLive) {
           await updateTrade(tradeId, { status: STATUS.LIVE });
         }
@@ -11375,7 +11772,15 @@ class TradeManager {
                 alert("warn", "⚠️ TARGET place failed (SL still active)", {
                   tradeId,
                   message: msg,
-                }).catch(() => {});
+                }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
                 const patch = {
                   status: STATUS.LIVE,
                   closeReason: "TARGET_PLACE_FAILED | " + msg,
@@ -11416,7 +11821,15 @@ class TradeManager {
               alert("warn", "⚠️ RUNNER TARGET place failed (SL still active)", {
                 tradeId,
                 message: msg,
-              }).catch(() => {});
+              }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
               const patch = {
                 status: STATUS.LIVE,
                 closeReason: "RUNNER_TARGET_PLACE_FAILED | " + msg,
@@ -11457,7 +11870,15 @@ class TradeManager {
             alert("warn", "⚠️ TARGET place failed (SL still active)", {
               tradeId,
               message: msg,
-            }).catch(() => {});
+            }).catch((err) =>
+        reportWindowedFault({
+          code: "ALERT_SEND_FAILED",
+          windowKey: "alert_send_failed",
+          err,
+          message: "[alert] failed to dispatch notification",
+          meta: { context: "trade_manager" },
+        }),
+      );
             // Do not kill-switch; SL is safety critical and is already placed.
             const patch = {
               status: STATUS.LIVE,
@@ -12020,7 +12441,7 @@ class TradeManager {
           : (entry - exit) * qty
         : null;
 
-    this.risk.markTradeClosed(Number(instrument_token), {
+    this.risk.markTradeClosed(t?.riskKey || String(instrument_token), {
       status: t?.status,
       closeReason: t?.closeReason,
       exitReason: t?.exitReason,
@@ -12042,7 +12463,15 @@ class TradeManager {
         kill: en,
         reason: en ? String(reason || "ADMIN") : null,
       },
-    ).catch(() => {});
+    ).catch((err) =>
+      reportWindowedFault({
+        code: "ALERT_SEND_FAILED",
+        windowKey: "alert_send_failed",
+        err,
+        message: "[alert] failed to dispatch notification",
+        meta: { context: "trade_manager" },
+      }),
+    );
     logger.warn({ kill: en, reason }, "[risk] kill-switch updated");
   }
 
@@ -12065,6 +12494,7 @@ class TradeManager {
       ordersPlacedToday: this.ordersPlacedToday,
       dynamicExitCadence: this._dynExitCadenceSnapshot(),
       orphanReplay: { ...this._orphanReplayStats },
+      faults: snapshotFaults(),
     };
   }
 }
