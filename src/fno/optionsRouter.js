@@ -512,7 +512,7 @@ async function pickOptionContractForSignal({
       optType: null,
       meta: {
         breakerOpenUntil: st?.breakerOpenUntil || null,
-        failStreak: st?.failStreak ?? null,
+        failStreak: st?.stats?.failStreak ?? null,
       },
     };
   }

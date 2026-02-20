@@ -7586,7 +7586,7 @@ class TradeManager {
         logger.warn(
           {
             breakerOpenUntil: st?.breakerOpenUntil || null,
-            failStreak: st?.failStreak ?? null,
+            failStreak: st?.stats?.failStreak ?? null,
             token: s.instrument_token,
             side: s.side,
           },
