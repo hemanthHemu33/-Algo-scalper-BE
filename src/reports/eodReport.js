@@ -1,16 +1,25 @@
 const { getDb } = require("../db");
+const { DateTime } = require("luxon");
+const { env } = require("../config");
 const { normalizeTradeRow } = require("../trading/tradeNormalization");
 
 const TRADES = "trades";
 
 function parseDayBounds(day) {
-  const d =
+  const tz = env.CANDLE_TZ || "Asia/Kolkata";
+  const parsed =
     typeof day === "string" && /^\d{4}-\d{2}-\d{2}$/.test(day)
-      ? day
-      : new Date().toISOString().slice(0, 10);
-  const start = new Date(`${d}T00:00:00.000Z`);
-  const end = new Date(`${d}T23:59:59.999Z`);
-  return { day: d, start, end };
+      ? DateTime.fromISO(day, { zone: tz })
+      : null;
+
+  const base = parsed?.isValid ? parsed : DateTime.now().setZone(tz);
+  const start = base.startOf("day");
+  const end = start.plus({ days: 1 });
+  return {
+    day: start.toFormat("yyyy-LL-dd"),
+    start: start.toJSDate(),
+    end: end.toJSDate(),
+  };
 }
 
 function pnlForTrade(t) {
@@ -73,8 +82,8 @@ async function buildEodReport({ day } = {}) {
     .collection(TRADES)
     .find({
       $or: [
-        { closedAt: { $gte: start, $lte: end } },
-        { updatedAt: { $gte: start, $lte: end } },
+        { closedAt: { $gte: start, $lt: end } },
+        { updatedAt: { $gte: start, $lt: end } },
       ],
       status: {
         $in: ["EXITED_TARGET", "EXITED_SL", "CLOSED", "ENTRY_FAILED", "ENTRY_CANCELLED"],
