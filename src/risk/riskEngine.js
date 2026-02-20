@@ -18,6 +18,13 @@ class RiskEngine {
     this.clock = clock && typeof clock.nowMs === "function" ? clock : { nowMs: () => Date.now() };
   }
 
+  _keyOf(tokenOrKey) {
+    if (typeof tokenOrKey === "string") return tokenOrKey.trim();
+    const n = Number(tokenOrKey);
+    if (Number.isFinite(n)) return String(n);
+    return String(tokenOrKey || "").trim();
+  }
+
   setStateChangeHandler(fn) {
     this.onStateChange = typeof fn === "function" ? fn : null;
   }
@@ -37,7 +44,7 @@ class RiskEngine {
       tradesToday: this.tradesToday,
       openPositions: Array.from(this.openPositions.entries()).map(
         ([token, pos]) => ({
-          token: Number(token),
+          token,
           ...pos,
         }),
       ),
@@ -62,13 +69,13 @@ class RiskEngine {
     }
     if (Array.isArray(state.openPositions)) {
       this.openPositions = new Map(
-        state.openPositions.map((p) => [Number(p.token), { ...p }]),
+        state.openPositions.map((p) => [this._keyOf(p.token), { ...p }]),
       );
     }
     if (state.cooldownUntil && typeof state.cooldownUntil === "object") {
       this.cooldownUntil = new Map(
         Object.entries(state.cooldownUntil).map(([token, ts]) => [
-          Number(token),
+          this._keyOf(token),
           Number(ts),
         ]),
       );
@@ -92,23 +99,24 @@ class RiskEngine {
     this._emitStateChange();
   }
   setOpenPosition(token, pos) {
-    this.openPositions.set(Number(token), pos);
+    this.openPositions.set(this._keyOf(token), pos);
     this._emitStateChange();
   }
   clearOpenPosition(token) {
-    this.openPositions.delete(Number(token));
+    this.openPositions.delete(this._keyOf(token));
     this._emitStateChange();
   }
   setCooldown(token, seconds, reason) {
     const sec = Math.max(0, Number(seconds ?? 0));
     if (!Number.isFinite(sec) || sec <= 0) return;
-    this.cooldownUntil.set(Number(token), this.clock.nowMs() + sec * 1000);
+    const key = this._keyOf(token);
+    this.cooldownUntil.set(key, this.clock.nowMs() + sec * 1000);
     this._emitStateChange();
-    return { token: Number(token), seconds: sec, reason: reason || null };
+    return { token: key, seconds: sec, reason: reason || null };
   }
 
   canTrade(token) {
-    token = Number(token);
+    token = this._keyOf(token);
 
     if (isHalted()) return { ok: false, reason: "halted" };
 
@@ -179,7 +187,7 @@ class RiskEngine {
 
   markTradeOpened(token, pos) {
     this.tradesToday += 1;
-    this.openPositions.set(Number(token), pos);
+    this.openPositions.set(this._keyOf(token), pos);
     this._emitStateChange();
   }
 
@@ -235,9 +243,10 @@ class RiskEngine {
   }
 
   markTradeClosed(token, reasonMeta = {}) {
-    this.openPositions.delete(Number(token));
+    const key = this._keyOf(token);
+    this.openPositions.delete(key);
     const cooldown = this._resolveCooldownSeconds(reasonMeta);
-    this.cooldownUntil.set(Number(token), this.clock.nowMs() + cooldown * 1000);
+    this.cooldownUntil.set(key, this.clock.nowMs() + cooldown * 1000);
     this._emitStateChange();
   }
 

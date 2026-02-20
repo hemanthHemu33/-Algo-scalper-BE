@@ -1,5 +1,6 @@
 const { DateTime } = require("luxon");
 const { buildPremiumAwareOptionPlan } = require("./optionPremiumPlanner");
+const { roundToTick } = require("./priceUtils");
 const { normalizeTickSize } = require("../utils/tickSize");
 
 /**
@@ -21,17 +22,6 @@ function clamp(x, lo, hi) {
 function safeNum(v, fallback = null) {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
-}
-
-function roundToTick(price, tick, mode = "nearest") {
-  const t = normalizeTickSize(tick);
-  if (!Number.isFinite(t)) return Number(price);
-  const p = Number(price);
-  if (!Number.isFinite(p)) return p;
-  const steps = p / t;
-  if (mode === "up") return Math.ceil(steps) * t;
-  if (mode === "down") return Math.floor(steps) * t;
-  return Math.round(steps) * t;
 }
 
 function atrLast(candles, period = 14) {

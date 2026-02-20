@@ -55,6 +55,7 @@ const {
   normalizeTradeRow,
 } = require("./trading/tradeNormalization");
 const { STATUS } = require("./trading/tradeStateMachine");
+const { snapshotFaults } = require("./runtime/errorBus");
 
 function buildAdminAuth() {
   const expected = env.ADMIN_API_KEY;
@@ -544,6 +545,7 @@ function buildApp() {
         activeTrade,
         tradeTracking,
         systemHealth,
+        faults: s?.faults || snapshotFaults(),
       });
     } catch (e) {
       res.status(503).json({ ok: false, error: e.message });
