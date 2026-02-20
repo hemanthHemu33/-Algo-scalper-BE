@@ -57,6 +57,7 @@ A production-ready, Zerodha Kite Connect–powered **scalping engine** that:
 ## Architecture overview
 
 **Core runtime flow**
+
 1. **Boot**: Loads env config, connects MongoDB, ensures retention indexes, starts telemetry + optimizer, watches token storage.
 2. **Token watcher**: Fetches latest Kite access token from MongoDB; halts trading if missing or invalid.
 3. **Ticker**: Connects to KiteTicker and streams ticks into the pipeline.
@@ -65,6 +66,7 @@ A production-ready, Zerodha Kite Connect–powered **scalping engine** that:
 6. **Telemetry**: Aggregates signal decisions, trade outcomes, and optimizer signals for performance tuning.
 
 **Supporting services**
+
 - **Market calendar**: Blocks trades on holidays and supports special sessions.
 - **Risk & kill switch**: Runtime controls that can stop trading immediately.
 - **Alerts + audit**: Notifications and compliance-style logs for admin actions.
@@ -80,6 +82,7 @@ npm run dev
 ```
 
 **Health checks**
+
 - `GET http://localhost:4001/health` – liveness
 - `GET http://localhost:4001/ready` – ready only if ticker connected + not halted
 
@@ -211,15 +214,18 @@ The server exchanges and stores the token. All `/admin/*` routes require `ADMIN_
 ## Market data & subscriptions
 
 **Two subscription modes**
+
 - **Symbols (recommended):** `SUBSCRIBE_SYMBOLS=NSE:RELIANCE,NSE:TCS`
 - **Tokens (legacy):** `SUBSCRIBE_TOKENS=738561`
 
 If both are provided, the engine subscribes to the **union**.
 
 **Instrument sync** (recommended)
+
 - `npm run sync:instruments` downloads the instrument dump and caches token data for the requested symbols.
 
 **Tick modes** (performance tuning)
+
 - `TICK_MODE_DEFAULT`: default for most tokens (`quote` or `full`)
 - `TICK_MODE_TRADE`: tokens actively traded
 - `TICK_MODE_UNDERLYING`: underlying instruments for options
@@ -293,10 +299,12 @@ FNO_MODE=FUT  # or OPT
 ```
 
 ### Futures
+
 - Contracts are selected based on underlying, expiry, lot sizes, and policy.
 - Enforces minimum days to expiry and expiry-day cutoffs.
 
 ### Options
+
 - Supports **ATM/ITM/OTM** strike selection and strike scan around ATM.
 - Filters by **premium bands**, **spread**, **depth**, **delta**, **gamma**, **IV**, and **OI walls**.
 - Handles **premium-aware SL/target planning** and **dynamic exit logic**.
@@ -324,6 +332,7 @@ The adaptive optimizer:
 - Persists state to MongoDB for fast restarts
 
 Admin controls:
+
 - `GET /admin/optimizer/snapshot`
 - `POST /admin/optimizer/flush`
 - `POST /admin/optimizer/reload`
@@ -460,6 +469,7 @@ See [`RENDER_DEPLOY.md`](./RENDER_DEPLOY.md) for step-by-step Render setup, heal
 ### Runtime controls
 
 - **Enable/disable trading**
+
   ```bash
   curl -X POST -H "x-api-key: $ADMIN_API_KEY" \
     "http://localhost:4001/admin/trading?enabled=false"
@@ -478,14 +488,17 @@ See [`RENDER_DEPLOY.md`](./RENDER_DEPLOY.md) for step-by-step Render setup, heal
 ## Troubleshooting
 
 ### Token issues
+
 - If `kite` access token is missing or invalid, the engine halts trading and keeps polling.
 - Use `/kite-redirect` or `/admin/kite/session` to refresh the token.
 
 ### Not ready
+
 - `/ready` returns 503 if ticker is disconnected or a halt is active.
 - Check `/admin/status` and `/admin/health/critical` for detailed diagnostics.
 
 ### Trading halted
+
 - Check `/admin/status` for `haltInfo`
 - Use `/admin/halt/reset` after resolving the underlying issue.
 
@@ -551,3 +564,13 @@ Price ^
       |
       +--------------------------------------------------> Time
 <!-- prettier-ignore-end -->
+
+What to expect now (your “no surprises” summary)
+With your current env + code:
+Dead/no-momentum trades will be cut around 6 minutes (but only if UL also didn’t move enough).
+Stagnant trades will be cut around 20 minutes unless they proved strength.
+Winners that touch +1R will stop giving back to tiny greens:
+SL will jump to protect ~₹175 (0.25R) minimum.
+Strong winners beyond 1.5R will trail tighter and exit quicker on pullbacks.
+Time-stop exits will try a fast LIMIT first, and if not filled in ~2s they’ll escalate.
+After exits, you’ll see cooldown behavior based on exit reason.
