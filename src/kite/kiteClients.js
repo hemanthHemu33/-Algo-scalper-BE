@@ -19,6 +19,24 @@ function isAuthError(err) {
   );
 }
 
+function isRetryableKiteError(err) {
+  const msg = String(err?.message || err || "");
+  return (
+    msg.includes("ECONNABORTED") ||
+    msg.includes("ECONNRESET") ||
+    msg.includes("ETIMEDOUT") ||
+    msg.includes("EAI_AGAIN") ||
+    msg.includes("socket hang up") ||
+    msg.includes("No response from server") ||
+    msg.includes("Gateway Timeout") ||
+    msg.includes("Too many requests") ||
+    msg.includes("429") ||
+    msg.includes("502") ||
+    msg.includes("503") ||
+    msg.includes("504")
+  );
+}
+
 async function withRetry(fn, { name, attempts = 3, baseDelayMs = 250 } = {}) {
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
@@ -30,13 +48,30 @@ async function withRetry(fn, { name, attempts = 3, baseDelayMs = 250 } = {}) {
         await halt("KITE_AUTH_ERROR", { name, message: e.message });
         throw e;
       }
+      if (!isRetryableKiteError(e)) {
+        throw e;
+      }
       if (i === attempts - 1) break;
-      const wait = baseDelayMs * Math.pow(2, i);
+      const jitter = Math.floor(Math.random() * 100);
+      const wait = baseDelayMs * Math.pow(2, i) + jitter;
       logger.warn({ name, attempt: i + 1, wait, e: e.message }, "[kite] call failed; retrying");
       await sleep(wait);
     }
   }
   throw lastErr;
+}
+
+function singleFlight(kc, methodName, impl) {
+  const inFlight = new Map();
+  kc[methodName] = (...args) => {
+    const key = JSON.stringify(args || []);
+    if (inFlight.has(key)) return inFlight.get(key);
+    const p = Promise.resolve()
+      .then(() => impl(...args))
+      .finally(() => inFlight.delete(key));
+    inFlight.set(key, p);
+    return p;
+  };
 }
 
 function wrapKiteConnect(kc) {
@@ -67,7 +102,12 @@ function wrapKiteConnect(kc) {
       continue;
     }
 
-    kc[m] = (...args) => withRetry(() => orig(...args), { name: m });
+    const call = (...args) => withRetry(() => orig(...args), { name: m });
+    if (m === "getOrders" || m === "getPositions" || m === "getMargins") {
+      singleFlight(kc, m, call);
+      continue;
+    }
+    kc[m] = call;
   }
 
   return kc;
