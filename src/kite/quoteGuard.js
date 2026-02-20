@@ -329,7 +329,7 @@ function getQuoteGuardStats() {
       : null,
     failStreak: state.failStreak,
     recentReq: state.recentReqTs.length,
-    stats: { ...state.stats },
+    stats: { ...state.stats, failStreak: state.failStreak },
   };
 }
 

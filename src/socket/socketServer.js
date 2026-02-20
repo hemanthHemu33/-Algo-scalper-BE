@@ -211,7 +211,13 @@ async function buildCriticalHealthSnapshot() {
     checks.push({ ok: true, code: "KILL_SWITCH_OFF" });
   }
 
-  const breakerUntil = Number(quoteGuard?.breakerOpenUntil ?? 0);
+  const breakerUntilRaw = quoteGuard?.breakerOpenUntil ?? null;
+  const breakerUntil =
+    typeof breakerUntilRaw === "string"
+      ? Date.parse(breakerUntilRaw)
+      : Number.isFinite(Number(breakerUntilRaw))
+        ? Number(breakerUntilRaw)
+        : 0;
   const breakerOpen = breakerUntil > Date.now();
   if (env.CRITICAL_HEALTH_FAIL_ON_QUOTE_BREAKER && breakerOpen) {
     checks.push({
@@ -219,8 +225,8 @@ async function buildCriticalHealthSnapshot() {
       code: "QUOTE_BREAKER_OPEN",
       meta: {
         breakerOpenUntil: breakerUntil,
-        failStreak: quoteGuard?.failStreak || 0,
-        lastError: quoteGuard?.lastError || null,
+        failStreak: quoteGuard?.stats?.failStreak || 0,
+        lastError: quoteGuard?.stats?.lastError || null,
       },
     });
   } else {
