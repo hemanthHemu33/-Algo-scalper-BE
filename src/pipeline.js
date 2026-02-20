@@ -21,6 +21,7 @@ const { RiskEngine } = require("./risk/riskEngine");
 const { TradeManager } = require("./trading/tradeManager");
 const { telemetry } = require("./telemetry/signalTelemetry");
 const { marketHealth } = require("./market/marketHealth");
+const { alert } = require("./alerts/alertService");
 
 function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   const intervals = (env.CANDLE_INTERVALS || "1,3")
@@ -109,6 +110,8 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
 
     for (const intervalMin of intervals) await ensureIndexes(intervalMin);
 
+    let totalBackfill = 0;
+    let weakBackfillCount = 0;
     for (const token of tokensRef) {
       for (const intervalMin of intervals) {
         try {
@@ -120,8 +123,10 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
           });
           candleCache.addCandles(candles);
           const count = Array.isArray(candles) ? candles.length : 0;
+          totalBackfill += count;
           logger.info({ token, intervalMin, count }, "[backfill] ok");
           if (count < 50) {
+            weakBackfillCount += 1;
             logger.warn(
               { token, intervalMin, count },
               "[backfill] insufficient candles for signal evaluation (need >= 50)",
@@ -135,6 +140,13 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
         }
       }
     }
+
+    alert("info", "🧩 Pipeline primed", {
+      tokens: tokensRef.length,
+      intervals,
+      totalBackfillCandles: totalBackfill,
+      lowHistoryBuckets: weakBackfillCount,
+    }).catch((err) => { reportFault({ code: "PIPELINE_ASYNC", err, message: "[src/pipeline.js] async task failed" }); });
   }
 
   // Allow seeding subscription view (primarily for admin visibility)
