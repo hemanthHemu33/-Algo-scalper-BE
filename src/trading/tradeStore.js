@@ -18,6 +18,7 @@ async function ensureTradeIndexes() {
   const db = getDb();
   await db.collection(TRADES).createIndex({ tradeId: 1 }, { unique: true });
   await db.collection(TRADES).createIndex({ status: 1, updatedAt: -1 });
+  await db.collection(TRADES).createIndex({ createdAt: -1, strategyId: 1 });
   await db
     .collection(ORDER_LINKS)
     .createIndex({ order_id: 1 }, { unique: true });

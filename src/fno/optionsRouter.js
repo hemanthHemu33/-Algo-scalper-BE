@@ -17,23 +17,55 @@ const {
   setLastOptionPick,
 } = require("./optionChainCache");
 
-function parseDate(v) {
+function optionTz() {
+  return env.CANDLE_TZ || "Asia/Kolkata";
+}
+
+function expiryDateTime(v, tz = optionTz()) {
   if (!v) return null;
-  try {
-    const d = v instanceof Date ? v : new Date(v);
-    return Number.isNaN(d.getTime()) ? null : d;
-  } catch {
-    return null;
+
+  if (DateTime.isDateTime(v)) {
+    return v.isValid ? v.setZone(tz) : null;
   }
+
+  if (v instanceof Date) {
+    const dt = DateTime.fromJSDate(v, { zone: tz });
+    return dt.isValid ? dt : null;
+  }
+
+  if (typeof v === "number") {
+    const dt = DateTime.fromMillis(v, { zone: tz });
+    return dt.isValid ? dt : null;
+  }
+
+  const raw = String(v || "").trim();
+  if (!raw) return null;
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    const dt = DateTime.fromISO(raw, { zone: tz });
+    return dt.isValid ? dt : null;
+  }
+
+  const dt = DateTime.fromISO(raw, { setZone: true });
+  if (dt.isValid) return dt.setZone(tz);
+
+  const fallback = new Date(raw);
+  if (Number.isNaN(fallback.getTime())) return null;
+  const fdt = DateTime.fromJSDate(fallback, { zone: tz });
+  return fdt.isValid ? fdt : null;
+}
+
+function expiryISOInTz(v, tz = optionTz()) {
+  const dt = expiryDateTime(v, tz);
+  return dt ? dt.toFormat("yyyy-LL-dd") : null;
 }
 
 function todayDate(nowMs = Date.now()) {
-  const tz = env.CANDLE_TZ || "Asia/Kolkata";
-  return DateTime.fromMillis(Number(nowMs)).setZone(tz).startOf("day").toJSDate();
+  return DateTime.fromMillis(Number(nowMs)).setZone(optionTz()).startOf("day");
 }
 
 function _dteDays(expiryISO, nowMs = Date.now()) {
-  const tz = env.CANDLE_TZ || "Asia/Kolkata";
+  const tz = optionTz();
   const e = String(expiryISO || "").slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(e)) return null;
   const exp = DateTime.fromISO(e, { zone: tz }).set({
@@ -155,19 +187,15 @@ async function buildOptionSubscriptionCandidates({
 
   const expiryISO = pickBestExpiryISO({
     expiries: optionRows
-      .map((r) => {
-        const exp = parseDate(r.expiry);
-        return exp ? exp.toISOString().slice(0, 10) : null;
-      })
+      .map((r) => expiryISOInTz(r.expiry))
       .filter(Boolean),
     env,
     nowMs,
   })?.expiryISO || pickNearestExpiryISO(optionRows, nowMs);
 
-  const slice = optionRows.filter((r) => {
-    const exp = parseDate(r.expiry);
-    return exp ? exp.toISOString().slice(0, 10) === expiryISO : false;
-  });
+  const slice = optionRows.filter(
+    (r) => expiryISOInTz(r.expiry) === expiryISO,
+  );
   if (!slice.length) return [];
 
   const step = detectStrikeStepFromRows(slice, strikeStepFallback(underlying));
@@ -232,12 +260,12 @@ function pickNearestExpiryISO(rows, nowMs = Date.now()) {
   const today = todayDate(nowMs);
   let bestExp = null;
   for (const r of rows || []) {
-    const exp = parseDate(r.expiry);
+    const exp = expiryDateTime(r.expiry);
     if (!exp) continue;
-    if (exp < today) continue;
+    if (exp.startOf("day") < today) continue;
     if (!bestExp || exp < bestExp) bestExp = exp;
   }
-  return bestExp ? bestExp.toISOString().slice(0, 10) : null;
+  return bestExp ? bestExp.toFormat("yyyy-LL-dd") : null;
 }
 
 function parseWeights(spec) {
@@ -547,12 +575,7 @@ async function pickOptionContractForSignal({
   }
 
   // Build expiry set
-  const expiries = optionRows
-    .map((r) => {
-      const exp = parseDate(r.expiry);
-      return exp ? exp.toISOString().slice(0, 10) : null;
-    })
-    .filter(Boolean);
+  const expiries = optionRows.map((r) => expiryISOInTz(r.expiry)).filter(Boolean);
 
   let expiryISO = forceExpiryISO || pickNearestExpiryISO(optionRows, nowMs);
   // Apply roll rules (min DTE / avoid expiry-day after cutoff)
@@ -574,10 +597,9 @@ async function pickOptionContractForSignal({
     };
   }
 
-  const slice = optionRows.filter((r) => {
-    const exp = parseDate(r.expiry);
-    return exp ? exp.toISOString().slice(0, 10) === expiryISO : false;
-  });
+  const slice = optionRows.filter(
+    (r) => expiryISOInTz(r.expiry) === expiryISO,
+  );
 
   const step = detectStrikeStepFromRows(slice, strikeStepFallback(underlying));
   const atm = roundToStep(Number(underlyingLtp), step);
