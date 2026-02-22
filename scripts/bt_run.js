@@ -11,6 +11,7 @@ const { getSessionForDateTime, buildBoundsForToday } = require("../src/market/ma
 const { evaluateOnCandles } = require("../src/strategy/replayEngine");
 const { computeDynamicExitPlan } = require("../src/trading/dynamicExitManager");
 const { estimateRoundTripCostInr } = require("../src/trading/costModel");
+const { buildTradePlan } = require("../src/trading/planBuilder");
 const { createBacktestClock } = require("../src/backtest/clock");
 const { buildOptionBacktestProvider } = require("../src/backtest/optionBacktest");
 const {
@@ -103,6 +104,58 @@ function isTargetEnabledForMode(mode) {
     return String(env.OPT_TP_ENABLED || "false") === "true";
   }
   return true;
+}
+
+function buildBacktestTradePlan({
+  mode,
+  env,
+  intervalMin,
+  replaySlice,
+  baseCandle,
+  pendingEntry,
+  optionProvider,
+  tradedCandle,
+}) {
+  const entryUnderlying = Number(baseCandle?.close);
+  const regimeMeta = pendingEntry?.sig?.regimeMeta || null;
+  const atr = Number(regimeMeta?.atr);
+  const close = Number(regimeMeta?.close);
+  const atrPctUnderlying = Number.isFinite(atr) && Number.isFinite(close) && close > 0 ? (atr / close) * 100 : null;
+
+  const isOpt = String(mode).toUpperCase() === "OPT";
+  const optionMeta = isOpt
+    ? {
+        strategyStyle: pendingEntry?.sig?.strategyStyle || null,
+        optionType: pendingEntry?.selectedContract?.snapshot?.optionType || null,
+        strike: Number(pendingEntry?.selectedContract?.selected?.strike ?? 0) || null,
+        expiry: pendingEntry?.selectedContract?.selected?.expiry || null,
+        delta: Number(pendingEntry?.selectedContract?.selected?.greeks?.delta),
+        gamma: Number(pendingEntry?.selectedContract?.selected?.greeks?.gamma),
+      }
+    : null;
+
+  const premiumCandles =
+    isOpt && pendingEntry?.selectedContract?.selectedToken
+      ? optionProvider?.getCandlesUpToTs?.(pendingEntry.selectedContract.selectedToken, baseCandle.ts) || null
+      : null;
+
+  const plan = buildTradePlan({
+    env,
+    candles: replaySlice,
+    premiumCandles,
+    intervalMin,
+    side: pendingEntry?.side,
+    signalStyle: pendingEntry?.sig?.strategyStyle,
+    entryUnderlying,
+    expectedMoveUnderlying: Number(regimeMeta?.expectedMovePerShare),
+    atrPeriod: Number(env.EXPECTED_MOVE_ATR_PERIOD ?? 14),
+    optionMeta,
+    entryPremium: isOpt ? Number(tradedCandle?.close) : null,
+    premiumTick: Number(pendingEntry?.selectedContract?.selected?.instrument?.tick_size ?? 0.05),
+    atrPctUnderlying,
+    nowTs: new Date(baseCandle.ts).getTime(),
+  });
+  return plan;
 }
 
 async function main() {
@@ -245,14 +298,30 @@ async function main() {
         const entryPrice = Number(exec?.avgFillPrice ?? rawEntry);
         const filledQty = Number(exec?.filledQty ?? pendingEntry.qty);
         if (filledQty > 0 && Number.isFinite(entryPrice) && entryPrice > 0) {
-          const riskPts = Math.max(0.05, entryPrice * (slPct / 100));
-          const stopLoss = pendingEntry.side === "BUY" ? entryPrice - riskPts : entryPrice + riskPts;
+          const fallbackRiskPts = Math.max(0.05, entryPrice * (slPct / 100));
+          const fallbackStopLoss = pendingEntry.side === "BUY" ? entryPrice - fallbackRiskPts : entryPrice + fallbackRiskPts;
+          const fallbackTargetPrice =
+            pendingEntry.side === "BUY"
+              ? entryPrice + rrTarget * fallbackRiskPts
+              : entryPrice - rrTarget * fallbackRiskPts;
+          const plan = buildBacktestTradePlan({
+            mode,
+            env,
+            intervalMin,
+            replaySlice,
+            baseCandle,
+            pendingEntry,
+            optionProvider,
+            tradedCandle,
+          });
+          const stopLoss = Number.isFinite(Number(plan?.stopLoss)) ? Number(plan.stopLoss) : fallbackStopLoss;
           const targetEnabled = isTargetEnabledForMode(mode);
           const targetPrice = targetEnabled
-            ? pendingEntry.side === "BUY"
-              ? entryPrice + rrTarget * riskPts
-              : entryPrice - rrTarget * riskPts
+            ? Number.isFinite(Number(plan?.targetPrice))
+              ? Number(plan.targetPrice)
+              : fallbackTargetPrice
             : null;
+          const plannedRr = Number.isFinite(Number(plan?.rr)) ? Number(plan.rr) : rrTarget;
 
           openTrade = {
             side: pendingEntry.side,
@@ -270,7 +339,10 @@ async function main() {
             stopLoss,
             initialStopLoss: stopLoss,
             targetPrice,
-            rr: rrTarget,
+            rr: plannedRr,
+            planMeta: plan?.meta || null,
+            planOk: !!plan?.ok,
+            planFallbackReason: plan?.ok ? null : plan?.reason || null,
             strategyId: pendingEntry.sig.strategyId,
             confidence: Number(pendingEntry.sig.confidence ?? 0),
             signalReason: pendingEntry.sig.reason || null,
