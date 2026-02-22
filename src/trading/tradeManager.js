@@ -2403,6 +2403,7 @@ class TradeManager {
         targetOrderId,
         targetPrice: st.targetPrice,
         targetVirtual: true,
+        exitPlacedAt: new Date(),
         targetVirtualFiredAt: new Date(),
         status: STATUS.LIVE,
       });
@@ -4703,6 +4704,7 @@ class TradeManager {
           status: STATUS.PANIC_EXIT_PLACED,
           panicExitOrderId: exitOrderId,
           panicExitPlacedAt: new Date(),
+          exitPlacedAt: new Date(),
           closeReason: `PANIC_EXIT_PLACED | ${reason}`,
         });
         await linkOrder({
@@ -6999,6 +7001,7 @@ class TradeManager {
       entryOrderId: fallbackOrderId,
       entryFallbackFrom: entryOrderId,
       entryFallbackPlacedAt: new Date(),
+      entryPlacedAt: tNow?.entryPlacedAt || new Date(),
       status: STATUS.ENTRY_REPLACED,
       entryFinalized: false,
     });
@@ -9153,6 +9156,7 @@ class TradeManager {
       peakLtp: null,
       trailSl: null,
       entryFilledAt: null,
+      entryPlacedAt: null,
       timeStopAt: null,
       quoteAtEntry,
       marketContextAtEntry: {
@@ -9192,6 +9196,7 @@ class TradeManager {
       entryFallbackInFlight: false,
       slOrderId: null,
       targetOrderId: null,
+      exitPlacedAt: null,
       entryPrice: null,
       exitPrice: null,
       closeReason: null,
@@ -9308,6 +9313,7 @@ class TradeManager {
 
     await updateTrade(tradeId, {
       entryOrderId,
+      entryPlacedAt: new Date(),
       status: STATUS.ENTRY_OPEN,
       entryFinalized: false,
       ...this._eventPatch("ENTRY_PLACED", {
@@ -10889,6 +10895,8 @@ class TradeManager {
       targetPrice,
       targetOrderType: targetParams.order_type,
       targetVirtual: false,
+      targetPlacedAt: new Date(),
+      exitPlacedAt: new Date(),
       status: STATUS.LIVE,
     };
     if (!shouldMarkLive) {
@@ -11031,6 +11039,8 @@ class TradeManager {
       tp1Qty: sizing.tp1Qty,
       runnerQty: sizing.runnerQty,
       tp1Done: false,
+      tp1PlacedAt: new Date(),
+      exitPlacedAt: new Date(),
       initialQty: initQty,
     });
     await linkOrder({ order_id: String(tp1OrderId), tradeId, role: "TP1" });
@@ -11119,6 +11129,8 @@ class TradeManager {
       runnerTargetMode: plan.mode,
       runnerTargetMeta: plan.meta,
       targetVirtual: false,
+      targetPlacedAt: new Date(),
+      exitPlacedAt: new Date(),
       status: STATUS.LIVE,
     };
     if (!shouldMarkLive) {
@@ -11622,6 +11634,8 @@ class TradeManager {
         await updateTrade(tradeId, {
           status: STATUS.SL_PLACED,
           slOrderId,
+          slPlacedAt: new Date(),
+          exitPlacedAt: new Date(),
           slOrderType: slOrderTypeUsed,
           slLimitPrice: slLimitPriceUsed,
           ...this._eventPatch("SL_PLACED", {
