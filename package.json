@@ -12,12 +12,13 @@
     "health:critical": "node scripts/health-critical.js",
     "bt:run": "node scripts/bt_run.js",
     "bt:prepare-options": "node scripts/bt_prepare_option_universe.js",
-    "test:dynexit": "node scripts/dyn_exit_scenarios.js"
+    "test:dynexit": "node scripts/dyn_exit_scenarios.js",
+    "test": "node --check src/index.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "kiteconnect": "^4.0.1",
+    "kiteconnect": "^5.1.0",
     "luxon": "^3.5.0",
     "mongodb": "^6.20.0",
     "pino": "^9.3.2",
@@ -26,6 +27,6 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "nodemon": "^3.1.4"
+    "nodemon": "^3.1.11"
   }
 }
