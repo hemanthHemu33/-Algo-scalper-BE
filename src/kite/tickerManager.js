@@ -183,6 +183,35 @@ function startTickTapLogger() {
   }, 10000);
 }
 
+function stopTickWatchdog() {
+  if (tickWatchdogTimer) {
+    clearInterval(tickWatchdogTimer);
+    tickWatchdogTimer = null;
+  }
+}
+
+function stopTickTapLogger() {
+  if (tickTapTimer) {
+    clearInterval(tickTapTimer);
+    tickTapTimer = null;
+  }
+  tickTapCount = 0;
+}
+
+function stopMarketGate() {
+  if (!marketGate) return;
+  try {
+    marketGate.stop?.();
+  } catch (err) {
+    reportFault({
+      code: "KITE_TICKERMANAGER_CATCH",
+      err,
+      message: "[src/kite/tickerManager.js] caught and continued",
+    });
+  }
+  marketGate = null;
+}
+
 function _modeConst(modeStr) {
   const m = _modeStrSafe(modeStr, "full");
   if (!ticker) return null;
@@ -485,20 +514,60 @@ async function drainTicks() {
   }
 }
 
+async function teardownActiveSession(reason = "session_refresh") {
+  stopReconcileLoop();
+  stopTickWatchdog();
+  stopTickTapLogger();
+
+  if (pipeline && typeof pipeline.shutdown === "function") {
+    try {
+      await pipeline.shutdown();
+    } catch (err) {
+      reportFault({
+        code: "KITE_TICKERMANAGER_CATCH",
+        err,
+        message: "[src/kite/tickerManager.js] caught and continued",
+      });
+    }
+  }
+  pipeline = null;
+
+  if (ticker) {
+    try {
+      ticker.disconnect();
+    } catch (err) {
+      reportFault({
+        code: "KITE_TICKERMANAGER_CATCH",
+        err,
+        message: "[src/kite/tickerManager.js] caught and continued",
+      });
+    }
+  }
+
+  ticker = null;
+  kite = null;
+  tickerConnected = false;
+  currentToken = null;
+  subscribedTokens = new Set();
+  tokenModeByToken = new Map();
+  _lastPosResubAt = 0;
+  _lastUniverseRebuildAt = 0;
+  tickQueue = [];
+  draining = false;
+  lastTickAt = 0;
+  recentOrderUpdateKeys = new Map();
+
+  stopMarketGate();
+
+  logger.info({ reason }, "[kite] session torn down");
+}
+
 async function setSession(accessToken) {
   if (accessToken === currentToken) return;
 
   logger.info("[kite] session update detected");
 
-  stopReconcileLoop();
-
-  if (ticker) {
-    try {
-      ticker.disconnect();
-    } catch (err) { reportFault({ code: "KITE_TICKERMANAGER_CATCH", err, message: "[src/kite/tickerManager.js] caught and continued" }); }
-    ticker = null;
-    tickerConnected = false;
-  }
+  await teardownActiveSession("session_refresh");
 
   kite = createKiteConnect({ apiKey: env.KITE_API_KEY, accessToken });
   ticker = createTicker({ apiKey: env.KITE_API_KEY, accessToken });
@@ -782,10 +851,15 @@ function getSubscribedTokens() {
   return Array.from(subscribedTokens || []);
 }
 
+async function shutdownAll(reason = "shutdown") {
+  await teardownActiveSession(reason);
+}
+
 module.exports = {
   setSession,
   getPipeline,
   getTickerStatus,
   getSubscribedTokens,
   ensureActivePositionSubscriptions,
+  shutdownAll,
 };
