@@ -33,6 +33,10 @@ class EquityService {
   constructor({ ringSize = 500 } = {}) {
     this.ringSize = ringSize;
     this.curve = [];
+    this.lastGoodMargins = null;
+    this.lastMarginsErrorAt = 0;
+    this.lastMarginsErrorMsg = null;
+    this.marginsErrorLogThrottleMs = 30_000;
   }
 
   _pushPoint(point) {
@@ -47,8 +51,30 @@ class EquityService {
     let positions = null;
     try {
       margins = kite ? await kite.getMargins() : null;
+      if (margins) {
+        this.lastGoodMargins = margins;
+      }
     } catch (e) {
-      logger.warn({ e: e?.message || String(e) }, "[equity] getMargins failed");
+      const msg = e?.message || String(e);
+      const now = Date.now();
+      const shouldLog =
+        this.lastMarginsErrorMsg !== msg ||
+        now - this.lastMarginsErrorAt >= this.marginsErrorLogThrottleMs;
+      if (shouldLog) {
+        logger.warn(
+          {
+            e: msg,
+            throttledForMs: this.marginsErrorLogThrottleMs,
+            hasFallback: !!this.lastGoodMargins,
+          },
+          "[equity] getMargins failed"
+        );
+        this.lastMarginsErrorAt = now;
+        this.lastMarginsErrorMsg = msg;
+      }
+      if (this.lastGoodMargins) {
+        margins = this.lastGoodMargins;
+      }
     }
 
     try {
