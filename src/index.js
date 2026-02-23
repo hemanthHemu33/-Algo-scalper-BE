@@ -5,11 +5,11 @@ const { halt } = require("./runtime/halt");
 const { upsertDailyRisk } = require("./trading/tradeStore");
 const { DateTime } = require("luxon");
 const dns = require("node:dns/promises");
-const { connectMongo } = require("./db");
+const { connectMongo, closeMongo } = require("./db");
 const { ensureRetentionIndexes } = require("./market/retention");
 const { buildApp } = require("./app");
 const { watchLatestToken } = require("./tokenWatcher");
-const { setSession } = require("./kite/tickerManager");
+const { setSession, shutdownAll } = require("./kite/tickerManager");
 const { telemetry } = require("./telemetry/signalTelemetry");
 const { tradeTelemetry } = require("./telemetry/tradeTelemetry");
 const { optimizer } = require("./optimizer/adaptiveOptimizer");
@@ -103,7 +103,7 @@ async function main() {
     await optimizer.start();
   } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
 
-  await watchLatestToken({
+  const stopTokenWatcher = await watchLatestToken({
     onToken: async (accessToken, doc, reason) => {
       const updatedAt = doc?.updatedAt || doc?.createdAt || null;
 
@@ -157,20 +157,46 @@ async function main() {
     }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
   });
 
+  let shuttingDown = false;
   const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
     logger.warn({ signal }, "shutdown");
     alert("warn", `🧯 Shutdown signal: ${signal}`, { signal }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
+
     try {
-      try {
-        if (io) io.close();
-      } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
-      server.close(() => logger.warn("server closed"));
+      if (typeof stopTokenWatcher === "function") {
+        await stopTokenWatcher();
+      }
     } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
-    setTimeout(() => process.exit(0), 500).unref();
+
+    try {
+      await shutdownAll(`signal_${signal}`);
+    } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
+
+    try {
+      if (io) io.close();
+    } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
+
+    try {
+      await new Promise((resolve) => {
+        server.close(() => {
+          logger.warn("server closed");
+          resolve();
+        });
+      });
+    } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
+
+    try {
+      await closeMongo();
+    } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
+
+    setTimeout(() => process.exit(0), 200).unref();
   };
 
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
+  process.on("SIGINT", () => { void shutdown("SIGINT"); });
 }
 
 process.on("unhandledRejection", async (reason) => {

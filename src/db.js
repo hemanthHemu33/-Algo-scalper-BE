@@ -50,9 +50,21 @@ async function connectMongo() {
   return { client, db };
 }
 
+
+async function closeMongo() {
+  if (!client) return;
+  try {
+    await client.close();
+    logger.info("[db] disconnected");
+  } finally {
+    client = null;
+    db = null;
+  }
+}
+
 function getDb() {
   if (!db) throw new Error("Mongo not connected yet");
   return db;
 }
 
-module.exports = { connectMongo, getDb };
+module.exports = { connectMongo, closeMongo, getDb };

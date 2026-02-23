@@ -15,6 +15,7 @@ async function watchLatestToken({ onToken }) {
   // Missing-token notification state (avoid spamming)
   let missing = false;
   let lastMissingAlertAt = 0;
+  let stopped = false;
 
   const maybeNotifyMissing = async (meta) => {
     const now = Date.now();
@@ -39,6 +40,7 @@ async function watchLatestToken({ onToken }) {
   };
 
   const refreshAndNotify = async (reason = "manual") => {
+    if (stopped) return;
     const res = await readLatestTokenDoc();
 
     // No doc / no access token -> keep the process alive and notify operator.
@@ -57,6 +59,7 @@ async function watchLatestToken({ onToken }) {
         "[tokenWatcher] no usable kite token. Engine will stay up and wait."
       );
       await maybeNotifyMissing(res);
+      await onToken(null, res?.doc || null, res?.reason || reason);
       return;
     }
 
@@ -111,11 +114,12 @@ async function watchLatestToken({ onToken }) {
     refreshAndNotify("poll").catch((err) => { reportFault({ code: "TOKENWATCHER_ASYNC", err, message: "[src/tokenWatcher.js] async task failed" }); });
   }, pollMs);
 
-  return () => {
+  return async () => {
+    stopped = true;
     clearInterval(interval);
     if (changeStream) {
       try {
-        changeStream.close();
+        await changeStream.close();
       } catch (err) { reportFault({ code: "TOKENWATCHER_CATCH", err, message: "[src/tokenWatcher.js] caught and continued" }); }
     }
   };

@@ -359,6 +359,8 @@ class TradeManager {
     // Reconcile debouncer (order-update driven)
     this._reconcileTimer = null;
     this._reconcileScheduledAt = 0;
+    this._timeGuardTimer = null;
+    this._timeGuardInFlight = false;
 
     this._virtualTargetFetchInFlight = new Set(); // tradeId -> in-flight
 
@@ -820,6 +822,52 @@ class TradeManager {
     await this._hydrateLiveOrderSnapshotsFromDb();
     await this._hydrateOpenPositionFromActiveTrade();
     this._startExitLoop();
+    this._startWallClockTimeGuardLoop();
+  }
+
+  async shutdown() {
+    if (this._reconcileTimer) {
+      clearTimeout(this._reconcileTimer);
+      this._reconcileTimer = null;
+    }
+    if (this._exitLoopTimer) {
+      clearInterval(this._exitLoopTimer);
+      this._exitLoopTimer = null;
+    }
+    if (this._timeGuardTimer) {
+      clearInterval(this._timeGuardTimer);
+      this._timeGuardTimer = null;
+    }
+
+    for (const [, timer] of this._entryFallbackTimers.entries()) {
+      clearTimeout(timer);
+    }
+    this._entryFallbackTimers.clear();
+
+    for (const [, timer] of this._panicExitTimers.entries()) {
+      clearTimeout(timer);
+    }
+    this._panicExitTimers.clear();
+
+    for (const [, timer] of this._timeStopFallbackTimers.entries()) {
+      clearTimeout(timer);
+    }
+    this._timeStopFallbackTimers.clear();
+
+    for (const [, st] of this._slWatch.entries()) {
+      if (st?.timer) clearTimeout(st.timer);
+    }
+    this._slWatch.clear();
+
+    for (const [, st] of this._targetWatch.entries()) {
+      if (st?.timer) clearTimeout(st.timer);
+    }
+    this._targetWatch.clear();
+
+    for (const [, st] of this._virtualTargetWatch.entries()) {
+      if (st?.timer) clearTimeout(st.timer);
+    }
+    this._virtualTargetWatch.clear();
   }
 
   _rememberLiveOrder(orderId, order) {
@@ -935,6 +983,30 @@ class TradeManager {
       },
       Math.max(250, everyMs),
     );
+  }
+
+  _startWallClockTimeGuardLoop() {
+    if (this._timeGuardTimer) return;
+    const everyMs = Math.max(
+      1000,
+      Number(env.FORCE_FLATTEN_CHECK_MS ?? 1000),
+    );
+    this._timeGuardTimer = setInterval(() => {
+      if (this._timeGuardInFlight) return;
+      this._timeGuardInFlight = true;
+      this._forceFlattenIfNeeded()
+        .catch((err) => {
+          reportFault({
+            code: "TIME_GUARD_LOOP_FAILED",
+            err,
+            message: "[time_guard] wall-clock loop failed",
+          });
+        })
+        .finally(() => {
+          this._timeGuardInFlight = false;
+        });
+    }, everyMs);
+    this._timeGuardTimer.unref?.();
   }
 
   async _exitLoopTick() {

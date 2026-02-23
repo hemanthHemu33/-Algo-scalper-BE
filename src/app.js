@@ -87,6 +87,11 @@ function buildAdminAuth() {
   };
 }
 
+function isNeedsLoginHalt(haltInfo) {
+  const reason = String(haltInfo?.reason || "").toUpperCase();
+  return reason === "KITE_TOKEN_MISSING" || reason === "KITE_SESSION_INIT_FAILED";
+}
+
 function parseBoolInput(value, defaultValue = false) {
   if (typeof value === "boolean") return value;
   if (typeof value === "number" && Number.isFinite(value)) return value !== 0;
@@ -375,13 +380,16 @@ function buildApp() {
       const pipeline = getPipeline();
       const ticker = getTickerStatus();
       const halted = isHalted();
+      const haltInfo = getHaltInfo();
+      const needsLogin = isNeedsLoginHalt(haltInfo);
 
       const ok = !!pipeline && ticker.connected && !halted;
 
       res.status(ok ? 200 : 503).json({
         ok,
         halted,
-        haltInfo: getHaltInfo(),
+        needsLogin,
+        haltInfo,
         ticker,
         now: new Date().toISOString(),
       });
@@ -397,6 +405,7 @@ function buildApp() {
       const ticker = getTickerStatus();
       const halted = isHalted();
       const haltInfo = getHaltInfo();
+      const needsLogin = isNeedsLoginHalt(haltInfo);
       const quoteGuard = getQuoteGuardStats();
 
       let pipeline = null;
@@ -460,6 +469,7 @@ function buildApp() {
         checks,
         ticker,
         halted,
+        needsLogin,
         haltInfo,
         killSwitch,
         quoteGuard,
@@ -479,6 +489,8 @@ function buildApp() {
       const s = await pipeline.status();
       const ticker = getTickerStatus();
       const halted = isHalted();
+      const haltInfo = getHaltInfo();
+      const needsLogin = isNeedsLoginHalt(haltInfo);
       const normalizedTicker = {
         connected: false,
         lastDisconnect: null,
@@ -533,7 +545,8 @@ function buildApp() {
         tradingEnabled: s?.tradingEnabled ?? getTradingEnabled(),
         killSwitch: s?.killSwitch ?? false,
         halted,
-        haltInfo: getHaltInfo(),
+        needsLogin,
+        haltInfo,
         ticker: normalizedTicker,
         now: new Date().toISOString(),
         tradesToday: s?.tradesToday ?? 0,
