@@ -92,6 +92,12 @@ function isNeedsLoginHalt(haltInfo) {
   return reason === "KITE_TOKEN_MISSING" || reason === "KITE_SESSION_INIT_FAILED";
 }
 
+function buildKiteLoginUrl() {
+  const apiKey = String(env.KITE_API_KEY || "").trim();
+  if (!apiKey) return null;
+  return `https://kite.zerodha.com/connect/login?api_key=${encodeURIComponent(apiKey)}&v=3`;
+}
+
 function parseBoolInput(value, defaultValue = false) {
   if (typeof value === "boolean") return value;
   if (typeof value === "number" && Number.isFinite(value)) return value !== 0;
@@ -485,8 +491,8 @@ function buildApp() {
 
   app.get("/admin/status", requirePerm("read"), async (req, res) => {
     try {
-      const pipeline = getPipeline();
-      const s = await pipeline.status();
+      const pipeline = getPipelineSafe();
+      const s = pipeline?.status ? await pipeline.status() : {};
       const ticker = getTickerStatus();
       const halted = isHalted();
       const haltInfo = getHaltInfo();
@@ -542,6 +548,8 @@ function buildApp() {
       res.json({
         ok: true,
         ...s,
+        pipelineReady: !!pipeline,
+        kiteLoginUrl: buildKiteLoginUrl(),
         tradingEnabled: s?.tradingEnabled ?? getTradingEnabled(),
         killSwitch: s?.killSwitch ?? false,
         halted,

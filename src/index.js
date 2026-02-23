@@ -104,20 +104,24 @@ async function main() {
   } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
 
   const stopTokenWatcher = await watchLatestToken({
+    onMissing: async (doc, reason) => {
+      const updatedAt = doc?.updatedAt || doc?.createdAt || null;
+
+      logger.error(
+        { reason, updatedAt },
+        "[tokenWatcher] kite access token missing (engine will stay up and keep polling)",
+      );
+      alert("error", "🔐 Kite access token missing — please login to Kite", {
+        reason,
+        hint: "Login via your token generator/scanner app or insert/update a doc with access_token in TOKENS_COLLECTION",
+      }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
+      await halt("KITE_TOKEN_MISSING", { reason, updatedAt });
+    },
     onToken: async (accessToken, doc, reason) => {
       const updatedAt = doc?.updatedAt || doc?.createdAt || null;
 
-      // If token is missing/invalid, do not crash; keep server alive and keep polling.
+      // Defensive guard: tokenWatcher should invoke onMissing for this path.
       if (!accessToken) {
-        logger.error(
-          { reason, updatedAt },
-          "[tokenWatcher] kite access token missing (engine will stay up and keep polling)",
-        );
-        alert("error", "🔐 Kite access token missing — please login to Kite", {
-          reason,
-          hint: "Login via your token generator/scanner app or insert/update a doc with access_token in TOKENS_COLLECTION",
-        }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
-        await halt("KITE_TOKEN_MISSING", { reason, updatedAt });
         return;
       }
 

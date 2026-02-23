@@ -6,7 +6,7 @@ services:
     plan: starter
     buildCommand: npm ci
     startCommand: npm start
-    healthCheckPath: /ready
+    healthCheckPath: /health
     autoDeploy: false
     envVars:
       - key: NODE_ENV
