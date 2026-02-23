@@ -42,6 +42,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
 
   const risk = new RiskEngine();
   const trader = new TradeManager({ kite, riskEngine: risk });
+  let finalizerTimer = null;
 
   let tokensRef = [];
   let tokensSet = new Set();
@@ -563,10 +564,27 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
 
   if (String(env.CANDLE_TIMER_FINALIZER_ENABLED || "true") === "true") {
     const everyMs = Number(env.CANDLE_FINALIZER_INTERVAL_MS ?? 1000);
-    setInterval(() => {
+    finalizerTimer = setInterval(() => {
       enqueue(() => candleFinalizerTick(), "candleFinalizer").catch((err) => { reportFault({ code: "PIPELINE_ASYNC", err, message: "[src/pipeline.js] async task failed" }); });
     }, everyMs);
+    finalizerTimer.unref?.();
   }
+
+  async function shutdown() {
+    if (finalizerTimer) {
+      clearInterval(finalizerTimer);
+      finalizerTimer = null;
+    }
+
+    if (typeof candleWriter?.stop === "function") {
+      await candleWriter.stop();
+    }
+
+    if (typeof trader?.shutdown === "function") {
+      await trader.shutdown();
+    }
+  }
+
   return {
     initForTokens,
     setSubscribedTokens,
@@ -580,6 +598,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
     status,
     getLiveCandle,
     trader,
+    shutdown,
   };
 }
 
