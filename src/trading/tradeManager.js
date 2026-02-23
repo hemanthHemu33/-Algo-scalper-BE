@@ -5966,6 +5966,7 @@ class TradeManager {
             );
             alert("info", "🔒 BE lock active", {
               tradeId,
+              entryPrice: trade?.entryPrice,
               beLockedAtPrice: patch.beLockedAtPrice,
               minGreenPts: trade?.minGreenPts,
               minGreenInr: trade?.minGreenInr,
@@ -6093,7 +6094,9 @@ class TradeManager {
             );
             alert("info", "🧭 SL trailed", {
               tradeId,
+              prevStopLoss: Number(trade.stopLoss ?? sl?.trigger_price ?? 0) || null,
               stopLoss: appliedTrigger,
+              beFloor: Number.isFinite(beFloor) ? beFloor : null,
             }).catch((err) =>
         reportWindowedFault({
           code: "ALERT_SEND_FAILED",
@@ -9236,6 +9239,7 @@ class TradeManager {
       symbol: instrument.tradingsymbol,
       side: side,
       qty,
+      entryRef: Number(expectedEntryPrice) || Number(entryGuess) || null,
       stopLoss,
       strategyId: s.strategyId,
     }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
@@ -9824,6 +9828,7 @@ class TradeManager {
         alert("info", "✅ ENTRY filled", {
           tradeId: trade.tradeId,
           avg,
+          expected,
           filledQty,
           slipBps,
         }).catch((err) =>
