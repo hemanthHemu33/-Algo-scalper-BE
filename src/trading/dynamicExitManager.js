@@ -50,7 +50,7 @@ function isOptionTrade(trade) {
   if (seg.includes("OPT")) return true;
 
   const sym = String(trade.instrument?.tradingsymbol || "").toUpperCase();
-  if (sym.endsWith("CE") || sym.endsWith("PE")) return true;
+  if (/\d(?:CE|PE)$/.test(sym)) return true;
 
   return false;
 }
@@ -66,8 +66,8 @@ function optionType(trade) {
   if (s === "PE" || s === "PUT") return "PE";
 
   const sym = String(trade?.instrument?.tradingsymbol || "").toUpperCase();
-  if (sym.endsWith("CE")) return "CE";
-  if (sym.endsWith("PE")) return "PE";
+  if (/\dCE$/.test(sym)) return "CE";
+  if (/\dPE$/.test(sym)) return "PE";
 
   return null;
 }
@@ -244,6 +244,8 @@ function applyMinGreenExitRules({
         env.TIME_STOP_NO_PROGRESS_UNDERLYING_CONFIRM ||
         "true",
     ) === "true";
+  const noProgressUnderlyingConfirmEffective =
+    noProgressUnderlyingConfirm && isOptionTrade(trade);
   const noProgressUnderlyingMode = String(
     env.TIME_STOP_NO_PROGRESS_UL_MODE || "STRICT",
   )
@@ -318,7 +320,7 @@ function applyMinGreenExitRules({
     : absUnderlyingMoveBps;
   const hasUnderlyingMove = Number.isFinite(absUnderlyingMoveBps);
   const noProgressUnderlyingSatisfied =
-    !noProgressUnderlyingConfirm ||
+    !noProgressUnderlyingConfirmEffective ||
     !Number.isFinite(noProgressUnderlyingBps) ||
     (hasUnderlyingMove && absUnderlyingMoveBps < noProgressUnderlyingBps) ||
     (!hasUnderlyingMove &&
@@ -388,9 +390,9 @@ function applyMinGreenExitRules({
         holdMin,
         noProgressMin,
         noProgressMfeR,
-        noProgressUnderlyingConfirm,
+        noProgressUnderlyingConfirm: noProgressUnderlyingConfirmEffective,
         noProgressUnderlyingBps,
-        noProgressUnderlyingStatus: noProgressUnderlyingConfirm
+        noProgressUnderlyingStatus: noProgressUnderlyingConfirmEffective
           ? hasUnderlyingMove
             ? "KNOWN"
             : "UNKNOWN"

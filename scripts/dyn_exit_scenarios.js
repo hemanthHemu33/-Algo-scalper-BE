@@ -51,6 +51,18 @@ function makeEnv(overrides = {}) {
   };
 }
 
+
+function flatCandles(count = 30, price = 100) {
+  return Array.from({ length: count }, (_, i) => ({
+    date: new Date(BASE_NOW - (count - i) * 60_000).toISOString(),
+    open: price,
+    high: price + 0.1,
+    low: price - 0.1,
+    close: price,
+    volume: 1000,
+  }));
+}
+
 function applyPlanPatch(trade, plan) {
   const next = { ...trade };
   if (plan?.sl?.stopLoss) next.stopLoss = Number(plan.sl.stopLoss);
@@ -144,12 +156,39 @@ const scenarios = [
         underlyingLtp: null,
         nowTs: BASE_NOW + 6 * 60_000,
         env,
-        candles: [],
+        candles: flatCandles(),
       });
       assert.equal(plan.ok, true);
       assert.equal(plan.action?.reason, 'TIME_STOP_NO_PROGRESS');
       assert.equal(plan.meta?.noProgressUnderlyingStatus, 'UNKNOWN');
       assert.equal(plan.meta?.noProgressUnderlyingMode, 'PRICE_ONLY_ON_UNKNOWN');
+    },
+  },
+
+  {
+    name: 'no-progress triggers for non-options even when UL confirm is enabled',
+    run: () => {
+      const trade = makeTrade({
+        instrument: {
+          tick_size: 0.05,
+          segment: 'NSE',
+          tradingsymbol: 'RELIANCE',
+        },
+        underlying_ltp: undefined,
+      });
+      const env = makeEnv();
+      const plan = computeDynamicExitPlan({
+        trade,
+        ltp: 100.1,
+        underlyingLtp: null,
+        nowTs: BASE_NOW + 6 * 60_000,
+        env,
+        candles: flatCandles(),
+      });
+      assert.equal(plan.ok, true);
+      assert.equal(plan.action?.reason, 'TIME_STOP_NO_PROGRESS');
+      assert.equal(plan.meta?.noProgressUnderlyingConfirm, false);
+      assert.equal(plan.meta?.noProgressUnderlyingStatus, 'BYPASSED');
     },
   },
   {
