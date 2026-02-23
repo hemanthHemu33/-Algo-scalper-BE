@@ -12422,6 +12422,8 @@ class TradeManager {
       } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
     }
 
+    const tradeWithPnl = await getTrade(tradeId);
+
     if (t && terminal.includes(t.status)) {
       await updateTrade(tradeId, { closedAt: new Date() });
     } else {
@@ -12450,20 +12452,43 @@ class TradeManager {
     this._dynExitFailBackoffUntil.delete(tradeId);
     this._dynPeakLtpByTrade.delete(tradeId);
     this._clearVirtualTarget(tradeId);
-    const qty = Number(t?.qty ?? 0);
-    const entry = Number(t?.entryPrice ?? 0);
-    const exit = Number(t?.exitPrice ?? 0);
+    const qty = Number(tradeWithPnl?.qty ?? t?.qty ?? 0);
+    const entry = Number(tradeWithPnl?.entryPrice ?? t?.entryPrice ?? 0);
+    const exit = Number(tradeWithPnl?.exitPrice ?? t?.exitPrice ?? 0);
     const pnl =
       qty > 0 && entry > 0 && exit > 0
-        ? String(t?.side || "BUY").toUpperCase() === "BUY"
+        ? String(tradeWithPnl?.side || t?.side || "BUY").toUpperCase() === "BUY"
           ? (exit - entry) * qty
           : (entry - exit) * qty
         : null;
 
-    this.risk.markTradeClosed(t?.riskKey || String(instrument_token), {
-      status: t?.status,
-      closeReason: t?.closeReason,
-      exitReason: t?.exitReason,
+    if (
+      tradeWithPnl &&
+      [STATUS.EXITED_TARGET, STATUS.EXITED_SL].includes(tradeWithPnl.status)
+    ) {
+      const grossPnlInr = Number(tradeWithPnl?.pnlGrossInr);
+      const netPnlInr = Number(tradeWithPnl?.pnlNetAfterEstCostsInr);
+      alert(
+        pnl != null && pnl >= 0 ? "info" : "warn",
+        "📌 Trade closed",
+        {
+          tradeId,
+          status: tradeWithPnl.status,
+          closeReason: tradeWithPnl.closeReason,
+          pnlInr: pnl,
+          pnlGrossInr: Number.isFinite(grossPnlInr) ? grossPnlInr : null,
+          pnlNetAfterEstCostsInr: Number.isFinite(netPnlInr) ? netPnlInr : null,
+          entryPrice: Number.isFinite(entry) ? entry : null,
+          exitPrice: Number.isFinite(exit) ? exit : null,
+          qty: Number.isFinite(qty) ? qty : null,
+        },
+      ).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
+    }
+
+    this.risk.markTradeClosed(tradeWithPnl?.riskKey || t?.riskKey || String(instrument_token), {
+      status: tradeWithPnl?.status || t?.status,
+      closeReason: tradeWithPnl?.closeReason || t?.closeReason,
+      exitReason: tradeWithPnl?.exitReason || t?.exitReason,
       pnl,
     });
   }
