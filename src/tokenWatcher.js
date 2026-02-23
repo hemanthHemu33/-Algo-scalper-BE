@@ -6,7 +6,7 @@ const { getDb } = require("./db");
 const { readLatestTokenDoc } = require("./tokenStore");
 const { reportFault } = require("./runtime/errorBus");
 
-async function watchLatestToken({ onToken }) {
+async function watchLatestToken({ onToken, onMissing }) {
   const db = getDb();
   const col = db.collection(env.TOKENS_COLLECTION);
 
@@ -59,6 +59,9 @@ async function watchLatestToken({ onToken }) {
         "[tokenWatcher] no usable kite token. Engine will stay up and wait."
       );
       await maybeNotifyMissing(res);
+      if (typeof onMissing === "function") {
+        await onMissing(res?.doc || null, res?.reason || reason);
+      }
       await onToken(null, res?.doc || null, res?.reason || reason);
       return;
     }
