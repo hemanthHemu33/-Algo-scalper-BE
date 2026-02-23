@@ -47,6 +47,17 @@ const resolvedTimezone =
 process.env.TZ = resolvedTimezone;
 Settings.defaultZone = resolvedTimezone;
 
+const boolFromEnv = z.preprocess((value) => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "n", "off", ""].includes(normalized)) return false;
+  }
+  return value;
+}, z.boolean());
+
 const schema = z.object({
   PORT: z.coerce.number().default(4001),
   NODE_ENV: z.string().default("development"),
@@ -54,7 +65,7 @@ const schema = z.object({
   ADMIN_API_KEY: z.string().optional(),
   RBAC_ENABLED: z.string().default("false"),
   RBAC_HEADER: z.string().default("x-role"),
-  RBAC_DEFAULT_ROLE: z.string().default("admin"),
+  RBAC_DEFAULT_ROLE: z.string().default("viewer"),
 
   // CORS
   CORS_ORIGIN: z.string().optional(),
@@ -190,7 +201,7 @@ const schema = z.object({
   // FUT (index futures) or OPT (buy calls/puts)
   FNO_MODE: z.string().default("FUT"),
   // Pro mode: focus one underlying
-  FNO_SINGLE_UNDERLYING_ENABLED: z.coerce.boolean().default(true),
+  FNO_SINGLE_UNDERLYING_ENABLED: boolFromEnv.default(true),
   FNO_SINGLE_UNDERLYING_SYMBOL: z.string().default("NIFTY"),
 
   // e.g. NIFTY,BANKNIFTY,SENSEX
@@ -221,7 +232,7 @@ const schema = z.object({
   // Expiry safety (optional)
   OPT_MIN_DAYS_TO_EXPIRY: z.coerce.number().default(1),
   // Preferred DTE band for option expiry selection (pro weekly-first behavior)
-  OPT_ALLOW_ZERO_DTE: z.coerce.boolean().default(false),
+  OPT_ALLOW_ZERO_DTE: boolFromEnv.default(false),
   OPT_DTE_PREFER_MIN: z.coerce.number().default(1),
   OPT_DTE_PREFER_MAX: z.coerce.number().default(3),
   OPT_DTE_FALLBACK_MAX: z.coerce.number().default(7),
@@ -232,9 +243,9 @@ const schema = z.object({
   // Strike offset in steps (e.g. +1 = one step OTM for calls, -1 = one step ITM)
   OPT_STRIKE_OFFSET_STEPS: z.coerce.number().default(0),
   // Pro scalping: restrict to ATM ± scan steps only (no far strikes)
-  OPT_STRICT_ATM_ONLY: z.coerce.boolean().default(true),
+  OPT_STRICT_ATM_ONLY: boolFromEnv.default(true),
   // Hard reject if no candidate passes spread/depth/premium gates
-  OPT_PICK_REQUIRE_OK: z.coerce.boolean().default(true),
+  OPT_PICK_REQUIRE_OK: boolFromEnv.default(true),
   // Debug: attach the top-N option candidates to last pick metadata (0 disables). Max 10.
   OPT_PICK_DEBUG_TOP_N: z.coerce.number().default(0),
 
@@ -260,9 +271,9 @@ const schema = z.object({
   // Underlying-specific premium bands (useful for small capital option buying)
   OPT_MIN_PREMIUM_NIFTY: z.coerce.number().default(80),
   OPT_MAX_PREMIUM_NIFTY: z.coerce.number().default(350),
-  OPT_PREMIUM_BAND_ENFORCE_NIFTY: z.coerce.boolean().default(true),
+  OPT_PREMIUM_BAND_ENFORCE_NIFTY: boolFromEnv.default(true),
   // Allow a premium-band-only fallback when all other gates pass (disabled by default).
-  OPT_PREMIUM_BAND_FALLBACK: z.coerce.boolean().default(false),
+  OPT_PREMIUM_BAND_FALLBACK: boolFromEnv.default(false),
   OPT_PREMIUM_BAND_FALLBACK_SLACK_DOWN: z.coerce.number().default(20),
   OPT_PREMIUM_BAND_FALLBACK_SLACK_UP: z.coerce.number().default(150),
   OPT_MAX_SPREAD_BPS: z.coerce.number().default(35),
@@ -272,7 +283,7 @@ const schema = z.object({
   OPT_PICK_SCORE_WEIGHTS: z.string().optional(),
 
   // Liquidity gate (spread/depth/OI/volume pre-filter)
-  OPT_LIQ_GATE_ENABLED: z.coerce.boolean().default(true),
+  OPT_LIQ_GATE_ENABLED: boolFromEnv.default(true),
   OPT_LIQ_GATE_MIN_SCORE: z.coerce.number().default(45),
   OPT_LIQ_GATE_MAX_SPREAD_BPS: z.coerce.number().default(35),
   OPT_LIQ_GATE_MIN_DEPTH_QTY: z.coerce.number().default(0),
@@ -284,12 +295,12 @@ const schema = z.object({
   OPT_STRIKE_SELECTION_MODE: z.string().default("DELTA_NEAREST"),
 
   // ---- Option-chain greeks / advanced filters ----
-  GREEKS_REQUIRED: z.coerce.boolean().default(false),
-  OPT_GREEKS_REQUIRED: z.coerce.boolean().default(false),
+  GREEKS_REQUIRED: boolFromEnv.default(false),
+  OPT_GREEKS_REQUIRED: boolFromEnv.default(false),
   OPT_RISK_FREE_RATE: z.coerce.number().default(0.06),
 
   // Delta band to avoid far OTM / low-reacting contracts (0..1)
-  OPT_DELTA_BAND_ENFORCE: z.coerce.boolean().default(true),
+  OPT_DELTA_BAND_ENFORCE: boolFromEnv.default(true),
   OPT_DELTA_BAND_MIN: z.coerce.number().default(0.35),
   OPT_DELTA_BAND_MAX: z.coerce.number().default(0.65),
   OPT_DELTA_TARGET: z.coerce.number().default(0.5),
@@ -312,11 +323,11 @@ const schema = z.object({
   // OI wall context filter (support/resistance)
   OPT_OI_WALL_MULT: z.coerce.number().default(2.5),
   OPT_OI_WALL_STRIKES: z.coerce.number().default(2),
-  OPT_OI_WALL_BLOCK: z.coerce.boolean().default(false),
-  OPT_OI_WALL_REQUIRE_OI_CHANGE: z.coerce.boolean().default(true),
+  OPT_OI_WALL_BLOCK: boolFromEnv.default(false),
+  OPT_OI_WALL_REQUIRE_OI_CHANGE: boolFromEnv.default(true),
 
   // IV + theta edge gate (after plan) to avoid IV-crush traps
-  OPT_IV_THETA_FILTER_ENABLED: z.coerce.boolean().default(true),
+  OPT_IV_THETA_FILTER_ENABLED: boolFromEnv.default(true),
   OPT_IV_DROP_MIN_PTS: z.coerce.number().default(1.5),
   OPT_IV_DROP_CAP_PTS: z.coerce.number().default(4.0),
   OPT_EXPECTED_HOLD_MIN: z.coerce.number().default(10),
@@ -335,15 +346,15 @@ const schema = z.object({
 
   // Option SL fitter (to make 1-lot risk fit RISK_PER_TRADE_INR caps when lot sizes are large)
   // If disabled, engine may block trades when 1-lot risk exceeds cap after lot-normalization.
-  OPT_SL_FIT_ENABLED: z.coerce.boolean().default(false),
+  OPT_SL_FIT_ENABLED: boolFromEnv.default(false),
   // When FORCE_ONE_LOT + LOT_RISK_CAP_ENFORCE would otherwise BLOCK, auto-tighten SL to fit 1 lot within cap.
   // Safe default: it never increases INR risk; it either tightens SL or blocks if it cannot fit within MIN ticks.
-  OPT_SL_FIT_WHEN_CAP_BLOCKS: z.coerce.boolean().default(true),
+  OPT_SL_FIT_WHEN_CAP_BLOCKS: boolFromEnv.default(true),
   // Minimum SL distance enforced by fitter (in ticks). Helps avoid ultra-tight “0.05 SL” fitting.
   OPT_SL_FIT_MIN_TICKS: z.coerce.number().default(10),
 
   // PLAN/Options exits — premium-aware initial SL/TP (plan builder uses option candles when available)
-  OPT_PLAN_PREMIUM_AWARE: z.coerce.boolean().default(true),
+  OPT_PLAN_PREMIUM_AWARE: boolFromEnv.default(true),
   OPT_PLAN_PREM_CANDLE_LIMIT: z.coerce.number().default(800),
   OPT_PLAN_PREM_ATR_PERIOD: z.coerce.number().default(14),
   OPT_PLAN_PREM_ATR_K: z.coerce.number().default(1.1),
@@ -447,7 +458,7 @@ const schema = z.object({
   TICK_MODE_OPTIONS: z.string().default("quote"),
 
   // Candle write buffer (avoid DB writes in the hot tick loop). Only used if market/candleWriteBuffer exists.
-  CANDLE_WRITE_BUFFER_ENABLED: z.coerce.boolean().default(true),
+  CANDLE_WRITE_BUFFER_ENABLED: boolFromEnv.default(true),
   CANDLE_WRITE_BATCH_SIZE: z.coerce.number().default(200),
   CANDLE_WRITE_FLUSH_MS: z.coerce.number().default(250),
   CANDLE_WRITE_MAX_BATCH: z.coerce.number().default(500),
@@ -585,18 +596,18 @@ const schema = z.object({
   OPT_TP_ENABLED: z.string().default("false"),
 
   // PATCH-10: Post-fill risk recheck (fills can drift; re-fit SL or exit)
-  POST_FILL_RISK_RECHECK_ENABLED: z.coerce.boolean().default(true),
+  POST_FILL_RISK_RECHECK_ENABLED: boolFromEnv.default(true),
   // extra tolerance over the cap (e.g., 0.01 = +1%)
   POST_FILL_RISK_EPS_PCT: z.coerce.number().default(0.01),
   // If risk still > cap after re-fit: EXIT (panic close) | KEEP (leave as-is)
   POST_FILL_RISK_FAIL_ACTION: z.string().default("EXIT"),
   // If SL is re-fitted, recompute target from RR_TARGET using the new (tighter) risk.
-  POST_FILL_RISK_REFIT_TARGET: z.coerce.boolean().default(true),
+  POST_FILL_RISK_REFIT_TARGET: boolFromEnv.default(true),
   // Minimum SL distance when re-fitting (in ticks)
   POST_FILL_RISK_MIN_TICKS: z.coerce.number().default(2),
 
   // PATCH-5: Lot risk cap enforcement (post lot-normalization)
-  LOT_RISK_CAP_ENFORCE: z.coerce.boolean().default(true),
+  LOT_RISK_CAP_ENFORCE: boolFromEnv.default(true),
   LOT_RISK_CAP_APPLY_IN_MARGIN_MODE: z.string().default("true"),
   // Tolerance to avoid micro blocks due to rounding (e.g., 0.02 = 2%)
   LOT_RISK_CAP_EPS_PCT: z.coerce.number().default(0.02),
@@ -618,9 +629,9 @@ const schema = z.object({
   AUTO_FIX_TIME_WINDOWS: z.string().default("false"),
   STOP_NEW_ENTRIES_AFTER: z.string().default("15:00"), // HH:mm in CANDLE_TZ
   FORCE_FLATTEN_AT: z.string().default("15:20"), // HH:mm in CANDLE_TZ
-  EOD_MIS_TO_NRML_ENABLED: z.coerce.boolean().default(true),
+  EOD_MIS_TO_NRML_ENABLED: boolFromEnv.default(true),
   EOD_MIS_TO_NRML_AT: z.string().default("15:18"), // HH:mm in CANDLE_TZ (must be < FORCE_FLATTEN_AT)
-  EOD_CARRY_ALLOWED: z.coerce.boolean().default(false),
+  EOD_CARRY_ALLOWED: boolFromEnv.default(false),
   RECONCILE_BROKER_SQOFF_MATCH_WINDOW_SEC: z.coerce.number().default(300),
 
   // Additional no-trade windows: comma-separated "HH:mm-HH:mm" ranges
@@ -661,10 +672,10 @@ const schema = z.object({
   ORPHAN_REPLAY_BACKOFF_FACTOR: z.coerce.number().default(2),
   ORPHAN_REPLAY_BACKOFF_MAX_MS: z.coerce.number().default(10_000),
   ORPHAN_REPLAY_JITTER_PCT: z.coerce.number().default(0.15),
-  ORPHAN_REPLAY_DEAD_LETTER_ENABLED: z.coerce.boolean().default(true),
+  ORPHAN_REPLAY_DEAD_LETTER_ENABLED: boolFromEnv.default(true),
 
   // SL fill watchdog: protects SL-L (stoploss-limit) from staying OPEN after trigger in fast moves.
-  SL_WATCHDOG_ENABLED: z.coerce.boolean().default(true),
+  SL_WATCHDOG_ENABLED: boolFromEnv.default(true),
   // If SL is triggered (LTP crosses trigger) but the SL order stays OPEN beyond this window -> cancel & MARKET exit.
   SL_WATCHDOG_OPEN_SEC: z.coerce.number().default(8),
   // Poll cadence while waiting (ms). Uses ticks when available; may fall back to a throttled quote/LTP fetch.
@@ -672,15 +683,15 @@ const schema = z.object({
   // Extra trigger buffer (in bps) to reduce false positives around the exact trigger price.
   SL_WATCHDOG_TRIGGER_BPS_BUFFER: z.coerce.number().default(5),
   // Require a price breach (via ticks/LTP) before considering the SL "triggered".
-  SL_WATCHDOG_REQUIRE_LTP_BREACH: z.coerce.boolean().default(true),
+  SL_WATCHDOG_REQUIRE_LTP_BREACH: boolFromEnv.default(true),
   // If true, enable kill-switch when watchdog fires (safest). If false, only panic-exits the position.
-  SL_WATCHDOG_KILL_SWITCH_ON_FIRE: z.coerce.boolean().default(false),
+  SL_WATCHDOG_KILL_SWITCH_ON_FIRE: boolFromEnv.default(false),
 
   // Health / monitoring (used by /admin/health/critical)
-  CRITICAL_HEALTH_REQUIRE_TICKER_CONNECTED: z.coerce.boolean().default(true),
-  CRITICAL_HEALTH_FAIL_ON_HALT: z.coerce.boolean().default(true),
-  CRITICAL_HEALTH_FAIL_ON_QUOTE_BREAKER: z.coerce.boolean().default(false),
-  CRITICAL_HEALTH_FAIL_ON_KILL_SWITCH: z.coerce.boolean().default(false),
+  CRITICAL_HEALTH_REQUIRE_TICKER_CONNECTED: boolFromEnv.default(true),
+  CRITICAL_HEALTH_FAIL_ON_HALT: boolFromEnv.default(true),
+  CRITICAL_HEALTH_FAIL_ON_QUOTE_BREAKER: boolFromEnv.default(false),
+  CRITICAL_HEALTH_FAIL_ON_KILL_SWITCH: boolFromEnv.default(false),
   // Grace window for quote breaker (ms). 0 means fail immediately when breaker is open.
   CRITICAL_HEALTH_QUOTE_BREAKER_GRACE_MS: z.coerce.number().default(0),
 
@@ -906,9 +917,9 @@ const schema = z.object({
   ENTRY_LIMIT_FALLBACK_GRACE_MS: z.coerce.number().default(250),
   ENTRY_LIMIT_FALLBACK_CANCEL_WAIT_MS: z.coerce.number().default(400),
   // Safety: do NOT auto-convert LIMIT -> MARKET. If you accept slippage, set ENTRY_ORDER_TYPE_OPT=MARKET explicitly.
-  ENTRY_LIMIT_FALLBACK_TO_MARKET: z.coerce.boolean().default(false),
+  ENTRY_LIMIT_FALLBACK_TO_MARKET: boolFromEnv.default(false),
   // Smart limit laddering (micro-improve fills without blind chasing)
-  ENTRY_LADDER_ENABLED: z.coerce.boolean().default(true),
+  ENTRY_LADDER_ENABLED: boolFromEnv.default(true),
   ENTRY_LADDER_TICKS: z.coerce.number().default(2),
   ENTRY_LADDER_STEP_DELAY_MS: z.coerce.number().default(350),
   ENTRY_LADDER_MAX_CHASE_BPS: z.coerce.number().default(35),
@@ -923,10 +934,10 @@ const schema = z.object({
   DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS: z.coerce.number().default(1200),
 
   // Executable vs idea signal split (keep logging ideas, route only executable)
-  EXECUTABLE_SIGNAL_GATE_ENABLED: z.coerce.boolean().default(true),
+  EXECUTABLE_SIGNAL_GATE_ENABLED: boolFromEnv.default(true),
 
   // Market-condition circuit breakers (rolling 5m window)
-  CIRCUIT_BREAKERS_ENABLED: z.coerce.boolean().default(true),
+  CIRCUIT_BREAKERS_ENABLED: boolFromEnv.default(true),
   CB_MAX_REJECTS_5M: z.coerce.number().default(5),
   CB_MAX_SPREAD_SPIKES_5M: z.coerce.number().default(8),
   CB_MAX_STALE_TICKS_5M: z.coerce.number().default(12),

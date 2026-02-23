@@ -3,7 +3,7 @@ const { env } = require("../config");
 function buildRbac() {
   const enabled = String(env.RBAC_ENABLED || "false").toLowerCase() === "true";
   const header = String(env.RBAC_HEADER || "x-role").toLowerCase();
-  const defaultRole = String(env.RBAC_DEFAULT_ROLE || "admin").toLowerCase();
+  const defaultRole = String(env.RBAC_DEFAULT_ROLE || "viewer").toLowerCase();
 
   const roles = {
     viewer: ["read"],
@@ -13,8 +13,8 @@ function buildRbac() {
 
   function resolveRole(raw) {
     const role = String(raw || "").toLowerCase();
-    if (roles[role]) return role;
-    return defaultRole in roles ? defaultRole : "admin";
+    if (role && roles[role]) return role;
+    return defaultRole in roles ? defaultRole : "viewer";
   }
 
   function roleMiddleware(req, _res, next) {
@@ -25,6 +25,9 @@ function buildRbac() {
     const rawRole = hdrKey ? req.headers[hdrKey] : undefined;
     const role = resolveRole(rawRole);
     req.rbac = { role, permissions: roles[role] || [] };
+    if (!rawRole) {
+      req.rbac.missingRoleHeader = true;
+    }
     return next();
   }
 
