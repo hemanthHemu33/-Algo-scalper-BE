@@ -79,9 +79,12 @@ async function updateTrade(tradeId, patch) {
           normalizeTradeStatus(fromStatus),
         );
       if (staleEntryFill) {
+        const mergedFactKeys = ["entryPrice", "qty", "entryFilledAt", "entry"].filter(
+          (k) => Object.prototype.hasOwnProperty.call(update, k),
+        );
         logger.info(
-          { tradeId, fromStatus, toStatus },
-          "[trade] stale ENTRY_FILLED transition ignored",
+          { tradeId, fromStatus, toStatus, mergedFactKeys },
+          "[trade] stale ENTRY_FILLED status ignored, facts merged",
         );
         delete update.status;
       }
