@@ -3,6 +3,7 @@ const { alert } = require("../alerts/alertService");
 
 const DEDUPE_MS = 10 * 60 * 1000;
 const lastByEvent = new Map();
+const DEDUPE_EVENTS = new Set(["TOKEN_MISSING", "TOKEN_RESTORED"]);
 
 function toIstNow() {
   return DateTime.now().setZone("Asia/Kolkata").toFormat("yyyy-LL-dd HH:mm:ss ZZZZ");
@@ -14,11 +15,13 @@ function pickLevel(event, payload = {}) {
   return "info";
 }
 
-function shouldSkip(event) {
+function shouldSkip(event, payload = {}) {
+  if (!DEDUPE_EVENTS.has(String(event))) return false;
   const now = Date.now();
-  const last = Number(lastByEvent.get(String(event)) || 0);
+  const key = `${String(event)}:${String(payload?.reason || "default")}`;
+  const last = Number(lastByEvent.get(key) || 0);
   if (now - last < DEDUPE_MS) return true;
-  lastByEvent.set(String(event), now);
+  lastByEvent.set(key, now);
   return false;
 }
 
@@ -26,7 +29,7 @@ async function notifyLifecycle(event, payload = {}) {
   try {
     const e = String(event || "UNKNOWN").trim().toUpperCase();
     if (!e) return { ok: false, skipped: true, reason: "missing_event" };
-    if (shouldSkip(e)) return { ok: true, skipped: true, reason: "dedupe" };
+    if (shouldSkip(e, payload)) return { ok: true, skipped: true, reason: "dedupe" };
 
     const meta = {
       event: e,
