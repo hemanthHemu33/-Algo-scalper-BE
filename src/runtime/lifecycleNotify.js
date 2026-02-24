@@ -8,9 +8,9 @@ function toIstNow() {
   return DateTime.now().setZone("Asia/Kolkata").toFormat("yyyy-LL-dd HH:mm:ss ZZZZ");
 }
 
-function pickLevel(event) {
+function pickLevel(event, payload = {}) {
   if (event === "TOKEN_MISSING") return "warn";
-  if (event === "FORCE_FLATTEN_RESULT") return "warn";
+  if (event === "FORCE_FLATTEN_RESULT") return payload?.ok ? "info" : "warn";
   return "info";
 }
 
@@ -33,7 +33,7 @@ async function notifyLifecycle(event, payload = {}) {
       istAt: toIstNow(),
       ...payload,
     };
-    await alert(pickLevel(e), `[lifecycle] ${e}`, meta);
+    await alert(pickLevel(e, payload), `[lifecycle] ${e}`, meta);
     return { ok: true, skipped: false };
   } catch {
     return { ok: false, skipped: true, reason: "notify_failed" };
