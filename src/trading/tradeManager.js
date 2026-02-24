@@ -31,6 +31,7 @@ const {
   computeTargetFromRR,
 } = require("./optionSlFitter");
 const { getRecentCandles } = require("../market/candleStore");
+const { getEffectivePrice } = require("../market/effectivePrice");
 const {
   isQuoteGuardBreakerOpen,
   getQuoteGuardStats,
@@ -239,6 +240,7 @@ class TradeManager {
     }
 
     this.lastPriceByToken = new Map(); // token -> ltp
+    this.lastQuoteByToken = new Map(); // token -> latest quote snapshot
     this.lastTickAtByToken = new Map(); // token -> ts
     this.activeTradeId = null; // single-stock mode
     this.recoveredPosition = null; // set when positions exist but trade state missing
@@ -1424,6 +1426,14 @@ class TradeManager {
 
     const now = Date.now();
     this.lastTickAtByToken.set(token, now);
+    const bid = Number(tick?.depth?.buy?.[0]?.price);
+    const ask = Number(tick?.depth?.sell?.[0]?.price);
+    this.lastQuoteByToken.set(token, {
+      ltp: Number.isFinite(ltp) ? ltp : null,
+      bestBid: Number.isFinite(bid) ? bid : null,
+      bestAsk: Number.isFinite(ask) ? ask : null,
+      quoteTsMs: now,
+    });
 
     const lossEveryMs = Number(env.DAILY_LOSS_CHECK_MS ?? 2000);
     if (
@@ -1475,7 +1485,7 @@ class TradeManager {
 
     // Tick-accurate peak tracking for live trade
     try {
-      this._maybeUpdatePeakFromTick(token, ltp);
+      this._maybeUpdatePeakFromTick(token, tick);
     } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     // SL watchdog: track trigger crossings in fast moves (especially for SL-L fallback)
@@ -1506,8 +1516,9 @@ class TradeManager {
     }
   }
 
-  _maybeUpdatePeakFromTick(token, ltp) {
+  _maybeUpdatePeakFromTick(token, tick) {
     if (!this.activeTradeId) return;
+    const ltp = Number(tick?.last_price);
     if (!Number.isFinite(ltp) || ltp <= 0) return;
     if (!Number.isFinite(this._activeTradeToken)) return;
     if (Number(token) !== Number(this._activeTradeToken)) return;
@@ -1515,11 +1526,23 @@ class TradeManager {
     if (side !== "BUY" && side !== "SELL") return;
 
     const tradeId = String(this.activeTradeId);
+    const px = getEffectivePrice({
+      ltp,
+      bestBid: Number(tick?.depth?.buy?.[0]?.price),
+      bestAsk: Number(tick?.depth?.sell?.[0]?.price),
+      quoteTsMs: Date.now(),
+    }, {
+      nowMs: Date.now(),
+      maxSpreadBps: Number(env.MAX_SPREAD_BPS_FOR_PEAK_UPDATE ?? 80),
+      maxQuoteAgeMs: Number(env.MAX_QUOTE_AGE_MS_FOR_PEAK_UPDATE ?? 1500),
+    });
+    const peakCandidate = Number(px?.effectivePrice ?? ltp);
+    if (!Number.isFinite(peakCandidate) || peakCandidate <= 0) return;
     const prev = toFiniteOrNaN(this._dynPeakLtpByTrade.get(tradeId));
     let next = prev;
-    if (!Number.isFinite(prev)) next = ltp;
-    else if (side === "BUY") next = Math.max(prev, ltp);
-    else next = Math.min(prev, ltp);
+    if (!Number.isFinite(prev)) next = peakCandidate;
+    else if (side === "BUY") next = Math.max(prev, peakCandidate);
+    else next = Math.min(prev, peakCandidate);
 
     if (Number.isFinite(next)) {
       this._dynPeakLtpByTrade.set(tradeId, next);
@@ -3640,23 +3663,29 @@ class TradeManager {
       const maxLeverage = Number(limits?.maxLeverage ?? 0);
       const maxMarginUtil = Number(limits?.maxMarginUtilization ?? 0);
 
+      const correlatedEnabled =
+        String(env.PORTFOLIO_CORRELATED_EXIT_ENABLED || "false") === "true";
       if (
         maxPerSymbolExposureInr <= 0 &&
         maxPortfolioExposureInr <= 0 &&
         maxLeverage <= 0 &&
-        maxMarginUtil <= 0
+        maxMarginUtil <= 0 &&
+        !correlatedEnabled
       ) {
         return;
       }
 
       const positions = await buildPositionsSnapshot({ kite: this.kite });
       const exposureBySymbol = {};
+      const exposureByToken = new Map();
       let totalExposure = 0;
       for (const p of positions) {
         const key = p.tradingsymbol || String(p.instrument_token || "");
         const exp = Number(p.exposureInr ?? 0);
         if (Number.isFinite(exp) && exp > 0) {
           exposureBySymbol[key] = (exposureBySymbol[key] || 0) + exp;
+          const tkn = Number(p.instrument_token);
+          if (Number.isFinite(tkn)) exposureByToken.set(tkn, exp);
           totalExposure += exp;
         }
       }
@@ -3723,6 +3752,55 @@ class TradeManager {
           };
         }
       }
+      if (!breach && correlatedEnabled) {
+        const activeTrades = await getActiveTrades();
+        const grouped = new Map();
+        for (const t of activeTrades || []) {
+          const token = Number(t?.instrument_token);
+          const exp = exposureByToken.get(token);
+          if (!(Number.isFinite(exp) && exp > 0)) continue;
+          const key =
+            String(
+              t?.option_meta?.underlying ||
+              t?.instrument?.name ||
+              t?.riskKey ||
+              token,
+            ).toUpperCase();
+          const row = grouped.get(key) || { exposure: 0, legs: 0, tokens: [] };
+          row.exposure += exp;
+          row.legs += 1;
+          row.tokens.push(token);
+          grouped.set(key, row);
+        }
+
+        const maxPct = Number(env.PORTFOLIO_MAX_CORRELATED_EXPOSURE_PCT ?? 65);
+        const maxLegs = Number(env.PORTFOLIO_MAX_CORRELATED_LEGS ?? 3);
+        const thresholdInr =
+          Number.isFinite(maxPct) && maxPct > 0 && totalExposure > 0
+            ? (maxPct / 100) * totalExposure
+            : Infinity;
+
+        for (const [groupKey, row] of grouped.entries()) {
+          if (
+            (Number.isFinite(thresholdInr) && row.exposure > thresholdInr) ||
+            (Number.isFinite(maxLegs) && maxLegs > 0 && row.legs > maxLegs)
+          ) {
+            breach = {
+              reason: "CORRELATED_EXPOSURE",
+              meta: {
+                groupKey,
+                groupExposure: row.exposure,
+                groupLegs: row.legs,
+                maxCorrelatedExposurePct: maxPct,
+                maxCorrelatedLegs: maxLegs,
+                totalExposure,
+                tokens: row.tokens,
+              },
+            };
+            break;
+          }
+        }
+      }
 
       if (!breach) return;
 
@@ -3748,7 +3826,19 @@ class TradeManager {
       const autoFlatten =
         String(env.RISK_AUTO_FLATTEN_ON_BREACH || "false") === "true";
       if (autoFlatten) {
-        await this._flattenNetPositions("PORTFOLIO_RISK_BREACH");
+        const correlatedScope = String(
+          env.PORTFOLIO_CORRELATED_AUTO_FLATTEN_SCOPE || "GROUP",
+        ).toUpperCase();
+        if (
+          breach.reason === "CORRELATED_EXPOSURE" &&
+          correlatedScope === "GROUP" &&
+          Array.isArray(breach?.meta?.tokens) &&
+          breach.meta.tokens.length
+        ) {
+          await this._flattenByTokens(breach.meta.tokens, "PORTFOLIO_CORRELATED_BREACH");
+        } else {
+          await this._flattenNetPositions("PORTFOLIO_RISK_BREACH");
+        }
       }
     } catch (e) {
       logger.warn(
@@ -3758,9 +3848,30 @@ class TradeManager {
     }
   }
 
-  async _flattenNetPositions(reason) {
+  async _flattenByTokens(tokens = [], reason) {
+    const allow = new Set((tokens || []).map((x) => Number(x)).filter((x) => Number.isFinite(x)));
+    if (!allow.size) {
+      return { ok: false, reason: "NO_TOKENS", attempted: 0, placed: 0, failed: 0, skipped: 0, tokens: [] };
+    }
+
     const positions = await this.kite.getPositions();
     const net = positions?.net || positions?.day || [];
+    const filtered = (net || []).filter((p) => {
+      const token = Number(p?.instrument_token);
+      const qty = Number(p?.quantity ?? p?.net_quantity ?? 0);
+      return allow.has(token) && Number.isFinite(qty) && qty !== 0;
+    });
+
+    if (!filtered.length) {
+      return { ok: true, reason: reason || "TOKEN_FLAT", attempted: 0, placed: 0, failed: 0, skipped: 0, tokens: Array.from(allow), openCount: 0 };
+    }
+
+    return this._flattenNetPositions(reason, filtered);
+  }
+
+  async _flattenNetPositions(reason, scopedOpen = null) {
+    const positions = scopedOpen ? null : await this.kite.getPositions();
+    const net = scopedOpen || positions?.net || positions?.day || [];
     const open = (net || []).filter((p) => {
       const qty = Number(p?.quantity ?? p?.net_quantity ?? 0);
       return Number.isFinite(qty) && qty !== 0;
@@ -4201,6 +4312,81 @@ class TradeManager {
       );
       throw e;
     }
+  }
+
+  _buildExitIntentId({ tradeId, desiredSLTrigger, desiredTP, version = 1 }) {
+    const payload = [
+      String(tradeId || ""),
+      Number(desiredSLTrigger ?? 0).toFixed(4),
+      Number(desiredTP ?? 0).toFixed(4),
+      String(version),
+    ].join("|");
+    return crypto.createHash("sha1").update(payload).digest("hex");
+  }
+
+  async _replaceStopLossOrder(trade, desiredStopLoss) {
+    const tradeId = String(trade?.tradeId || "");
+    const fresh = (await getTrade(tradeId)) || trade;
+    if (!fresh?.slOrderId) throw new Error("missing_sl_order_for_replace");
+    this.expectedCancelOrderIds.add(String(fresh.slOrderId));
+    await this._safeCancelOrder(env.DEFAULT_ORDER_VARIETY, fresh.slOrderId, {
+      purpose: "DYN_EXIT_SL_REPLACE_CANCEL",
+      tradeId,
+    });
+    await updateTrade(tradeId, {
+      slOrderId: null,
+      stopLoss: desiredStopLoss,
+      slTrigger: desiredStopLoss,
+      slReplaceCount: Math.max(0, Number(fresh?.slReplaceCount ?? 0)) + 1,
+    });
+    await this._placeExitsIfMissing({ ...fresh, stopLoss: desiredStopLoss, slOrderId: null });
+  }
+
+  async _handleDynSlEnforcementFailure({ trade, plan, error }) {
+    const tradeId = String(trade?.tradeId || "");
+    const now = Date.now();
+    const maxFails = Math.max(1, Number(env.DYN_EXIT_MODIFY_FAIL_MAX ?? 3));
+    const windowMs = Math.max(1000, Number(env.DYN_EXIT_MODIFY_FAIL_WINDOW_SEC ?? 20) * 1000);
+    const replaceMax = Math.max(0, Number(env.DYN_EXIT_REPLACE_MAX ?? 1));
+    const escalatePanic = String(env.DYN_EXIT_ESCALATE_TO_PANIC ?? "true") === "true";
+
+    const prevFirst = Number(new Date(trade?.slModifyFailFirstTs || 0).getTime());
+    const prevCount = Math.max(0, Number(trade?.slModifyFailCount ?? 0));
+    const inWindow = Number.isFinite(prevFirst) && prevFirst > 0 && now - prevFirst <= windowMs;
+    const nextCount = inWindow ? prevCount + 1 : 1;
+    const firstTs = inWindow ? prevFirst : now;
+
+    await updateTrade(tradeId, {
+      slModifyFailCount: nextCount,
+      slModifyFailFirstTs: new Date(firstTs),
+      beApplyFails: Math.max(0, Number(trade?.beApplyFails ?? 0)) + 1,
+    });
+
+    if (nextCount < maxFails) return { escalated: false };
+
+    const replaceCount = Math.max(0, Number(trade?.slReplaceCount ?? 0));
+    if (replaceCount < replaceMax) {
+      await this._replaceStopLossOrder(trade, Number(plan?.sl?.stopLoss));
+      await updateTrade(tradeId, { slModifyFailCount: 0, slModifyFailFirstTs: null });
+      await alert("error", "🚨 BE/TRAIL ENFORCEMENT ESCALATION: replaced SL", {
+        tradeId,
+        desiredStopLoss: Number(plan?.sl?.stopLoss ?? 0),
+        error: String(error?.message || error || "unknown"),
+      });
+      return { escalated: true, replaced: true };
+    }
+
+    if (escalatePanic) {
+      await alert("error", "🛑 PANIC EXIT due to SL enforcement failure", {
+        tradeId,
+        desiredStopLoss: Number(plan?.sl?.stopLoss ?? 0),
+        error: String(error?.message || error || "unknown"),
+      });
+      await this._panicExit(trade, "SL_ENFORCEMENT_FAILED", { allowWhenHalted: true, force: true });
+      await halt("SL_ENFORCEMENT_FAILED");
+      return { escalated: true, panic: true };
+    }
+    return { escalated: true };
   }
 
   async _safeModifyOrder(
@@ -6176,6 +6362,7 @@ class TradeManager {
         ? { ...tradeWithFacts, peakLtp: peakFromTick }
         : tradeWithFacts;
 
+      const quoteSnapshot = this.lastQuoteByToken.get(token) || { ltp, quoteTsMs: now };
       const plan = computeDynamicExitPlan({
         trade: tradeForPlan,
         ltp,
@@ -6183,6 +6370,7 @@ class TradeManager {
         nowTs: now,
         env,
         underlyingLtp: Number.isFinite(underlyingLtp) ? underlyingLtp : undefined,
+        quoteSnapshot,
       });
       if (!plan?.ok) {
         this._dynExitCadenceStats.evalNoPlan += 1;
@@ -6386,6 +6574,17 @@ class TradeManager {
             patch.price = nextLimitPrice;
           }
 
+          const intentId = this._buildExitIntentId({
+            tradeId,
+            desiredSLTrigger: Number(plan?.sl?.stopLoss ?? 0),
+            desiredTP: Number(plan?.target?.targetPrice ?? 0),
+            version: Number(trade?.exitIntentVersion ?? 1),
+          });
+          if (intentId && String(trade?.lastExitIntentId || "") === intentId) {
+            logger.info({ tradeId, intentId }, "[dyn_exit] idempotent SL intent; skipping broker modify");
+            return;
+          }
+
           const retryMeta = {
             type: "DYN_SL",
             token,
@@ -6439,6 +6638,10 @@ class TradeManager {
                 : beLockedNow
                   ? { beApplyFails: nextBeApplyFails }
                   : {}),
+              beArmed: Boolean(plan?.meta?.beArmed),
+              beFiredTs: plan?.meta?.beFiredTs || trade?.beFiredTs || null,
+              activeLockFloorPrice: Number.isFinite(Number(plan?.meta?.activeLockFloorPrice)) ? Number(plan.meta.activeLockFloorPrice) : null,
+              lastExitIntentId: intentId,
               ...this._eventPatch("SL_TRAILED", {
                 tradeId,
                 stopLoss: appliedTrigger,
@@ -6544,35 +6747,7 @@ class TradeManager {
               tradeId,
               Date.now() + Math.min(nextBackoff, maxBackoff),
             );
-            if (fails >= 3) {
-              this._dynExitDisabled.add(tradeId);
-              try {
-                await updateTrade(tradeId, {
-                  dynExitDisabled: true,
-                  dynExitDisabledAt: new Date(),
-                  ...this._eventPatch("TRAILING_DISABLED", {
-                    tradeId,
-                    failCount: fails,
-                  }),
-                });
-              } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
-              alert("error", "🛑 Trailing disabled after modify failures", {
-                tradeId,
-                failCount: fails,
-              }).catch((err) =>
-        reportWindowedFault({
-          code: "ALERT_SEND_FAILED",
-          windowKey: "alert_send_failed",
-          err,
-          message: "[alert] failed to dispatch notification",
-          meta: { context: "trade_manager" },
-        }),
-      );
-              logger.error(
-                { tradeId, failCount: fails },
-                "[dyn_exit] trailing disabled after failures",
-              );
-            }
+            await this._handleDynSlEnforcementFailure({ trade, plan, error: e });
             logger.warn(
               { tradeId, e: e.message, stopLoss: plan.sl.stopLoss },
               "[dyn_exit] SL modify failed",
@@ -9498,6 +9673,43 @@ class TradeManager {
           meta: null,
         };
 
+    const spreadBpsAtEntry = Number(quoteAtEntry?.bps ?? NaN);
+    const microPolicyEnabled =
+      String(env.ENTRY_MICROSTRUCTURE_POLICY_ENABLED || "true") === "true";
+    const execPolicyMeta = {
+      bucket: "DEFAULT",
+      spreadBps: Number.isFinite(spreadBpsAtEntry) ? spreadBpsAtEntry : null,
+      layering: String(env.ENTRY_EXEC_LAYERING_ENABLED || "false") === "true",
+    };
+
+    let finalEntryOrderType = entryOrderType;
+    let entryValidity = "DAY";
+    let entryPriceHint = Number(expectedEntryPrice) || Number(entryGuess);
+
+    if (microPolicyEnabled && isOptContract && Number.isFinite(spreadBpsAtEntry)) {
+      const passiveMax = Number(env.ENTRY_PASSIVE_MAX_SPREAD_BPS ?? 8);
+      const aggressiveMax = Number(env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS ?? 20);
+      const bidPx = Number(quoteAtEntry?.bid ?? 0);
+      const askPx = Number(quoteAtEntry?.ask ?? 0);
+
+      if (spreadBpsAtEntry <= passiveMax) {
+        execPolicyMeta.bucket = "PASSIVE";
+        finalEntryOrderType = "LIMIT";
+        entryValidity = String(env.ENTRY_PASSIVE_VALIDITY || "DAY").toUpperCase();
+        if (side === "BUY" && Number.isFinite(bidPx) && bidPx > 0) entryPriceHint = bidPx;
+        if (side === "SELL" && Number.isFinite(askPx) && askPx > 0) entryPriceHint = askPx;
+      } else if (spreadBpsAtEntry <= aggressiveMax) {
+        execPolicyMeta.bucket = "AGGRESSIVE";
+        finalEntryOrderType = "LIMIT";
+        entryValidity = String(env.ENTRY_AGGRESSIVE_VALIDITY || "IOC").toUpperCase();
+        if (side === "BUY" && Number.isFinite(askPx) && askPx > 0) entryPriceHint = askPx;
+        if (side === "SELL" && Number.isFinite(bidPx) && bidPx > 0) entryPriceHint = bidPx;
+      } else {
+        execPolicyMeta.bucket = "WIDE_SPREAD";
+        finalEntryOrderType = "MARKET";
+      }
+    }
+
     const tradeId = crypto.randomUUID();
     const trade = {
       tradeId,
@@ -9547,7 +9759,7 @@ class TradeManager {
       minGreenPts: minGreen.minGreenPts,
       // planned risk cap used for sizing / gating (₹)
       riskInr: Number(_riskInrOverride ?? env.RISK_PER_TRADE_INR ?? 0),
-      entryOrderType,
+      entryOrderType: finalEntryOrderType,
       maxEntrySlippageBps: maxEntrySlipBps,
       maxEntrySlippageKillBps: maxEntrySlipKillBps,
       entrySlippageBps: null,
@@ -9555,6 +9767,7 @@ class TradeManager {
       plannedTargetPrice: plannedTargetPrice || null,
       planMeta: planMeta || null,
       pacingPolicy: policy?.meta || null,
+      executionPolicy: execPolicyMeta,
       optimizer: opt?.meta || null,
       status: STATUS.ENTRY_PLACED,
       entryOrderId: null,
@@ -9580,15 +9793,15 @@ class TradeManager {
       transaction_type: side,
       quantity: qty,
       product: env.DEFAULT_PRODUCT,
-      order_type: entryOrderType,
-      validity: "DAY",
+      order_type: finalEntryOrderType,
+      validity: entryValidity,
       tag: makeTag(tradeId, "ENTRY"),
     };
 
-    if (entryOrderType === "LIMIT") {
+    if (finalEntryOrderType === "LIMIT") {
       // Use top-of-book price from spread check if available.
       // BUY -> ask; SELL -> bid
-      const px = Number(expectedEntryPrice) || Number(entryGuess);
+      const px = Number(entryPriceHint) || Number(expectedEntryPrice) || Number(entryGuess);
       entryParams.price = roundToTick(px, tick, side === "BUY" ? "up" : "down");
     }
 
@@ -9639,7 +9852,7 @@ class TradeManager {
     }
 
     // Pro: if LIMIT entry is not filled quickly, fallback to MARKET (options only)
-    if (entryOrderType === "LIMIT") {
+    if (finalEntryOrderType === "LIMIT") {
       this._startEntryLadder({
         tradeId,
         entryOrderId,
@@ -9659,7 +9872,7 @@ class TradeManager {
     // Pro: if LIMIT entry is not filled quickly, fallback to MARKET (options only)
     if (
       isOptContract &&
-      entryOrderType === "LIMIT" &&
+      finalEntryOrderType === "LIMIT" &&
       String(env.ENTRY_LIMIT_FALLBACK_TO_MARKET || "false") === "true" &&
       Number(env.ENTRY_LIMIT_TIMEOUT_MS ?? 0) > 0
     ) {
