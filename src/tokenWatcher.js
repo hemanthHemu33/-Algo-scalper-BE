@@ -116,6 +116,7 @@ async function watchLatestToken({ onToken, onMissing }) {
   const interval = setInterval(() => {
     refreshAndNotify("poll").catch((err) => { reportFault({ code: "TOKENWATCHER_ASYNC", err, message: "[src/tokenWatcher.js] async task failed" }); });
   }, pollMs);
+  interval.unref?.();
 
   return async () => {
     stopped = true;

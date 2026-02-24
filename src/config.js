@@ -419,6 +419,22 @@ const schema = z.object({
   TICK_WATCHDOG_MAX_AGE_MS: z.coerce.number().default(15000),
   TICK_TAP_LOG: z.string().default("false"),
 
+  // Engine lifecycle orchestration (opt-in)
+  ENGINE_LIFECYCLE_ENABLED: z.string().default("false"),
+  MARKET_TZ: z.string().default("Asia/Kolkata"),
+  ENGINE_WARMUP_HHMM: z.string().default("09:10"),
+  ENGINE_LIVE_HHMM: z.string().default("09:15"),
+  ENGINE_CLOSE_HHMM: z.string().default("15:30"),
+  ENGINE_IDLE_AFTER_MIN: z.coerce.number().default(5),
+  ENGINE_REQUIRE_FLAT_BEFORE_IDLE: z.string().default("true"),
+  ENGINE_FORCE_FLATTEN_AT_CLOSE: z.string().default("false"),
+  ENGINE_FORCE_FLATTEN_DEADLINE_MIN: z.coerce.number().default(10),
+  ENGINE_IDLE_GUARD_SEC: z.coerce.number().default(60),
+  ENGINE_NEAR_EVENT_GUARD_SEC: z.coerce.number().default(5),
+  ENGINE_COOLDOWN_POLL_SEC: z.coerce.number().default(10),
+  MARKET_HOLIDAYS: z.string().optional(),
+  ENGINE_TEST_NOW_ISO: z.string().optional(),
+
   // Market holiday calendar (optional) — blocks trading on holidays / weekends and supports special sessions.
   HOLIDAY_CALENDAR_ENABLED: z.string().default("false"),
   HOLIDAY_CALENDAR_FILE: z.string().default("config/market_calendar.json"),

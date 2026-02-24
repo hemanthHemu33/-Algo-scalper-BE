@@ -9,7 +9,9 @@ const { connectMongo, closeMongo } = require("./db");
 const { ensureRetentionIndexes } = require("./market/retention");
 const { buildApp } = require("./app");
 const { watchLatestToken } = require("./tokenWatcher");
-const { setSession, shutdownAll } = require("./kite/tickerManager");
+const { setSession, shutdownAll, startSession, stopSession, setTradingEnabled, getSessionStatus, getOpenPositionsSummary, forceFlatten } = require("./kite/tickerManager");
+const { createEngineLifecycle } = require("./runtime/engineLifecycle");
+const { notifyLifecycle } = require("./runtime/lifecycleNotify");
 const { telemetry } = require("./telemetry/signalTelemetry");
 const { tradeTelemetry } = require("./telemetry/tradeTelemetry");
 const { optimizer } = require("./optimizer/adaptiveOptimizer");
@@ -103,6 +105,20 @@ async function main() {
     await optimizer.start();
   } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
 
+  const lifecycle = createEngineLifecycle({
+    startSession,
+    stopSession,
+    setTradingEnabled,
+    getSessionStatus,
+    getOpenPositionsSummary,
+    forceFlatten,
+  });
+  const lifecycleEnabled = String(env.ENGINE_LIFECYCLE_ENABLED || "false") === "true";
+
+  if (lifecycleEnabled) {
+    await lifecycle.start();
+  }
+
   const stopTokenWatcher = await watchLatestToken({
     onMissing: async (doc, reason) => {
       const updatedAt = doc?.updatedAt || doc?.createdAt || null;
@@ -115,6 +131,10 @@ async function main() {
         reason,
         hint: "Login via your token generator/scanner app or insert/update a doc with access_token in TOKENS_COLLECTION",
       }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
+      await notifyLifecycle("TOKEN_MISSING", { reason, updatedAt });
+      if (lifecycleEnabled) {
+        await lifecycle.setToken(null);
+      }
       await halt("KITE_TOKEN_MISSING", { reason, updatedAt });
     },
     onToken: async (accessToken, doc, reason) => {
@@ -130,9 +150,14 @@ async function main() {
         reason,
         updatedAt,
       }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
+      await notifyLifecycle("TOKEN_RESTORED", { reason, updatedAt });
 
       try {
-        await setSession(accessToken);
+        if (lifecycleEnabled) {
+          await lifecycle.setToken(accessToken);
+        } else {
+          await setSession(accessToken);
+        }
       } catch (e) {
         const err = describeErr(e);
         logger.error(
@@ -173,6 +198,10 @@ async function main() {
       if (typeof stopTokenWatcher === "function") {
         await stopTokenWatcher();
       }
+    } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
+
+    try {
+      lifecycle.stop?.();
     } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
 
     try {

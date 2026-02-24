@@ -4,6 +4,7 @@ const {
   getPipeline,
   getTickerStatus,
   getSubscribedTokens,
+  getSessionStatus,
 } = require("./kite/tickerManager");
 const { isHalted, getHaltInfo, resetHalt } = require("./runtime/halt");
 const {
@@ -56,6 +57,7 @@ const {
 } = require("./trading/tradeNormalization");
 const { STATUS } = require("./trading/tradeStateMachine");
 const { reportFault, snapshotFaults } = require("./runtime/errorBus");
+const { getEngineLifecycleStatus } = require("./runtime/engineLifecycle");
 
 function buildAdminAuth() {
   const expected = env.ADMIN_API_KEY;
@@ -503,6 +505,9 @@ function buildApp() {
         hasSession: false,
         ...(ticker || {}),
       };
+      const lifecycle = getEngineLifecycleStatus();
+      const sessionStatus = await getSessionStatus();
+      const tokenPresent = !!lifecycle?.tokenPresent || !!normalizedTicker?.hasSession;
       const dailyPnL =
         s?.dailyRisk?.lastTotal ??
         s?.dailyRisk?.lastRealizedPnl ??
@@ -548,9 +553,14 @@ function buildApp() {
       res.json({
         ok: true,
         ...s,
-        pipelineReady: !!pipeline,
         kiteLoginUrl: buildKiteLoginUrl(),
-        tradingEnabled: s?.tradingEnabled ?? getTradingEnabled(),
+        tokenPresent,
+        needsKiteLogin: !tokenPresent || needsLogin,
+        engineMode: lifecycle?.mode || "LEGACY",
+        nextTransitionAt: lifecycle?.nextTransitionAt || null,
+        tradingEnabled: s?.tradingEnabled ?? sessionStatus?.tradingEnabled ?? getTradingEnabled(),
+        tickerConnected: !!sessionStatus?.tickerConnected,
+        pipelineReady: !!pipeline && !!sessionStatus?.pipelineReady,
         killSwitch: s?.killSwitch ?? false,
         halted,
         needsLogin,
