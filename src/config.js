@@ -377,6 +377,10 @@ const schema = z.object({
   OPT_EXIT_TRAIL_PCT_BASE: z.coerce.number().default(12),
   OPT_EXIT_TRAIL_PCT_MIN: z.coerce.number().default(6),
   OPT_EXIT_TRAIL_PCT_MAX: z.coerce.number().default(22),
+  // HYBRID_ATR_DELTA model: trail gap blended from premium% and underlying ATR mapped via option delta/gamma
+  OPT_EXIT_HYBRID_ATR_MULT: z.coerce.number().default(1.0),
+  OPT_EXIT_HYBRID_WEIGHT: z.coerce.number().default(0.7),
+  OPT_EXIT_HYBRID_MIN_TICKS: z.coerce.number().default(2),
 
   // Coarse IV spike/crush heuristics (proxy using underlying move)
   OPT_IV_NEUTRAL_BPS: z.coerce.number().default(12),
@@ -640,6 +644,11 @@ const schema = z.object({
   RISK_MAX_EXPOSURE_PER_SYMBOL_INR: z.coerce.number().default(150000),
   RISK_MAX_PORTFOLIO_EXPOSURE_INR: z.coerce.number().default(0),
   RISK_MAX_LEVERAGE: z.coerce.number().default(0),
+  // Correlated portfolio risk (same underlying / cluster concentration)
+  PORTFOLIO_CORRELATED_EXIT_ENABLED: boolFromEnv.default(false),
+  PORTFOLIO_MAX_CORRELATED_EXPOSURE_PCT: z.coerce.number().default(65),
+  PORTFOLIO_MAX_CORRELATED_LEGS: z.coerce.number().default(3),
+  PORTFOLIO_CORRELATED_AUTO_FLATTEN_SCOPE: z.string().default("GROUP"),
 
   // Trading window (MIS safe)
   AUTO_FIX_TIME_WINDOWS: z.string().default("false"),
@@ -939,6 +948,14 @@ const schema = z.object({
   ENTRY_LADDER_TICKS: z.coerce.number().default(2),
   ENTRY_LADDER_STEP_DELAY_MS: z.coerce.number().default(350),
   ENTRY_LADDER_MAX_CHASE_BPS: z.coerce.number().default(35),
+
+  // Microstructure-aware execution policy (entry)
+  ENTRY_MICROSTRUCTURE_POLICY_ENABLED: boolFromEnv.default(true),
+  ENTRY_PASSIVE_MAX_SPREAD_BPS: z.coerce.number().default(8),
+  ENTRY_AGGRESSIVE_MAX_SPREAD_BPS: z.coerce.number().default(20),
+  ENTRY_PASSIVE_VALIDITY: z.string().default("DAY"),
+  ENTRY_AGGRESSIVE_VALIDITY: z.string().default("IOC"),
+  ENTRY_EXEC_LAYERING_ENABLED: boolFromEnv.default(false),
 
   // Optional simple caps (highly recommended)
   MAX_QTY: z.coerce.number().optional(),
