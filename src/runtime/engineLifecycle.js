@@ -195,7 +195,10 @@ function makeLifecycle(ops = {}) {
   }
 
   async function transit(target, reason = "schedule") {
-    if (state === target) return;
+    if (state === target) {
+      scheduleNext();
+      return;
+    }
     logger.info({ from: state, to: target, reason }, "[lifecycle] transition");
 
     if (!token && target !== "IDLE") {
@@ -238,6 +241,11 @@ function makeLifecycle(ops = {}) {
     scheduleNext();
   }
 
+  async function reconcileNow(reason = "reconcile") {
+    const target = desiredStateAt(nowIst());
+    await transit(target, reason);
+  }
+
   function scheduleNext() {
     wakeTimer = clearTimer(wakeTimer);
     cooldownTimer = clearTimer(cooldownTimer);
@@ -274,8 +282,7 @@ function makeLifecycle(ops = {}) {
   async function start() {
     if (!cfg.enabled) return;
     startIdleGuard();
-    await transit("IDLE", "startup");
-    scheduleNext();
+    await reconcileNow("startup");
   }
 
   async function setToken(accessToken) {
@@ -288,12 +295,12 @@ function makeLifecycle(ops = {}) {
     }
     if (token && !had) {
       await notifyLifecycle("TOKEN_RESTORED", {});
-      const target = desiredStateAt(nowIst());
-      if (target === "IDLE") {
-        scheduleNext();
-      } else {
-        await transit(target, "token_restored");
-      }
+      await reconcileNow("token_restored");
+      return;
+    }
+
+    if (token) {
+      await reconcileNow("token_updated");
     }
   }
 
