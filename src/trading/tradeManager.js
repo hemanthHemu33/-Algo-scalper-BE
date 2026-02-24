@@ -3663,23 +3663,29 @@ class TradeManager {
       const maxLeverage = Number(limits?.maxLeverage ?? 0);
       const maxMarginUtil = Number(limits?.maxMarginUtilization ?? 0);
 
+      const correlatedEnabled =
+        String(env.PORTFOLIO_CORRELATED_EXIT_ENABLED || "false") === "true";
       if (
         maxPerSymbolExposureInr <= 0 &&
         maxPortfolioExposureInr <= 0 &&
         maxLeverage <= 0 &&
-        maxMarginUtil <= 0
+        maxMarginUtil <= 0 &&
+        !correlatedEnabled
       ) {
         return;
       }
 
       const positions = await buildPositionsSnapshot({ kite: this.kite });
       const exposureBySymbol = {};
+      const exposureByToken = new Map();
       let totalExposure = 0;
       for (const p of positions) {
         const key = p.tradingsymbol || String(p.instrument_token || "");
         const exp = Number(p.exposureInr ?? 0);
         if (Number.isFinite(exp) && exp > 0) {
           exposureBySymbol[key] = (exposureBySymbol[key] || 0) + exp;
+          const tkn = Number(p.instrument_token);
+          if (Number.isFinite(tkn)) exposureByToken.set(tkn, exp);
           totalExposure += exp;
         }
       }
@@ -3746,6 +3752,55 @@ class TradeManager {
           };
         }
       }
+      if (!breach && correlatedEnabled) {
+        const activeTrades = await getActiveTrades();
+        const grouped = new Map();
+        for (const t of activeTrades || []) {
+          const token = Number(t?.instrument_token);
+          const exp = exposureByToken.get(token);
+          if (!(Number.isFinite(exp) && exp > 0)) continue;
+          const key =
+            String(
+              t?.option_meta?.underlying ||
+              t?.instrument?.name ||
+              t?.riskKey ||
+              token,
+            ).toUpperCase();
+          const row = grouped.get(key) || { exposure: 0, legs: 0, tokens: [] };
+          row.exposure += exp;
+          row.legs += 1;
+          row.tokens.push(token);
+          grouped.set(key, row);
+        }
+
+        const maxPct = Number(env.PORTFOLIO_MAX_CORRELATED_EXPOSURE_PCT ?? 65);
+        const maxLegs = Number(env.PORTFOLIO_MAX_CORRELATED_LEGS ?? 3);
+        const thresholdInr =
+          Number.isFinite(maxPct) && maxPct > 0 && totalExposure > 0
+            ? (maxPct / 100) * totalExposure
+            : Infinity;
+
+        for (const [groupKey, row] of grouped.entries()) {
+          if (
+            (Number.isFinite(thresholdInr) && row.exposure > thresholdInr) ||
+            (Number.isFinite(maxLegs) && maxLegs > 0 && row.legs > maxLegs)
+          ) {
+            breach = {
+              reason: "CORRELATED_EXPOSURE",
+              meta: {
+                groupKey,
+                groupExposure: row.exposure,
+                groupLegs: row.legs,
+                maxCorrelatedExposurePct: maxPct,
+                maxCorrelatedLegs: maxLegs,
+                totalExposure,
+                tokens: row.tokens,
+              },
+            };
+            break;
+          }
+        }
+      }
 
       if (!breach) return;
 
@@ -3771,7 +3826,19 @@ class TradeManager {
       const autoFlatten =
         String(env.RISK_AUTO_FLATTEN_ON_BREACH || "false") === "true";
       if (autoFlatten) {
-        await this._flattenNetPositions("PORTFOLIO_RISK_BREACH");
+        const correlatedScope = String(
+          env.PORTFOLIO_CORRELATED_AUTO_FLATTEN_SCOPE || "GROUP",
+        ).toUpperCase();
+        if (
+          breach.reason === "CORRELATED_EXPOSURE" &&
+          correlatedScope === "GROUP" &&
+          Array.isArray(breach?.meta?.tokens) &&
+          breach.meta.tokens.length
+        ) {
+          await this._flattenByTokens(breach.meta.tokens, "PORTFOLIO_CORRELATED_BREACH");
+        } else {
+          await this._flattenNetPositions("PORTFOLIO_RISK_BREACH");
+        }
       }
     } catch (e) {
       logger.warn(
@@ -3781,9 +3848,30 @@ class TradeManager {
     }
   }
 
-  async _flattenNetPositions(reason) {
+  async _flattenByTokens(tokens = [], reason) {
+    const allow = new Set((tokens || []).map((x) => Number(x)).filter((x) => Number.isFinite(x)));
+    if (!allow.size) {
+      return { ok: false, reason: "NO_TOKENS", attempted: 0, placed: 0, failed: 0, skipped: 0, tokens: [] };
+    }
+
     const positions = await this.kite.getPositions();
     const net = positions?.net || positions?.day || [];
+    const filtered = (net || []).filter((p) => {
+      const token = Number(p?.instrument_token);
+      const qty = Number(p?.quantity ?? p?.net_quantity ?? 0);
+      return allow.has(token) && Number.isFinite(qty) && qty !== 0;
+    });
+
+    if (!filtered.length) {
+      return { ok: true, reason: reason || "TOKEN_FLAT", attempted: 0, placed: 0, failed: 0, skipped: 0, tokens: Array.from(allow), openCount: 0 };
+    }
+
+    return this._flattenNetPositions(reason, filtered);
+  }
+
+  async _flattenNetPositions(reason, scopedOpen = null) {
+    const positions = scopedOpen ? null : await this.kite.getPositions();
+    const net = scopedOpen || positions?.net || positions?.day || [];
     const open = (net || []).filter((p) => {
       const qty = Number(p?.quantity ?? p?.net_quantity ?? 0);
       return Number.isFinite(qty) && qty !== 0;
@@ -9585,6 +9673,43 @@ class TradeManager {
           meta: null,
         };
 
+    const spreadBpsAtEntry = Number(quoteAtEntry?.bps ?? NaN);
+    const microPolicyEnabled =
+      String(env.ENTRY_MICROSTRUCTURE_POLICY_ENABLED || "true") === "true";
+    const execPolicyMeta = {
+      bucket: "DEFAULT",
+      spreadBps: Number.isFinite(spreadBpsAtEntry) ? spreadBpsAtEntry : null,
+      layering: String(env.ENTRY_EXEC_LAYERING_ENABLED || "false") === "true",
+    };
+
+    let finalEntryOrderType = entryOrderType;
+    let entryValidity = "DAY";
+    let entryPriceHint = Number(expectedEntryPrice) || Number(entryGuess);
+
+    if (microPolicyEnabled && isOptContract && Number.isFinite(spreadBpsAtEntry)) {
+      const passiveMax = Number(env.ENTRY_PASSIVE_MAX_SPREAD_BPS ?? 8);
+      const aggressiveMax = Number(env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS ?? 20);
+      const bidPx = Number(quoteAtEntry?.bid ?? 0);
+      const askPx = Number(quoteAtEntry?.ask ?? 0);
+
+      if (spreadBpsAtEntry <= passiveMax) {
+        execPolicyMeta.bucket = "PASSIVE";
+        finalEntryOrderType = "LIMIT";
+        entryValidity = String(env.ENTRY_PASSIVE_VALIDITY || "DAY").toUpperCase();
+        if (side === "BUY" && Number.isFinite(bidPx) && bidPx > 0) entryPriceHint = bidPx;
+        if (side === "SELL" && Number.isFinite(askPx) && askPx > 0) entryPriceHint = askPx;
+      } else if (spreadBpsAtEntry <= aggressiveMax) {
+        execPolicyMeta.bucket = "AGGRESSIVE";
+        finalEntryOrderType = "LIMIT";
+        entryValidity = String(env.ENTRY_AGGRESSIVE_VALIDITY || "IOC").toUpperCase();
+        if (side === "BUY" && Number.isFinite(askPx) && askPx > 0) entryPriceHint = askPx;
+        if (side === "SELL" && Number.isFinite(bidPx) && bidPx > 0) entryPriceHint = bidPx;
+      } else {
+        execPolicyMeta.bucket = "WIDE_SPREAD";
+        finalEntryOrderType = "MARKET";
+      }
+    }
+
     const tradeId = crypto.randomUUID();
     const trade = {
       tradeId,
@@ -9634,7 +9759,7 @@ class TradeManager {
       minGreenPts: minGreen.minGreenPts,
       // planned risk cap used for sizing / gating (₹)
       riskInr: Number(_riskInrOverride ?? env.RISK_PER_TRADE_INR ?? 0),
-      entryOrderType,
+      entryOrderType: finalEntryOrderType,
       maxEntrySlippageBps: maxEntrySlipBps,
       maxEntrySlippageKillBps: maxEntrySlipKillBps,
       entrySlippageBps: null,
@@ -9642,6 +9767,7 @@ class TradeManager {
       plannedTargetPrice: plannedTargetPrice || null,
       planMeta: planMeta || null,
       pacingPolicy: policy?.meta || null,
+      executionPolicy: execPolicyMeta,
       optimizer: opt?.meta || null,
       status: STATUS.ENTRY_PLACED,
       entryOrderId: null,
@@ -9667,15 +9793,15 @@ class TradeManager {
       transaction_type: side,
       quantity: qty,
       product: env.DEFAULT_PRODUCT,
-      order_type: entryOrderType,
-      validity: "DAY",
+      order_type: finalEntryOrderType,
+      validity: entryValidity,
       tag: makeTag(tradeId, "ENTRY"),
     };
 
-    if (entryOrderType === "LIMIT") {
+    if (finalEntryOrderType === "LIMIT") {
       // Use top-of-book price from spread check if available.
       // BUY -> ask; SELL -> bid
-      const px = Number(expectedEntryPrice) || Number(entryGuess);
+      const px = Number(entryPriceHint) || Number(expectedEntryPrice) || Number(entryGuess);
       entryParams.price = roundToTick(px, tick, side === "BUY" ? "up" : "down");
     }
 
@@ -9726,7 +9852,7 @@ class TradeManager {
     }
 
     // Pro: if LIMIT entry is not filled quickly, fallback to MARKET (options only)
-    if (entryOrderType === "LIMIT") {
+    if (finalEntryOrderType === "LIMIT") {
       this._startEntryLadder({
         tradeId,
         entryOrderId,
@@ -9746,7 +9872,7 @@ class TradeManager {
     // Pro: if LIMIT entry is not filled quickly, fallback to MARKET (options only)
     if (
       isOptContract &&
-      entryOrderType === "LIMIT" &&
+      finalEntryOrderType === "LIMIT" &&
       String(env.ENTRY_LIMIT_FALLBACK_TO_MARKET || "false") === "true" &&
       Number(env.ENTRY_LIMIT_TIMEOUT_MS ?? 0) > 0
     ) {

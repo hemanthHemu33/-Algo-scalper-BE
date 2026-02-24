@@ -938,6 +938,61 @@ function underlyingMoveBps({ trade, underlyingLtp }) {
   return ((uNow - uEntry) / uEntry) * 10000;
 }
 
+function optionHybridTrailGap({ trade, ltp, env, trailPct, tick }) {
+  const pctGap = Number.isFinite(trailPct) && trailPct > 0
+    ? (Number(ltp) * trailPct) / 100
+    : NaN;
+
+  const atrU = safeNum(
+    trade?.regimeMeta?.atr ??
+      trade?.marketContextAtEntry?.atr ??
+      trade?.planMeta?.regimeMeta?.atr,
+  );
+  const atrMult = Math.max(0, Number(env.OPT_EXIT_HYBRID_ATR_MULT ?? 1.0));
+  const moveU = Number.isFinite(atrU) && atrU > 0 ? atrU * atrMult : NaN;
+
+  const deltaAbs = Math.abs(Number(trade?.option_meta?.delta));
+  const delta = Number.isFinite(deltaAbs) && deltaAbs > 0
+    ? deltaAbs
+    : Number(env.OPT_DELTA_ATM ?? 0.5);
+  const gammaRaw = Math.abs(Number(trade?.option_meta?.gamma));
+  const gamma = Number.isFinite(gammaRaw) ? gammaRaw : 0;
+
+  const atrGap =
+    Number.isFinite(moveU) && moveU > 0
+      ? moveU * delta + 0.5 * gamma * moveU * moveU
+      : NaN;
+
+  const w = clamp(Number(env.OPT_EXIT_HYBRID_WEIGHT ?? 0.7), 0, 1);
+  let hybridGap = NaN;
+  if (Number.isFinite(atrGap) && Number.isFinite(pctGap)) {
+    hybridGap = atrGap * w + pctGap * (1 - w);
+  } else if (Number.isFinite(atrGap)) {
+    hybridGap = atrGap;
+  } else if (Number.isFinite(pctGap)) {
+    hybridGap = pctGap;
+  }
+
+  const minTicks = Math.max(1, Number(env.OPT_EXIT_HYBRID_MIN_TICKS ?? 2));
+  const minGap = Math.max(tick, minTicks * tick);
+  if (Number.isFinite(hybridGap)) hybridGap = Math.max(minGap, hybridGap);
+
+  return {
+    gap: Number.isFinite(hybridGap) ? hybridGap : null,
+    meta: {
+      pctGap: Number.isFinite(pctGap) ? pctGap : null,
+      atrU: Number.isFinite(atrU) ? atrU : null,
+      atrMult,
+      moveU: Number.isFinite(moveU) ? moveU : null,
+      delta,
+      gamma,
+      atrGap: Number.isFinite(atrGap) ? atrGap : null,
+      weight: w,
+      minGap,
+    },
+  };
+}
+
 function optionExitFallback({
   trade,
   ltp,
@@ -1072,13 +1127,19 @@ function optionExitFallback({
   const trailMax = Number(env.OPT_EXIT_TRAIL_PCT_MAX ?? 22);
 
   const trailPct = clamp(baseTrailPct * volFactor, trailMin, trailMax);
+  const exitModel = String(env.OPT_EXIT_MODEL || "PREMIUM_PCT").toUpperCase();
+  const hybrid = optionHybridTrailGap({ trade, ltp, env, trailPct, tick });
+  const useHybridTrail = exitModel === "HYBRID_ATR_DELTA";
 
   if (Number.isFinite(trailStartPct) && pPct >= trailStartPct) {
+    const trailGap = useHybridTrail && Number.isFinite(hybrid.gap)
+      ? Number(hybrid.gap)
+      : (ltp * trailPct) / 100;
     if (side === "BUY") {
-      const trailSL = roundToTick(ltp * (1 - trailPct / 100), tick, "down");
+      const trailSL = roundToTick(ltp - trailGap, tick, "down");
       newSL = Math.max(newSL, trailSL);
     } else {
-      const trailSL = roundToTick(ltp * (1 + trailPct / 100), tick, "up");
+      const trailSL = roundToTick(ltp + trailGap, tick, "up");
       newSL = Math.min(newSL, trailSL);
     }
   }
@@ -1176,6 +1237,8 @@ function optionExitFallback({
       volFactor,
       slPct,
       tpPct,
+      exitModel,
+      hybridTrail: useHybridTrail ? hybrid.meta : null,
       modelSL,
       modelTP,
       curSL: Number.isFinite(curSL) ? curSL : null,
