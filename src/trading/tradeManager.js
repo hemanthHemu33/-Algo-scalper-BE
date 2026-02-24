@@ -292,6 +292,7 @@ class TradeManager {
     this._lastModifyAttemptAtByOrder = new Map(); // orderId -> ts
     this._exitLoopTimer = null;
     this._exitLoopInFlight = false;
+    this._exitLoopInstanceId = crypto.randomUUID();
     this._dynExitFailCount = new Map(); // tradeId -> failure count
     this._dynExitDisabled = new Set(); // tradeId -> disable trailing
     this._dynExitInFlight = new Set(); // tradeId -> lock for dynamic exit
@@ -355,6 +356,9 @@ class TradeManager {
     this._panicExitRetryCount = new Map();
     this._timeStopEscalationAt = new Map();
     this._timeStopFallbackTimers = new Map();
+    this._pnlBlindStateByTrade = new Map(); // tradeId -> {count, firstAt, lastAlertAt}
+    this._recoveryEpoch = 0;
+    this._initialized = false;
 
     // Reconcile debouncer (order-update driven)
     this._reconcileTimer = null;
@@ -796,6 +800,7 @@ class TradeManager {
   }
 
   async init() {
+    if (this._initialized) return;
     await ensureTradeIndexes();
     // Patch-6: load persisted cost calibration multipliers (if enabled)
     try {
@@ -823,6 +828,7 @@ class TradeManager {
     await this._hydrateOpenPositionFromActiveTrade();
     this._startExitLoop();
     this._startWallClockTimeGuardLoop();
+    this._initialized = true;
   }
 
   async shutdown() {
@@ -967,7 +973,13 @@ class TradeManager {
   }
 
   _startExitLoop() {
-    if (this._exitLoopTimer) return;
+    if (this._exitLoopTimer) {
+      logger.warn(
+        { exitLoopInstanceId: this._exitLoopInstanceId },
+        "[dyn_exit] duplicate loop start ignored",
+      );
+      return;
+    }
     const everyMs = Number(env.EXIT_LOOP_MS ?? 0);
     if (!Number.isFinite(everyMs) || everyMs <= 0) return;
 
@@ -982,6 +994,10 @@ class TradeManager {
         );
       },
       Math.max(250, everyMs),
+    );
+    logger.info(
+      { exitLoopInstanceId: this._exitLoopInstanceId, everyMs: Math.max(250, everyMs) },
+      "[dyn_exit] exit loop started",
     );
   }
 
@@ -4959,6 +4975,7 @@ class TradeManager {
    */
   async reconcile(tokens = []) {
     await this.init();
+    this._recoveryEpoch += 1;
 
     // 1) Read today's orders (used for mapping existing entry/sl/target)
     const orders = await this.kite.getOrders();
@@ -5779,6 +5796,98 @@ class TradeManager {
     };
   }
 
+  _resolveEntryFactsFromTrade(trade) {
+    const avgPrice = Number(trade?.entryPrice ?? trade?.entry?.avgPrice ?? 0);
+    const filledQty = Number(trade?.qty ?? trade?.entry?.filledQty ?? 0);
+    if (avgPrice > 0 && filledQty > 0) {
+      return {
+        avgPrice,
+        filledQty,
+        fillTime: trade?.entryFilledAt || trade?.entry?.fillTime || null,
+        source: "trade",
+      };
+    }
+    return null;
+  }
+
+  async _resolveEntryFactsForActiveTrade(trade, byId) {
+    const fromTrade = this._resolveEntryFactsFromTrade(trade);
+    if (fromTrade) return fromTrade;
+
+    const entryOrderId = String(trade?.entryOrderId || "");
+    const entryOrder = entryOrderId ? byId?.get?.(entryOrderId) : null;
+    const orderAvg = Number(entryOrder?.average_price ?? 0);
+    const orderQty = Number(entryOrder?.filled_quantity ?? 0);
+    if (orderAvg > 0 && orderQty > 0) {
+      return {
+        avgPrice: orderAvg,
+        filledQty: orderQty,
+        fillTime: entryOrder?.exchange_timestamp || trade?.entryFilledAt || null,
+        source: "executed_order",
+      };
+    }
+
+    try {
+      if (this.kite && typeof this.kite.getPositions === "function") {
+        const positions = await this.kite.getPositions();
+        const net = positions?.net || positions?.day || [];
+        const token = Number(trade?.instrument_token);
+        const pos = (net || []).find((p) => Number(p?.instrument_token) === token);
+        const posAvg = Number(pos?.average_price ?? pos?.buy_price ?? pos?.sell_price ?? 0);
+        const posQty = Math.abs(Number(pos?.quantity ?? pos?.net_quantity ?? 0));
+        if (posAvg > 0 && posQty > 0) {
+          return {
+            avgPrice: posAvg,
+            filledQty: posQty,
+            fillTime: trade?.entryFilledAt || trade?.createdAt || null,
+            source: "position",
+          };
+        }
+      }
+    } catch (e) {
+      logger.warn({ tradeId: trade?.tradeId, e: e?.message || String(e) }, "[dyn_exit] resolve entry facts via positions failed");
+    }
+
+    return null;
+  }
+
+  async _handleBlindExitEngine(trade) {
+    const tradeId = String(trade?.tradeId || "");
+    if (!tradeId) return;
+    const now = Date.now();
+    const st = this._pnlBlindStateByTrade.get(tradeId) || { count: 0, firstAt: now, lastAlertAt: 0 };
+    st.count += 1;
+    st.firstAt = st.firstAt || now;
+    this._pnlBlindStateByTrade.set(tradeId, st);
+
+    const shouldEscalate = st.count >= 3 || (now - st.firstAt) >= 2000;
+    if (!shouldEscalate) return;
+
+    logger.error({ tradeId, status: trade?.status, blindCount: st.count }, "PNL_UNAVAILABLE_ACTIVE_TRADE");
+    this.risk?.setKillSwitch?.(true);
+
+    const dedupMs = 60 * 1000;
+    if (now - Number(st.lastAlertAt || 0) >= dedupMs) {
+      st.lastAlertAt = now;
+      this._pnlBlindStateByTrade.set(tradeId, st);
+      alert("error", "⚠️ Exit engine blind: entry facts missing. Reconcile triggered.", {
+        tradeId,
+        status: trade?.status,
+        blindCount: st.count,
+      }).catch((err) => reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }));
+    }
+
+    try {
+      await this.reconcile([]);
+    } catch (e) {
+      logger.error({ tradeId, e: e?.message || String(e) }, "[dyn_exit] reconcile failed after pnl blind detection");
+    }
+  }
+
+  _resetBlindExitEngineState(tradeId) {
+    this._pnlBlindStateByTrade.delete(String(tradeId || ""));
+  }
+
   async _maybeDynamicAdjustExits(trade, byId) {
     if (String(env.DYNAMIC_EXITS_ENABLED) !== "true") return;
     if (
@@ -5891,10 +6000,36 @@ class TradeManager {
         return;
       }
 
+      const entryFacts = await this._resolveEntryFactsForActiveTrade(trade, byId);
+      if (!entryFacts) {
+        await this._handleBlindExitEngine(trade);
+        return;
+      }
+      this._resetBlindExitEngineState(tradeId);
+
+      const factsPatch = {};
+      if (!(Number(trade?.entryPrice) > 0)) factsPatch.entryPrice = entryFacts.avgPrice;
+      if (!(Number(trade?.qty) > 0)) factsPatch.qty = entryFacts.filledQty;
+      if (!trade?.entryFilledAt && entryFacts.fillTime) factsPatch.entryFilledAt = new Date(entryFacts.fillTime);
+      factsPatch.entry = {
+        avgPrice: entryFacts.avgPrice,
+        filledQty: entryFacts.filledQty,
+        fillTime: entryFacts.fillTime ? new Date(entryFacts.fillTime) : trade?.entryFilledAt || null,
+        source: entryFacts.source,
+      };
+      if (Object.keys(factsPatch).length) {
+        await updateTrade(tradeId, factsPatch);
+      }
+
       const peakFromTick = toFiniteOrNaN(this._dynPeakLtpByTrade.get(tradeId));
+      const tradeWithFacts = {
+        ...trade,
+        entryPrice: Number(trade?.entryPrice) > 0 ? trade.entryPrice : entryFacts.avgPrice,
+        qty: Number(trade?.qty) > 0 ? trade.qty : entryFacts.filledQty,
+      };
       const tradeForPlan = Number.isFinite(peakFromTick)
-        ? { ...trade, peakLtp: peakFromTick }
-        : trade;
+        ? { ...tradeWithFacts, peakLtp: peakFromTick }
+        : tradeWithFacts;
 
       const plan = computeDynamicExitPlan({
         trade: tradeForPlan,
@@ -5914,11 +6049,22 @@ class TradeManager {
       logger.info(
         {
           tradeId,
+          tradeStatus: trade?.status,
+          ltp,
+          entryAvgPrice: tradeForPlan?.entryPrice ?? "missing",
+          qty: tradeForPlan?.qty ?? "missing",
           pnlInr: plan?.meta?.pnlInr ?? null,
+          currentSL: Number(trade?.stopLoss ?? 0) || null,
+          desiredSL: plan?.meta?.desiredStopLoss ?? null,
           peakLtp: plan?.meta?.peakLtp ?? tradeForPlan?.peakLtp ?? null,
-          beLockHit: Boolean(plan?.meta?.beLockHit),
-          trailHit: Boolean(plan?.meta?.trailHit),
+          beLockArmed: Boolean(plan?.meta?.beLockArmed),
+          beLockFiredThisTick: Boolean(plan?.meta?.beLockFiredThisTick),
+          trailArmed: Boolean(plan?.meta?.trailArmed),
+          pendingMove: plan?.meta?.pendingMove ?? null,
+          trailStep: plan?.meta?.trailStep ?? null,
           skipReason: plan?.meta?.skipReason || null,
+          recoveryEpoch: this._recoveryEpoch,
+          exitLoopInstanceId: this._exitLoopInstanceId,
         },
         "[dyn_exit] eval",
       );
