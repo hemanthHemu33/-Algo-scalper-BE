@@ -36,6 +36,15 @@
   - `STOP_NEW_ENTRIES_AFTER=15:00`
   - `FORCE_FLATTEN_AT=15:15`
 
+### Runtime lifecycle (set for production)
+- `ENGINE_LIFECYCLE_ENABLED=true`
+- `ENGINE_WARMUP_HHMM=09:10`
+- `ENGINE_LIVE_HHMM=09:15`
+- `ENGINE_CLOSE_HHMM=15:30`
+- `MARKET_HOLIDAYS=<comma-separated YYYY-MM-DD list>`
+  - Example: `2026-01-26,2026-03-06,2026-08-15`
+  - Keep this list aligned with the exchange holiday calendar before each new trading year.
+
 ## 3) Telegram alerts
 - `TELEGRAM_ENABLED=true`
 - `TELEGRAM_BOT_TOKEN=<bot token>`
@@ -55,6 +64,7 @@ The bot will send alerts for:
    - `/health` is ok
    - `/ready` becomes ok after ticker connects
    - Telegram messages are received
+   - `/admin/status` shows lifecycle schedule values expected for production (`ENGINE_WARMUP_HHMM`, `ENGINE_LIVE_HHMM`, `ENGINE_CLOSE_HHMM`) and correct holiday coverage.
 3. Turn on `TRADING_ENABLED=true` during market hours only.
 4. During the first live sessions (and before any restart), verify no legacy trade statuses are stuck:
    ```bash
