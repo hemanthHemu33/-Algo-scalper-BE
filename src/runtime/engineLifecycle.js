@@ -287,6 +287,7 @@ function makeLifecycle(ops = {}) {
 
   async function setToken(accessToken) {
     const had = !!token;
+    const prevToken = token;
     token = accessToken ? String(accessToken) : null;
     if (!token && had) {
       await notifyLifecycle("TOKEN_MISSING", {});
@@ -297,6 +298,11 @@ function makeLifecycle(ops = {}) {
       await notifyLifecycle("TOKEN_RESTORED", {});
       await reconcileNow("token_restored");
       return;
+    }
+
+    const tokenChanged = !!token && prevToken !== token;
+    if (tokenChanged && (state === "WARMUP" || state === "LIVE" || state === "COOLDOWN")) {
+      await maybeStartSession("token_updated");
     }
 
     if (token) {
