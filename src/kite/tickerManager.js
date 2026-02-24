@@ -647,13 +647,18 @@ async function getOpenPositionsSummary() {
     return { openCount: open.length, positions: open };
   } catch (e) {
     logger.warn({ e: e?.message || String(e) }, "[kite] getOpenPositionsSummary failed");
-    return { openCount: 0, positions: [], error: e?.message || String(e) };
+    return {
+      openCount: null,
+      positions: [],
+      error: e?.message || String(e),
+    };
   }
 }
 
 async function isFlat() {
   const s = await getOpenPositionsSummary();
-  return Number(s?.openCount || 0) === 0;
+  if (s?.error) return false;
+  return Number(s?.openCount) === 0;
 }
 
 async function forceFlatten(reason = "ENGINE_FORCE_FLATTEN") {
