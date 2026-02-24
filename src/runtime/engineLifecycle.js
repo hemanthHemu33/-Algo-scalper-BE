@@ -109,6 +109,16 @@ function makeLifecycle(ops = {}) {
     return { nextAt: nextMarketDayStart(dt), nextState: "WARMUP" };
   }
 
+  function desiredStateAt(dt = nowIst()) {
+    if (!isMarketDay(dt)) return "IDLE";
+    const s = computeTodaySchedule(dt);
+    if (dt < s.warmupAt) return "IDLE";
+    if (dt < s.liveAt) return "WARMUP";
+    if (dt < s.closeAt) return "LIVE";
+    if (dt < s.idleAt) return "COOLDOWN";
+    return "IDLE";
+  }
+
   async function stopHeavy(reason) {
     await ops.setTradingEnabled?.(false, reason);
     await ops.stopSession?.(reason);
@@ -278,7 +288,12 @@ function makeLifecycle(ops = {}) {
     }
     if (token && !had) {
       await notifyLifecycle("TOKEN_RESTORED", {});
-      scheduleNext();
+      const target = desiredStateAt(nowIst());
+      if (target === "IDLE") {
+        scheduleNext();
+      } else {
+        await transit(target, "token_restored");
+      }
     }
   }
 
