@@ -15,6 +15,7 @@
 const { roundToTick } = require("./priceUtils");
 const { atr, rollingVWAP, maxHigh, minLow } = require("../strategy/utils");
 const { estimateRoundTripCostInr } = require("./costModel");
+const { getEffectivePrice } = require("../market/effectivePrice");
 
 function clamp(n, lo, hi) {
   if (!Number.isFinite(n)) return n;
@@ -187,6 +188,8 @@ function applyMinGreenExitRules({
   sl0,
   side,
   tick,
+  candles,
+  quoteSnapshot,
 }) {
   const qty = Number(trade?.qty ?? trade?.initialQty ?? 0);
   const minGreenEnabled = String(env.MIN_GREEN_ENABLED || "true") === "true";
@@ -209,7 +212,17 @@ function applyMinGreenExitRules({
       : null;
   const priceRisk = Math.abs(entry - sl0);
   const pnlPriceR = profitR({ side, entry, ltp, risk: priceRisk });
-  const peakLtpNow = bestPeakLtp({ trade, ltp, side });
+  const maxSpreadBpsForPeak = Number(env.MAX_SPREAD_BPS_FOR_PEAK_UPDATE ?? 80);
+  const maxQuoteAgeMsForPeak = Number(env.MAX_QUOTE_AGE_MS_FOR_PEAK_UPDATE ?? 1500);
+  const pxInfo = getEffectivePrice(
+    {
+      ...(quoteSnapshot || {}),
+      ltp,
+    },
+    { nowMs: now, maxSpreadBps: maxSpreadBpsForPeak, maxQuoteAgeMs: maxQuoteAgeMsForPeak },
+  );
+  const effectivePx = Number(pxInfo?.effectivePrice);
+  const peakLtpNow = bestPeakLtp({ trade, ltp: effectivePx, side });
   const peakPnlFromPriceInr = Number.isFinite(peakLtpNow)
     ? unrealizedPnlInr({ side, entry, ltp: peakLtpNow, qty })
     : null;
@@ -499,6 +512,10 @@ function applyMinGreenExitRules({
     tradePatch.beLocked = true;
     tradePatch.beLockedAt = new Date(now);
   }
+  if (beLockArmed) {
+    tradePatch.beArmed = true;
+    if (!trade?.beFiredTs) tradePatch.beFiredTs = tradePatch.beLockedAt || new Date(now);
+  }
   if (trailArmed && !trade?.trailLocked) {
     tradePatch.trailLocked = true;
     tradePatch.trailLockedAt = new Date(now);
@@ -606,10 +623,28 @@ function applyMinGreenExitRules({
   ) {
     const prevPeak = toFiniteOrNaN(trade?.peakLtp);
     let peakLtp = prevPeak;
-    if (side === "BUY") {
-      peakLtp = Number.isFinite(prevPeak) ? Math.max(prevPeak, ltp) : ltp;
-    } else {
-      peakLtp = Number.isFinite(prevPeak) ? Math.min(prevPeak, ltp) : ltp;
+    const recent = Array.isArray(trade?.recentEffectivePx) ? trade.recentEffectivePx.slice(-10) : [];
+    if (Number.isFinite(effectivePx)) recent.push(effectivePx);
+    const avg = recent.length ? recent.reduce((a, b) => a + Number(b || 0), 0) / recent.length : null;
+    const variance = recent.length
+      ? recent.reduce((acc, n) => acc + (Number(n || 0) - avg) ** 2, 0) / recent.length
+      : null;
+    const sigma = Number.isFinite(variance) ? Math.sqrt(variance) : null;
+    const outlierEnabled = String(env.PEAK_OUTLIER_FILTER || "true") === "true";
+    const outlierSigma = Number(env.PEAK_OUTLIER_SIGMA_MULT ?? 3.0);
+    const isOutlier =
+      outlierEnabled &&
+      Number.isFinite(effectivePx) &&
+      Number.isFinite(avg) &&
+      Number.isFinite(sigma) &&
+      sigma > 0 &&
+      Math.abs(effectivePx - avg) > outlierSigma * sigma;
+    const canUseForPeak = Boolean(Number.isFinite(effectivePx) && pxInfo?.spreadOk && pxInfo?.ageOk && !isOutlier);
+
+    if (side === "BUY" && canUseForPeak) {
+      peakLtp = Number.isFinite(prevPeak) ? Math.max(prevPeak, effectivePx) : effectivePx;
+    } else if (side === "SELL" && canUseForPeak) {
+      peakLtp = Number.isFinite(prevPeak) ? Math.min(prevPeak, effectivePx) : effectivePx;
     }
     const shouldTightenTrail =
       Number.isFinite(peakRForRules) &&
@@ -635,6 +670,7 @@ function applyMinGreenExitRules({
     if (!Number.isFinite(prevPeak) || peakLtp !== prevPeak) {
       tradePatch.peakLtp = peakLtp;
     }
+    if (recent.length) tradePatch.recentEffectivePx = recent.slice(-10);
     const curTrailSl = Number(trade?.trailSl);
     if (
       Number.isFinite(trailSl) &&
@@ -700,7 +736,17 @@ function applyMinGreenExitRules({
       ? env.DYN_STEP_TICKS_POST_BE ?? env.DYN_TRAIL_STEP_TICKS ?? 10
       : env.DYN_STEP_TICKS_PRE_BE ?? env.DYN_TRAIL_STEP_TICKS ?? 20,
   );
-  const step = stepTicks * tick;
+  let adaptiveStepTicks = stepTicks;
+  if (String(env.DYN_STEP_VOL_ADAPT || "false") === "true") {
+    const lookback = Number(env.DYN_STEP_VOL_LOOKBACK ?? 20);
+    const vol = premiumVolPct(candles, lookback);
+    const baseVol = Number(env.DYN_STEP_VOL_BASE_PCT ?? 1.2);
+    const minMult = Number(env.DYN_STEP_VOL_MIN_MULT ?? 0.5);
+    const maxMult = Number(env.DYN_STEP_VOL_MAX_MULT ?? 1.2);
+    const factor = Number.isFinite(vol) && Number.isFinite(baseVol) && baseVol > 0 ? vol / baseVol : 1;
+    adaptiveStepTicks = stepTicks * clamp(factor, minMult, maxMult);
+  }
+  const step = adaptiveStepTicks * tick;
   const curSlRounded = roundToTick(curSL, tick, side === "BUY" ? "down" : "up");
   const desiredStopLoss = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
   const tightenDelta = side === "BUY"
@@ -710,7 +756,14 @@ function applyMinGreenExitRules({
     Number.isFinite(curSlRounded) &&
     Number.isFinite(beFloor) &&
     (side === "BUY" ? curSlRounded < beFloor : curSlRounded > beFloor);
+  const lockCandidates = [beFloor, beProfitLockFloor, curSL].map((v) => Number(v)).filter((v) => Number.isFinite(v));
+  const activeLockFloorPrice = !lockCandidates.length
+    ? null
+    : side === "BUY"
+      ? Math.max(...lockCandidates)
+      : Math.min(...lockCandidates);
   const forceBePriorityMove = Boolean(!beApplied && beLockedNow && curSlBelowBeFloor);
+  const shouldForceApply = forceBePriorityMove || (Number.isFinite(activeLockFloorPrice) && Number.isFinite(desiredStopLoss) && (side === "BUY" ? desiredStopLoss <= activeLockFloorPrice : desiredStopLoss >= activeLockFloorPrice));
 
   const prevPendingMove = Number(trade?.trailPendingMove ?? 0);
   const pendingBase = Number.isFinite(prevPendingMove) && prevPendingMove > 0 ? prevPendingMove : 0;
@@ -780,6 +833,10 @@ function applyMinGreenExitRules({
     }
   }
 
+  if (Number.isFinite(activeLockFloorPrice)) {
+    tradePatch.activeLockFloorPrice = activeLockFloorPrice;
+  }
+
   if (forceBePriorityMove) {
     skipReasons.push("be_priority_sl_move");
   } else if (!shouldMoveSL) {
@@ -821,6 +878,15 @@ function applyMinGreenExitRules({
       trueBE: Number.isFinite(trueBE) ? trueBE : null,
       beFloor,
       beProfitLockFloor,
+      beArmed: beLockedNow,
+      beFiredTs: tradePatch.beLockedAt || trade?.beLockedAt || null,
+      activeLockFloorPrice: Number.isFinite(activeLockFloorPrice) ? activeLockFloorPrice : null,
+      effectivePrice: Number.isFinite(effectivePx) ? effectivePx : null,
+      effectivePriceSource: pxInfo?.source || null,
+      spreadBps: Number.isFinite(pxInfo?.spreadBps) ? pxInfo.spreadBps : null,
+      quoteAgeMs: Number.isFinite(pxInfo?.quoteAgeMs) ? pxInfo.quoteAgeMs : null,
+      shouldForceApply,
+      reasonCodes: skipReasons,
       estCostInr: Number.isFinite(estCostInr) ? estCostInr : null,
       desiredStopLoss: effectiveDesiredStopLoss,
       finalStopLoss,
@@ -837,6 +903,7 @@ function applyMinGreenExitRules({
       trailGapPostBePctTight,
       pendingMove: nextPendingMove,
       trailStep: step,
+      stepTicksApplied: adaptiveStepTicks,
       widenMult: Number.isFinite(widenMult) ? widenMult : null,
       maxRiskInr: Number.isFinite(maxRiskInr) ? maxRiskInr : null,
       maxRiskPts: Number.isFinite(maxRiskPts) ? maxRiskPts : null,
@@ -1127,6 +1194,7 @@ function computeDynamicExitPlan({
   nowTs,
   env,
   underlyingLtp = undefined,
+  quoteSnapshot = undefined,
 }) {
   const side = String(trade?.side || "").toUpperCase();
   const tick = Number(trade?.instrument?.tick_size ?? 0.05);
@@ -1355,6 +1423,8 @@ function computeDynamicExitPlan({
     sl0,
     side,
     tick,
+    candles,
+    quoteSnapshot,
   });
 }
 

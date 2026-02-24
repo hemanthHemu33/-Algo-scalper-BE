@@ -31,6 +31,7 @@ const {
   computeTargetFromRR,
 } = require("./optionSlFitter");
 const { getRecentCandles } = require("../market/candleStore");
+const { getEffectivePrice } = require("../market/effectivePrice");
 const {
   isQuoteGuardBreakerOpen,
   getQuoteGuardStats,
@@ -239,6 +240,7 @@ class TradeManager {
     }
 
     this.lastPriceByToken = new Map(); // token -> ltp
+    this.lastQuoteByToken = new Map(); // token -> latest quote snapshot
     this.lastTickAtByToken = new Map(); // token -> ts
     this.activeTradeId = null; // single-stock mode
     this.recoveredPosition = null; // set when positions exist but trade state missing
@@ -1424,6 +1426,14 @@ class TradeManager {
 
     const now = Date.now();
     this.lastTickAtByToken.set(token, now);
+    const bid = Number(tick?.depth?.buy?.[0]?.price);
+    const ask = Number(tick?.depth?.sell?.[0]?.price);
+    this.lastQuoteByToken.set(token, {
+      ltp: Number.isFinite(ltp) ? ltp : null,
+      bestBid: Number.isFinite(bid) ? bid : null,
+      bestAsk: Number.isFinite(ask) ? ask : null,
+      quoteTsMs: now,
+    });
 
     const lossEveryMs = Number(env.DAILY_LOSS_CHECK_MS ?? 2000);
     if (
@@ -1475,7 +1485,7 @@ class TradeManager {
 
     // Tick-accurate peak tracking for live trade
     try {
-      this._maybeUpdatePeakFromTick(token, ltp);
+      this._maybeUpdatePeakFromTick(token, tick);
     } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     // SL watchdog: track trigger crossings in fast moves (especially for SL-L fallback)
@@ -1506,8 +1516,9 @@ class TradeManager {
     }
   }
 
-  _maybeUpdatePeakFromTick(token, ltp) {
+  _maybeUpdatePeakFromTick(token, tick) {
     if (!this.activeTradeId) return;
+    const ltp = Number(tick?.last_price);
     if (!Number.isFinite(ltp) || ltp <= 0) return;
     if (!Number.isFinite(this._activeTradeToken)) return;
     if (Number(token) !== Number(this._activeTradeToken)) return;
@@ -1515,11 +1526,23 @@ class TradeManager {
     if (side !== "BUY" && side !== "SELL") return;
 
     const tradeId = String(this.activeTradeId);
+    const px = getEffectivePrice({
+      ltp,
+      bestBid: Number(tick?.depth?.buy?.[0]?.price),
+      bestAsk: Number(tick?.depth?.sell?.[0]?.price),
+      quoteTsMs: Date.now(),
+    }, {
+      nowMs: Date.now(),
+      maxSpreadBps: Number(env.MAX_SPREAD_BPS_FOR_PEAK_UPDATE ?? 80),
+      maxQuoteAgeMs: Number(env.MAX_QUOTE_AGE_MS_FOR_PEAK_UPDATE ?? 1500),
+    });
+    const peakCandidate = Number(px?.effectivePrice ?? ltp);
+    if (!Number.isFinite(peakCandidate) || peakCandidate <= 0) return;
     const prev = toFiniteOrNaN(this._dynPeakLtpByTrade.get(tradeId));
     let next = prev;
-    if (!Number.isFinite(prev)) next = ltp;
-    else if (side === "BUY") next = Math.max(prev, ltp);
-    else next = Math.min(prev, ltp);
+    if (!Number.isFinite(prev)) next = peakCandidate;
+    else if (side === "BUY") next = Math.max(prev, peakCandidate);
+    else next = Math.min(prev, peakCandidate);
 
     if (Number.isFinite(next)) {
       this._dynPeakLtpByTrade.set(tradeId, next);
@@ -4203,6 +4226,81 @@ class TradeManager {
     }
   }
 
+  _buildExitIntentId({ tradeId, desiredSLTrigger, desiredTP, version = 1 }) {
+    const payload = [
+      String(tradeId || ""),
+      Number(desiredSLTrigger ?? 0).toFixed(4),
+      Number(desiredTP ?? 0).toFixed(4),
+      String(version),
+    ].join("|");
+    return crypto.createHash("sha1").update(payload).digest("hex");
+  }
+
+  async _replaceStopLossOrder(trade, desiredStopLoss) {
+    const tradeId = String(trade?.tradeId || "");
+    const fresh = (await getTrade(tradeId)) || trade;
+    if (!fresh?.slOrderId) throw new Error("missing_sl_order_for_replace");
+    this.expectedCancelOrderIds.add(String(fresh.slOrderId));
+    await this._safeCancelOrder(env.DEFAULT_ORDER_VARIETY, fresh.slOrderId, {
+      purpose: "DYN_EXIT_SL_REPLACE_CANCEL",
+      tradeId,
+    });
+    await updateTrade(tradeId, {
+      slOrderId: null,
+      stopLoss: desiredStopLoss,
+      slTrigger: desiredStopLoss,
+      slReplaceCount: Math.max(0, Number(fresh?.slReplaceCount ?? 0)) + 1,
+    });
+    await this._placeExitsIfMissing({ ...fresh, stopLoss: desiredStopLoss, slOrderId: null });
+  }
+
+  async _handleDynSlEnforcementFailure({ trade, plan, error }) {
+    const tradeId = String(trade?.tradeId || "");
+    const now = Date.now();
+    const maxFails = Math.max(1, Number(env.DYN_EXIT_MODIFY_FAIL_MAX ?? 3));
+    const windowMs = Math.max(1000, Number(env.DYN_EXIT_MODIFY_FAIL_WINDOW_SEC ?? 20) * 1000);
+    const replaceMax = Math.max(0, Number(env.DYN_EXIT_REPLACE_MAX ?? 1));
+    const escalatePanic = String(env.DYN_EXIT_ESCALATE_TO_PANIC ?? "true") === "true";
+
+    const prevFirst = Number(new Date(trade?.slModifyFailFirstTs || 0).getTime());
+    const prevCount = Math.max(0, Number(trade?.slModifyFailCount ?? 0));
+    const inWindow = Number.isFinite(prevFirst) && prevFirst > 0 && now - prevFirst <= windowMs;
+    const nextCount = inWindow ? prevCount + 1 : 1;
+    const firstTs = inWindow ? prevFirst : now;
+
+    await updateTrade(tradeId, {
+      slModifyFailCount: nextCount,
+      slModifyFailFirstTs: new Date(firstTs),
+      beApplyFails: Math.max(0, Number(trade?.beApplyFails ?? 0)) + 1,
+    });
+
+    if (nextCount < maxFails) return { escalated: false };
+
+    const replaceCount = Math.max(0, Number(trade?.slReplaceCount ?? 0));
+    if (replaceCount < replaceMax) {
+      await this._replaceStopLossOrder(trade, Number(plan?.sl?.stopLoss));
+      await updateTrade(tradeId, { slModifyFailCount: 0, slModifyFailFirstTs: null });
+      await alert("error", "🚨 BE/TRAIL ENFORCEMENT ESCALATION: replaced SL", {
+        tradeId,
+        desiredStopLoss: Number(plan?.sl?.stopLoss ?? 0),
+        error: String(error?.message || error || "unknown"),
+      });
+      return { escalated: true, replaced: true };
+    }
+
+    if (escalatePanic) {
+      await alert("error", "🛑 PANIC EXIT due to SL enforcement failure", {
+        tradeId,
+        desiredStopLoss: Number(plan?.sl?.stopLoss ?? 0),
+        error: String(error?.message || error || "unknown"),
+      });
+      await this._panicExit(trade, "SL_ENFORCEMENT_FAILED", { allowWhenHalted: true, force: true });
+      await halt("SL_ENFORCEMENT_FAILED");
+      return { escalated: true, panic: true };
+    }
+    return { escalated: true };
+  }
+
   async _safeModifyOrder(
     variety,
     orderId,
@@ -6176,6 +6274,7 @@ class TradeManager {
         ? { ...tradeWithFacts, peakLtp: peakFromTick }
         : tradeWithFacts;
 
+      const quoteSnapshot = this.lastQuoteByToken.get(token) || { ltp, quoteTsMs: now };
       const plan = computeDynamicExitPlan({
         trade: tradeForPlan,
         ltp,
@@ -6183,6 +6282,7 @@ class TradeManager {
         nowTs: now,
         env,
         underlyingLtp: Number.isFinite(underlyingLtp) ? underlyingLtp : undefined,
+        quoteSnapshot,
       });
       if (!plan?.ok) {
         this._dynExitCadenceStats.evalNoPlan += 1;
@@ -6386,6 +6486,17 @@ class TradeManager {
             patch.price = nextLimitPrice;
           }
 
+          const intentId = this._buildExitIntentId({
+            tradeId,
+            desiredSLTrigger: Number(plan?.sl?.stopLoss ?? 0),
+            desiredTP: Number(plan?.target?.targetPrice ?? 0),
+            version: Number(trade?.exitIntentVersion ?? 1),
+          });
+          if (intentId && String(trade?.lastExitIntentId || "") === intentId) {
+            logger.info({ tradeId, intentId }, "[dyn_exit] idempotent SL intent; skipping broker modify");
+            return;
+          }
+
           const retryMeta = {
             type: "DYN_SL",
             token,
@@ -6439,6 +6550,10 @@ class TradeManager {
                 : beLockedNow
                   ? { beApplyFails: nextBeApplyFails }
                   : {}),
+              beArmed: Boolean(plan?.meta?.beArmed),
+              beFiredTs: plan?.meta?.beFiredTs || trade?.beFiredTs || null,
+              activeLockFloorPrice: Number.isFinite(Number(plan?.meta?.activeLockFloorPrice)) ? Number(plan.meta.activeLockFloorPrice) : null,
+              lastExitIntentId: intentId,
               ...this._eventPatch("SL_TRAILED", {
                 tradeId,
                 stopLoss: appliedTrigger,
@@ -6544,35 +6659,7 @@ class TradeManager {
               tradeId,
               Date.now() + Math.min(nextBackoff, maxBackoff),
             );
-            if (fails >= 3) {
-              this._dynExitDisabled.add(tradeId);
-              try {
-                await updateTrade(tradeId, {
-                  dynExitDisabled: true,
-                  dynExitDisabledAt: new Date(),
-                  ...this._eventPatch("TRAILING_DISABLED", {
-                    tradeId,
-                    failCount: fails,
-                  }),
-                });
-              } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
-              alert("error", "🛑 Trailing disabled after modify failures", {
-                tradeId,
-                failCount: fails,
-              }).catch((err) =>
-        reportWindowedFault({
-          code: "ALERT_SEND_FAILED",
-          windowKey: "alert_send_failed",
-          err,
-          message: "[alert] failed to dispatch notification",
-          meta: { context: "trade_manager" },
-        }),
-      );
-              logger.error(
-                { tradeId, failCount: fails },
-                "[dyn_exit] trailing disabled after failures",
-              );
-            }
+            await this._handleDynSlEnforcementFailure({ trade, plan, error: e });
             logger.warn(
               { tradeId, e: e.message, stopLoss: plan.sl.stopLoss },
               "[dyn_exit] SL modify failed",
