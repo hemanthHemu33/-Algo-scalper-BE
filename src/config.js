@@ -1039,6 +1039,20 @@ const schema = z.object({
   OPT_VOL_REF_ATR_PCT: z.coerce.number().default(0.6),
 });
 
+// Back-compat env aliases (common deployment docs/older setups).
+if (
+  !process.env.TOKENS_COLLECTION &&
+  String(process.env.KITE_TOKEN_COLLECTION || "").trim()
+) {
+  process.env.TOKENS_COLLECTION = String(process.env.KITE_TOKEN_COLLECTION);
+}
+if (
+  !process.env.DAILY_MAX_LOSS_INR &&
+  String(process.env.DAILY_MAX_LOSS || "").trim()
+) {
+  process.env.DAILY_MAX_LOSS_INR = String(process.env.DAILY_MAX_LOSS);
+}
+
 const env = schema.parse(process.env);
 
 // Back-compat mapping: allow older OPT_* env keys to drive the new canonical keys.
