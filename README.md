@@ -436,6 +436,10 @@ Useful CLI utilities:
   ```bash
   npm run health:critical
   ```
+- **Phase 8 live scenario matrix (A–E) against running stack**
+  ```bash
+  MATRIX_BASE_URL=http://localhost:4001 ADMIN_API_KEY=$ADMIN_API_KEY npm run test:phase8:live
+  ```
 - **Run backtest engine** (supports EQ and dynamic OPT contracts)
   ```bash
   npm run bt:run -- --mode=OPT --token=260105 --underlying="NIFTY 50" --dynamicContracts=true --from=2025-01-01 --to=2025-01-31 --interval=1 --qty=50 --forceEodExit=true
