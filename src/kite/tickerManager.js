@@ -91,6 +91,7 @@ function _modeStrSafe(v, def = "full") {
 }
 
 function _shouldControlTrading() {
+  if (_bool(env.ENGINE_LIFECYCLE_ENABLED, false)) return false;
   return _bool(env.MARKET_GATE_CONTROL_TRADING, true);
 }
 
