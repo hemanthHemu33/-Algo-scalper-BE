@@ -3766,13 +3766,36 @@ class TradeManager {
       return Number.isFinite(qty) && qty !== 0;
     });
 
-    if (!open.length) return;
+    const summary = {
+      ok: true,
+      reason: reason || "HARD_FLAT",
+      attempted: 0,
+      placed: 0,
+      failed: 0,
+      skipped: 0,
+      tokens: [],
+      errors: [],
+    };
+
+    if (!open.length) {
+      return {
+        ...summary,
+        openCount: 0,
+      };
+    }
+
+    summary.openCount = open.length;
 
     for (const p of open) {
       const qty = Number(p?.quantity ?? p?.net_quantity ?? 0);
       const token = Number(p?.instrument_token);
-      if (!Number.isFinite(qty) || qty === 0 || !Number.isFinite(token))
+      if (!Number.isFinite(qty) || qty === 0 || !Number.isFinite(token)) {
+        summary.skipped += 1;
         continue;
+      }
+
+      summary.attempted += 1;
+      summary.tokens.push(token);
 
       let instrument = null;
       try {
@@ -3796,13 +3819,26 @@ class TradeManager {
           purpose: reason || "HARD_FLAT",
           tradeId: null,
         });
+        summary.placed += 1;
       } catch (e) {
+        summary.failed += 1;
+        summary.ok = false;
+        summary.errors.push({
+          token,
+          message: e?.message || String(e),
+        });
         logger.error(
           { token, e: e?.message || String(e), reason },
           "[risk] flatten order failed",
         );
       }
     }
+
+    if (summary.attempted === 0 && summary.skipped > 0) {
+      summary.ok = false;
+    }
+
+    return summary;
   }
 
   _recordSlippageFeedback({ entrySlippageBps, pnlSlippageDeltaInr }) {

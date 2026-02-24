@@ -659,8 +659,12 @@ async function isFlat() {
 async function forceFlatten(reason = "ENGINE_FORCE_FLATTEN") {
   if (!pipeline?.trader?._flattenNetPositions) return { ok: false, reason: "FLATTEN_NOT_AVAILABLE" };
   try {
-    await pipeline.trader._flattenNetPositions(reason);
-    return { ok: true };
+    const result = await pipeline.trader._flattenNetPositions(reason);
+    return {
+      ok: !!result?.ok,
+      reason,
+      result: result || null,
+    };
   } catch (e) {
     logger.warn({ e: e?.message || String(e) }, "[kite] forceFlatten failed");
     return { ok: false, reason: e?.message || String(e) };

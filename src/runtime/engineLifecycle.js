@@ -59,6 +59,7 @@ function makeLifecycle(ops = {}) {
   let idleGuardTimer = null;
   let cooldownTimer = null;
   let forceFlattenStartedAt = 0;
+  let forceFlattenDeadlineHit = false;
 
   const nowIst = () => {
     if (cfg.testNowIso) {
@@ -113,6 +114,11 @@ function makeLifecycle(ops = {}) {
     await ops.stopSession?.(reason);
   }
 
+  function normalizeWarmupReason(reason) {
+    const base = String(reason || "scheduled").trim().toLowerCase().replace(/\s+/g, "_");
+    return base.startsWith("warmup") ? base : `warmup_${base}`;
+  }
+
   async function maybeStartSession(reason) {
     if (!token) return { ok: false, reason: "TOKEN_MISSING" };
     return ops.startSession?.(token, reason);
@@ -142,12 +148,33 @@ function makeLifecycle(ops = {}) {
       if (!forceFlattenStartedAt) {
         forceFlattenStartedAt = now.toMillis();
         await notifyLifecycle("FORCE_FLATTEN_START", { openCount });
-        await ops.forceFlatten?.("ENGINE_CLOSE_FORCE_FLATTEN");
+        const flattenRes = await ops.forceFlatten?.("ENGINE_CLOSE_FORCE_FLATTEN");
+        await notifyLifecycle("FORCE_FLATTEN_RESULT", {
+          ok: !!flattenRes?.ok,
+          openCount,
+          timedOut: false,
+          flatten: flattenRes || null,
+        });
       }
       const deadlineMs = cfg.forceFlattenDeadlineMin * 60 * 1000;
       const timedOut = now.toMillis() - forceFlattenStartedAt >= deadlineMs;
-      if (timedOut) {
-        await notifyLifecycle("FORCE_FLATTEN_RESULT", { ok: false, openCount, timedOut: true });
+      if (timedOut && !forceFlattenDeadlineHit) {
+        forceFlattenDeadlineHit = true;
+        await notifyLifecycle("FORCE_FLATTEN_RESULT", {
+          ok: false,
+          openCount,
+          timedOut: true,
+          action: "cooldown_deadline_forced_idle",
+          deadlineMin: cfg.forceFlattenDeadlineMin,
+        });
+        await stopHeavy("cooldown_deadline_elapsed");
+        state = "IDLE";
+        await notifyLifecycle("IDLE_ENTER", {
+          reason: "cooldown_deadline_elapsed",
+          openCount,
+        });
+        scheduleNext();
+        return;
       }
     }
 
@@ -174,8 +201,9 @@ function makeLifecycle(ops = {}) {
         state = "IDLE";
       } else {
         state = "WARMUP";
-        await ops.setTradingEnabled?.(false, "warmup");
-        await notifyLifecycle("WARMUP_START", { reason });
+        const warmupReason = normalizeWarmupReason(reason);
+        await ops.setTradingEnabled?.(false, warmupReason);
+        await notifyLifecycle("WARMUP_START", { reason: warmupReason });
       }
     } else if (target === "LIVE") {
       await maybeStartSession(reason);
@@ -188,6 +216,7 @@ function makeLifecycle(ops = {}) {
       const p = await ops.getOpenPositionsSummary?.();
       await notifyLifecycle("CLOSE_START", { openCount: Number(p?.openCount || 0), requireFlat: cfg.requireFlat, forceFlatten: cfg.forceFlatten });
       forceFlattenStartedAt = 0;
+      forceFlattenDeadlineHit = false;
       await evaluateCooldown();
       return;
     } else {
