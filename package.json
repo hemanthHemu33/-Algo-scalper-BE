@@ -13,7 +13,9 @@
     "bt:run": "node scripts/bt_run.js",
     "bt:prepare-options": "node scripts/bt_prepare_option_universe.js",
     "test:dynexit": "node scripts/dyn_exit_scenarios.js",
-    "test": "node --check src/index.js"
+    "test": "node --check src/index.js",
+    "test:recovery-gate": "node scripts/test_recovery_coordinator_gate.js",
+    "test:stale-merge": "node scripts/test_stale_event_merge_regression.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

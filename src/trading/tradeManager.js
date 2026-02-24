@@ -357,6 +357,15 @@ class TradeManager {
     this._timeStopEscalationAt = new Map();
     this._timeStopFallbackTimers = new Map();
     this._pnlBlindStateByTrade = new Map(); // tradeId -> {count, firstAt, lastAlertAt}
+    this._factRecoveryGate = {
+      blockedTicks: 0,
+      resumedTicks: 0,
+      lastBlockedAt: null,
+      lastResumedAt: null,
+      lastReason: null,
+      blockers: [],
+      reconcileInFlight: false,
+    };
     this._recoveryEpoch = 0;
     this._initialized = false;
 
@@ -900,7 +909,7 @@ class TradeManager {
 
   async _hydrateLiveOrderSnapshotsFromDb() {
     try {
-      const actives = await getActiveTrades();
+      const actives = await this._getActiveTradesForFactGate();
       const tradeIds = (actives || []).map((t) => t?.tradeId).filter(Boolean);
       if (!tradeIds.length) return;
 
@@ -1044,6 +1053,9 @@ class TradeManager {
       )
         return;
       this._syncActiveTradeState(trade);
+
+      const gate = await this._globalFactRecoveryGate(this._lastOrdersById);
+      if (!gate?.ok) return;
 
       await this._maybeDynamicAdjustExits(trade, this._lastOrdersById);
     } finally {
@@ -1322,7 +1334,7 @@ class TradeManager {
   }
 
   async _loadActiveTradeId() {
-    const actives = await getActiveTrades();
+    const actives = await this._getActiveTradesForFactGate();
     await this._restoreDynamicExitState(actives);
     if (actives.length) {
       const latest = actives.sort(
@@ -5810,10 +5822,7 @@ class TradeManager {
     return null;
   }
 
-  async _resolveEntryFactsForActiveTrade(trade, byId) {
-    const fromTrade = this._resolveEntryFactsFromTrade(trade);
-    if (fromTrade) return fromTrade;
-
+  _resolveEntryFactsFromOrderMap(trade, byId) {
     const entryOrderId = String(trade?.entryOrderId || "");
     const entryOrder = entryOrderId ? byId?.get?.(entryOrderId) : null;
     const orderAvg = Number(entryOrder?.average_price ?? 0);
@@ -5826,23 +5835,123 @@ class TradeManager {
         source: "executed_order",
       };
     }
+    return null;
+  }
+
+  _resolveEntryFactsFromPosition(trade, positions) {
+    const token = Number(trade?.instrument_token);
+    if (!Number.isFinite(token)) return null;
+    const pos = (positions || []).find((p) => Number(p?.instrument_token) === token);
+    if (!pos) return null;
+    const posAvg = Number(pos?.average_price ?? pos?.buy_price ?? pos?.sell_price ?? 0);
+    const posQty = Math.abs(Number(pos?.quantity ?? pos?.net_quantity ?? 0));
+    if (posAvg > 0 && posQty > 0) {
+      return {
+        avgPrice: posAvg,
+        filledQty: posQty,
+        fillTime: trade?.entryFilledAt || trade?.createdAt || null,
+        source: "position",
+      };
+    }
+    return null;
+  }
+
+  async _getActiveTradesForFactGate() {
+    return getActiveTrades();
+  }
+
+  async _updateTradeFacts(tradeId, patch) {
+    return updateTrade(tradeId, patch);
+  }
+
+  async _globalFactRecoveryGate(byId) {
+    const actives = await this._getActiveTradesForFactGate();
+    if (!Array.isArray(actives) || !actives.length) {
+      this._factRecoveryGate.resumedTicks += 1;
+      this._factRecoveryGate.lastResumedAt = Date.now();
+      this._factRecoveryGate.lastReason = null;
+      this._factRecoveryGate.blockers = [];
+      return { ok: true, blockers: [] };
+    }
+
+    let positions = [];
+    try {
+      if (this.kite && typeof this.kite.getPositions === "function") {
+        const p = await this.kite.getPositions();
+        positions = p?.net || p?.day || [];
+      }
+    } catch (e) {
+      logger.warn({ e: e?.message || String(e) }, "[dyn_exit] global fact gate: getPositions failed");
+    }
+
+    const blockers = [];
+    for (const t of actives) {
+      const dbFacts = this._resolveEntryFactsFromTrade(t);
+      const orderFacts = this._resolveEntryFactsFromOrderMap(t, byId);
+      const posFacts = this._resolveEntryFactsFromPosition(t, positions);
+      const resolved = dbFacts || orderFacts || posFacts;
+
+      if (!resolved) {
+        blockers.push({ tradeId: t?.tradeId, reason: "MISSING_DB_BROKER_EXEC_FACTS" });
+        continue;
+      }
+
+      const patch = {};
+      if (!(Number(t?.entryPrice) > 0)) patch.entryPrice = resolved.avgPrice;
+      if (!(Number(t?.qty) > 0)) patch.qty = resolved.filledQty;
+      if (!t?.entryFilledAt && resolved.fillTime) patch.entryFilledAt = new Date(resolved.fillTime);
+      patch.entry = {
+        avgPrice: resolved.avgPrice,
+        filledQty: resolved.filledQty,
+        fillTime: resolved.fillTime ? new Date(resolved.fillTime) : t?.entryFilledAt || null,
+        source: resolved.source,
+      };
+      if (Object.keys(patch).length) {
+        await this._updateTradeFacts(String(t.tradeId), patch);
+      }
+    }
+
+    if (blockers.length) {
+      const now = Date.now();
+      this._factRecoveryGate.blockedTicks += 1;
+      this._factRecoveryGate.lastBlockedAt = now;
+      this._factRecoveryGate.lastReason = "FACT_INCOMPLETE";
+      this._factRecoveryGate.blockers = blockers;
+      logger.warn({ blockers, recoveryEpoch: this._recoveryEpoch }, "[dyn_exit] global gate blocked until active trades are fact-complete");
+
+      if (!this._factRecoveryGate.reconcileInFlight) {
+        this._factRecoveryGate.reconcileInFlight = true;
+        this.reconcile([])
+          .catch((e) => {
+            logger.error({ e: e?.message || String(e), blockers }, "[dyn_exit] global fact gate reconcile failed");
+          })
+          .finally(() => {
+            this._factRecoveryGate.reconcileInFlight = false;
+          });
+      }
+      return { ok: false, blockers };
+    }
+
+    this._factRecoveryGate.resumedTicks += 1;
+    this._factRecoveryGate.lastResumedAt = Date.now();
+    this._factRecoveryGate.lastReason = null;
+    this._factRecoveryGate.blockers = [];
+    return { ok: true, blockers: [] };
+  }
+
+  async _resolveEntryFactsForActiveTrade(trade, byId) {
+    const fromTrade = this._resolveEntryFactsFromTrade(trade);
+    if (fromTrade) return fromTrade;
+
+    const fromOrder = this._resolveEntryFactsFromOrderMap(trade, byId);
+    if (fromOrder) return fromOrder;
 
     try {
       if (this.kite && typeof this.kite.getPositions === "function") {
         const positions = await this.kite.getPositions();
         const net = positions?.net || positions?.day || [];
-        const token = Number(trade?.instrument_token);
-        const pos = (net || []).find((p) => Number(p?.instrument_token) === token);
-        const posAvg = Number(pos?.average_price ?? pos?.buy_price ?? pos?.sell_price ?? 0);
-        const posQty = Math.abs(Number(pos?.quantity ?? pos?.net_quantity ?? 0));
-        if (posAvg > 0 && posQty > 0) {
-          return {
-            avgPrice: posAvg,
-            filledQty: posQty,
-            fillTime: trade?.entryFilledAt || trade?.createdAt || null,
-            source: "position",
-          };
-        }
+        const fromPos = this._resolveEntryFactsFromPosition(trade, net || []);
+        if (fromPos) return fromPos;
       }
     } catch (e) {
       logger.warn({ tradeId: trade?.tradeId, e: e?.message || String(e) }, "[dyn_exit] resolve entry facts via positions failed");
@@ -12755,6 +12864,7 @@ class TradeManager {
       dailyRiskReason: risk?.stateReason || null,
       ordersPlacedToday: this.ordersPlacedToday,
       dynamicExitCadence: this._dynExitCadenceSnapshot(),
+      factRecoveryGate: { ...this._factRecoveryGate },
       orphanReplay: { ...this._orphanReplayStats },
       faults: snapshotFaults(),
     };
