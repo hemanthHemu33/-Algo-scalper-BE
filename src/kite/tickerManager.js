@@ -8,7 +8,10 @@ const { buildFnoUniverse, getLastFnoUniverse } = require("../fno/fnoUniverse");
 const { logger } = require("../logger");
 const { alert } = require("../alerts/alertService");
 const { isHalted } = require("../runtime/halt");
-const { setTradingEnabled } = require("../runtime/tradingEnabled");
+const {
+  setTradingEnabled,
+  getTradingEnabled,
+} = require("../runtime/tradingEnabled");
 const { createTicker, createKiteConnect } = require("./kiteClients");
 const { buildPipeline } = require("../pipeline");
 const { updateFromTicks } = require("../market/ltpStream");
@@ -173,6 +176,7 @@ function startTickWatchdog() {
       logger.warn({ e: e?.message || String(e) }, "[ticks] resubscribe failed");
     }
   }, Math.max(1000, intervalMs));
+  tickWatchdogTimer.unref?.();
 }
 
 function startTickTapLogger() {
@@ -181,6 +185,7 @@ function startTickTapLogger() {
     logger.info({ ticks10s: tickTapCount }, "[ticktap]");
     tickTapCount = 0;
   }, 10000);
+  tickTapTimer.unref?.();
 }
 
 function stopTickWatchdog() {
@@ -448,6 +453,7 @@ function startOcoReconcileLoop() {
     },
     Math.max(1, everySec) * 1000,
   );
+  ocoReconcileTimer.unref?.();
 }
 
 function stopOcoReconcileLoop() {
@@ -490,6 +496,7 @@ function startReconcileLoop() {
         ),
       );
   }, sec * 1000);
+  reconcileTimer.unref?.();
 }
 
 async function drainTicks() {
@@ -590,6 +597,74 @@ async function setSession(accessToken) {
   startTickTapLogger();
 
   currentToken = accessToken;
+}
+
+async function startSession(accessToken, reason = "manual_start") {
+  const token = String(accessToken || "").trim();
+  if (!token) {
+    return { ok: false, reason: "TOKEN_MISSING" };
+  }
+  if (currentToken === token && tickerConnected && pipeline) {
+    return { ok: true, reason: "ALREADY_RUNNING" };
+  }
+  await setSession(token);
+  logger.info({ reason }, "[kite] startSession complete");
+  return { ok: true, reason: "STARTED" };
+}
+
+async function stopSession(reason = "manual_stop") {
+  if (!currentToken && !pipeline && !ticker) {
+    return { ok: true, reason: "ALREADY_STOPPED" };
+  }
+  await teardownActiveSession(reason);
+  return { ok: true, reason: "STOPPED" };
+}
+
+async function setSessionTradingEnabled(enabled, reason = "runtime") {
+  const status = setTradingEnabled(!!enabled);
+  logger.info({ enabled: status.enabled, source: status.source, reason }, "[trade] tradingEnabled updated");
+  return { ok: true, ...status };
+}
+
+async function getSessionStatus() {
+  return {
+    tickerConnected,
+    pipelineReady: !!pipeline,
+    tradingEnabled: getTradingEnabled(),
+    hasSession: !!currentToken,
+    lastTickAt: lastTickAt || null,
+    lastDisconnect,
+    subscribedTokens: Array.from(subscribedTokens || []).length,
+  };
+}
+
+async function getOpenPositionsSummary() {
+  if (!kite || !currentToken) return { openCount: 0, positions: [] };
+  try {
+    const positions = await kite.getPositions();
+    const net = positions?.net || positions?.day || [];
+    const open = (Array.isArray(net) ? net : []).filter((p) => Number(p?.quantity ?? p?.net_quantity ?? 0) !== 0);
+    return { openCount: open.length, positions: open };
+  } catch (e) {
+    logger.warn({ e: e?.message || String(e) }, "[kite] getOpenPositionsSummary failed");
+    return { openCount: 0, positions: [], error: e?.message || String(e) };
+  }
+}
+
+async function isFlat() {
+  const s = await getOpenPositionsSummary();
+  return Number(s?.openCount || 0) === 0;
+}
+
+async function forceFlatten(reason = "ENGINE_FORCE_FLATTEN") {
+  if (!pipeline?.trader?._flattenNetPositions) return { ok: false, reason: "FLATTEN_NOT_AVAILABLE" };
+  try {
+    await pipeline.trader._flattenNetPositions(reason);
+    return { ok: true };
+  } catch (e) {
+    logger.warn({ e: e?.message || String(e) }, "[kite] forceFlatten failed");
+    return { ok: false, reason: e?.message || String(e) };
+  }
 }
 
 function wireEvents() {
@@ -857,6 +932,13 @@ async function shutdownAll(reason = "shutdown") {
 
 module.exports = {
   setSession,
+  startSession,
+  stopSession,
+  setTradingEnabled: setSessionTradingEnabled,
+  getSessionStatus,
+  getOpenPositionsSummary,
+  isFlat,
+  forceFlatten,
   getPipeline,
   getTickerStatus,
   getSubscribedTokens,
