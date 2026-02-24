@@ -23,6 +23,18 @@ services:
       # ---- TRADING ----
       # - TRADING_ENABLED ("true" when ready)
       # - DEFAULT_PRODUCT (MIS)
+      # ---- ENGINE LIFECYCLE (production schedule) ----
+      - key: ENGINE_LIFECYCLE_ENABLED
+        value: "true"
+      - key: ENGINE_WARMUP_HHMM
+        value: "09:10"
+      - key: ENGINE_LIVE_HHMM
+        value: "09:15"
+      - key: ENGINE_CLOSE_HHMM
+        value: "15:30"
+      # Comma-separated YYYY-MM-DD market holidays (keep updated each exchange calendar year)
+      - key: MARKET_HOLIDAYS
+        value: ""
       # ---- TELEGRAM ----
       # - TELEGRAM_ENABLED ("true")
       # - TELEGRAM_BOT_TOKEN

@@ -137,11 +137,12 @@ function makeLifecycle(ops = {}) {
   async function evaluateCooldown(now = nowIst()) {
     if (state !== "COOLDOWN") return;
     let flat = true;
-    let openCount = 0;
+    let openCount = null;
     try {
       const p = await ops.getOpenPositionsSummary?.();
-      openCount = Number(p?.openCount || 0);
-      flat = openCount === 0;
+      const hasError = !!p?.error;
+      openCount = Number.isFinite(Number(p?.openCount)) ? Number(p.openCount) : null;
+      flat = !hasError && openCount === 0;
     } catch {
       flat = false;
     }
@@ -195,7 +196,10 @@ function makeLifecycle(ops = {}) {
   }
 
   async function transit(target, reason = "schedule") {
-    if (state === target) return;
+    if (state === target) {
+      scheduleNext();
+      return;
+    }
     logger.info({ from: state, to: target, reason }, "[lifecycle] transition");
 
     if (!token && target !== "IDLE") {
@@ -224,7 +228,13 @@ function makeLifecycle(ops = {}) {
       state = "COOLDOWN";
       await ops.setTradingEnabled?.(false, "close");
       const p = await ops.getOpenPositionsSummary?.();
-      await notifyLifecycle("CLOSE_START", { openCount: Number(p?.openCount || 0), requireFlat: cfg.requireFlat, forceFlatten: cfg.forceFlatten });
+      const openCount = Number.isFinite(Number(p?.openCount)) ? Number(p.openCount) : null;
+      await notifyLifecycle("CLOSE_START", {
+        openCount,
+        flatCheckError: p?.error || null,
+        requireFlat: cfg.requireFlat,
+        forceFlatten: cfg.forceFlatten,
+      });
       forceFlattenStartedAt = 0;
       forceFlattenDeadlineHit = false;
       await evaluateCooldown();
@@ -236,6 +246,11 @@ function makeLifecycle(ops = {}) {
     }
 
     scheduleNext();
+  }
+
+  async function reconcileNow(reason = "reconcile") {
+    const target = desiredStateAt(nowIst());
+    await transit(target, reason);
   }
 
   function scheduleNext() {
@@ -274,12 +289,12 @@ function makeLifecycle(ops = {}) {
   async function start() {
     if (!cfg.enabled) return;
     startIdleGuard();
-    await transit("IDLE", "startup");
-    scheduleNext();
+    await reconcileNow("startup");
   }
 
   async function setToken(accessToken) {
     const had = !!token;
+    const prevToken = token;
     token = accessToken ? String(accessToken) : null;
     if (!token && had) {
       await notifyLifecycle("TOKEN_MISSING", {});
@@ -288,12 +303,17 @@ function makeLifecycle(ops = {}) {
     }
     if (token && !had) {
       await notifyLifecycle("TOKEN_RESTORED", {});
-      const target = desiredStateAt(nowIst());
-      if (target === "IDLE") {
-        scheduleNext();
-      } else {
-        await transit(target, "token_restored");
-      }
+      await reconcileNow("token_restored");
+      return;
+    }
+
+    const tokenChanged = !!token && prevToken !== token;
+    if (tokenChanged && (state === "WARMUP" || state === "LIVE" || state === "COOLDOWN")) {
+      await maybeStartSession("token_updated");
+    }
+
+    if (token) {
+      await reconcileNow("token_updated");
     }
   }
 
