@@ -137,11 +137,12 @@ function makeLifecycle(ops = {}) {
   async function evaluateCooldown(now = nowIst()) {
     if (state !== "COOLDOWN") return;
     let flat = true;
-    let openCount = 0;
+    let openCount = null;
     try {
       const p = await ops.getOpenPositionsSummary?.();
-      openCount = Number(p?.openCount || 0);
-      flat = openCount === 0;
+      const hasError = !!p?.error;
+      openCount = Number.isFinite(Number(p?.openCount)) ? Number(p.openCount) : null;
+      flat = !hasError && openCount === 0;
     } catch {
       flat = false;
     }
@@ -227,7 +228,13 @@ function makeLifecycle(ops = {}) {
       state = "COOLDOWN";
       await ops.setTradingEnabled?.(false, "close");
       const p = await ops.getOpenPositionsSummary?.();
-      await notifyLifecycle("CLOSE_START", { openCount: Number(p?.openCount || 0), requireFlat: cfg.requireFlat, forceFlatten: cfg.forceFlatten });
+      const openCount = Number.isFinite(Number(p?.openCount)) ? Number(p.openCount) : null;
+      await notifyLifecycle("CLOSE_START", {
+        openCount,
+        flatCheckError: p?.error || null,
+        requireFlat: cfg.requireFlat,
+        forceFlatten: cfg.forceFlatten,
+      });
       forceFlattenStartedAt = 0;
       forceFlattenDeadlineHit = false;
       await evaluateCooldown();
