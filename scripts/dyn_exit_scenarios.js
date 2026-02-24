@@ -287,6 +287,41 @@ const scenarios = [
     },
   },
   {
+    name: 'trail accumulation keeps SL monotonic across incremental favorable ticks',
+    run: () => {
+      const trade = makeTrade({
+        stopLoss: 95,
+        initialStopLoss: 90,
+      });
+      const env = makeEnv({
+        BE_ARM_R: 0.2,
+        TRAIL_ARM_R: 0.2,
+        DYN_TRAIL_STEP_TICKS: 1,
+        DYN_STEP_TICKS_PRE_BE: 1,
+        DYN_STEP_TICKS_POST_BE: 1,
+        PROFIT_LOCK_ENABLED: 'false',
+      });
+
+      const { plans } = runFeed({
+        trade,
+        env,
+        points: [
+          { min: 1, ltp: 102, underlyingLtp: 20005 },
+          { min: 2, ltp: 103, underlyingLtp: 20010 },
+          { min: 3, ltp: 104, underlyingLtp: 20015 },
+        ],
+      });
+
+      const slValues = plans
+        .map((p) => Number(p?.meta?.desiredStopLoss ?? p?.sl?.stopLoss ?? NaN))
+        .filter((n) => Number.isFinite(n));
+      assert.ok(slValues.length >= 2, 'need multiple trail computations');
+      for (let i = 1; i < slValues.length; i++) {
+        assert.ok(slValues[i] >= slValues[i - 1], 'SL should only tighten as trail accumulates');
+      }
+    },
+  },
+  {
     name: 'latch prevents repeated alert patching',
     run: () => {
       const env = makeEnv();
