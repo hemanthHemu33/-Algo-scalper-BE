@@ -246,6 +246,8 @@ const schema = z.object({
   OPT_STRICT_ATM_ONLY: boolFromEnv.default(true),
   // Hard reject if no candidate passes spread/depth/premium gates
   OPT_PICK_REQUIRE_OK: boolFromEnv.default(true),
+  // Enforce that selected options contract must fit 1-lot risk budget
+  OPT_RISK_FIT_ENABLED: boolFromEnv.default(true),
   // Debug: attach the top-N option candidates to last pick metadata (0 disables). Max 10.
   OPT_PICK_DEBUG_TOP_N: z.coerce.number().default(0),
 
@@ -567,6 +569,26 @@ const schema = z.object({
   // Risk limits
   RISK_PER_TRADE_INR: z.coerce.number().default(450),
   DAILY_PROFIT_GOAL_INR: z.coerce.number().default(2000),
+  RISK_BUDGET_ENABLED: boolFromEnv.default(true),
+  RISK_EQUITY_SOURCE: z.string().default("AVAILABLE_MARGIN"),
+  RISK_EQUITY_FIXED_INR: z.coerce.number().default(0),
+  RISK_EQUITY_FLOOR_INR: z.coerce.number().default(0),
+  RISK_BASE_PCT_PER_TRADE: z.coerce.number().default(0.0035),
+  RISK_VOL_TARGET_BPS: z.coerce.number().default(65),
+  RISK_VOL_SCALER_MIN: z.coerce.number().default(0.65),
+  RISK_VOL_SCALER_MAX: z.coerce.number().default(1.4),
+  RISK_VOL_LOOKBACK_BARS: z.coerce.number().default(20),
+  RISK_TRADE_R_MIN: z.coerce.number().default(0.6),
+  RISK_TRADE_R_BASE: z.coerce.number().default(1.0),
+  RISK_TRADE_R_MAX: z.coerce.number().default(1.25),
+  RISK_SCALE_BY_CONFIDENCE: boolFromEnv.default(true),
+  RISK_SCALE_BY_REGIME: boolFromEnv.default(true),
+  RISK_SCALE_BY_SPREAD: boolFromEnv.default(true),
+  DAILY_DD_THROTTLE_R: z.coerce.number().default(2.0),
+  DAILY_DD_PAUSE_R: z.coerce.number().default(3.0),
+  DAILY_PROFIT_LOCK_START_R: z.coerce.number().default(2.0),
+  DAILY_DD_THROTTLE_RISK_MULT: z.coerce.number().default(0.6),
+  DAILY_PROFIT_LOCK_RISK_MULT: z.coerce.number().default(0.5),
 
   // Exit management (min-green, breakeven lock, trailing, time stop)
   MIN_GREEN_ENABLED: z.string().default("true"),
@@ -878,6 +900,13 @@ const schema = z.object({
   // Cost/edge gating (prevents tiny targets that cannot beat costs)
   ENABLE_COST_GATE: z.string().default("true"),
   COST_GATE_MULT: z.coerce.number().default(3), // expected move must be >= 3x estimated all-in costs
+  COST_GATE_DYNAMIC_ENABLED: boolFromEnv.default(true),
+  COST_GATE_MULT_MIN: z.coerce.number().default(2.5),
+  COST_GATE_MULT_MAX: z.coerce.number().default(4.0),
+  COST_GATE_MULT_OPT_BONUS: z.coerce.number().default(0.3),
+  COST_GATE_MULT_WIDE_SPREAD_BONUS: z.coerce.number().default(0.5),
+  COST_GATE_MULT_PROFIT_LOCK_BONUS: z.coerce.number().default(0.2),
+  COST_GATE_MULT_THROTTLED_BONUS: z.coerce.number().default(0.35),
   // Planned fee-multiple gate: (plannedProfit @ RR target) / estCosts. 0 disables.
   FEE_MULTIPLE_PLANNED_MIN: z.coerce.number().default(0),
   EXPECTED_MOVE_ATR_PERIOD: z.coerce.number().default(14),
@@ -1182,6 +1211,10 @@ function validateProfileCombos() {
     failOrWarn(
       "[config] Unsafe combo: FORCE_ONE_LOT with very low RISK_PER_TRADE_INR may block trades or force oversized risk.",
     );
+  }
+
+  if (env.RISK_BUDGET_ENABLED) {
+    env.FNO_MIN_LOT_POLICY = "STRICT";
   }
 
   const optTpEnabled = String(env.OPT_TP_ENABLED || "false") === "true";

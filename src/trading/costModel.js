@@ -115,6 +115,34 @@ function getCalibrationMultiplier(segKey, env) {
   }
 }
 
+
+function resolveCostGateMultiple({ env, instrument, spreadBps, ctx } = {}) {
+  const base = n(env?.COST_GATE_MULT, 3);
+  const dynEnabled = String(env?.COST_GATE_DYNAMIC_ENABLED || "false") === "true";
+  if (!dynEnabled) return base;
+
+  let k = base;
+  const seg = segmentKeyFromContext({ instrument, env });
+  if (seg === "OPT") k += n(env?.COST_GATE_MULT_OPT_BONUS, 0.3);
+
+  const spread = n(spreadBps, NaN);
+  const wideSpreadBps = n(env?.OPT_MAX_SPREAD_BPS, 35);
+  if (Number.isFinite(spread) && spread >= wideSpreadBps) {
+    k += n(env?.COST_GATE_MULT_WIDE_SPREAD_BONUS, 0.5);
+  }
+
+  const dayState = up(ctx?.dayState);
+  if (dayState === "THROTTLED") k += n(env?.COST_GATE_MULT_THROTTLED_BONUS, 0.35);
+  if (dayState === "PROFIT_LOCK") k += n(env?.COST_GATE_MULT_PROFIT_LOCK_BONUS, 0.2);
+
+  const regime = up(ctx?.regime);
+  if (regime.includes("RANGE")) k += 0.15;
+
+  const kMin = n(env?.COST_GATE_MULT_MIN, 2.5);
+  const kMax = n(env?.COST_GATE_MULT_MAX, 4.0);
+  return clamp(k, Math.min(kMin, kMax), Math.max(kMin, kMax));
+}
+
 /**
  * Estimate all-in round-trip cost in INR.
  *
@@ -209,6 +237,7 @@ function costGate({
   instrument,
   segmentKey,
   product,
+  ctx,
 } = {}) {
   const price = n(entryPrice);
   const sl = n(stopLoss);
@@ -289,7 +318,7 @@ function costGate({
 
   // 2) Edge gate: expected move should be >= K * all-in costs
   if (String(env.ENABLE_COST_GATE) === "true") {
-    const k = n(env.COST_GATE_MULT, 3);
+    const k = resolveCostGateMultiple({ env, instrument, spreadBps, ctx });
     if (Number.isFinite(expMoveInr) && expMoveInr > 0) {
       if (expMoveInr < k * estCostInr) {
         return {
@@ -306,6 +335,8 @@ function costGate({
             plannedProfitInr,
             feeMultiplePlanned,
             ...(costMeta || {}),
+            dayState: ctx?.dayState || null,
+            regime: ctx?.regime || null,
           },
         };
       }

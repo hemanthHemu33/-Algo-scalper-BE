@@ -303,11 +303,9 @@ function applyMinGreenExitRules({
     Number.isFinite(estCostInr) && estCostInr > 0 && Number.isFinite(beArmCostMult) && beArmCostMult > 0
       ? beArmCostMult * estCostInr
       : null;
-  const beLockAtFallback = Number(env.BE_LOCK_AT_PROFIT_INR ?? 0);
   const beLockAt = Math.max(
     Number.isFinite(beLockAtFromR) ? beLockAtFromR : 0,
     Number.isFinite(beLockAtFromCost) ? beLockAtFromCost : 0,
-    Number.isFinite(beLockAtFallback) ? beLockAtFallback : 0,
   );
   const trailStartInr =
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
@@ -565,7 +563,6 @@ function applyMinGreenExitRules({
   if (beLockedNow && Number.isFinite(entry) && Number.isFinite(qty) && qty > 0) {
     const beLockKeepR = Number(env.BE_PROFIT_LOCK_KEEP_R ?? env.PROFIT_LOCK_KEEP_R ?? 0.25);
     const beLockCostMult = Number(env.BE_PROFIT_LOCK_COST_MULT ?? env.PROFIT_LOCK_COST_MULT ?? 1.0);
-    const beLockMinInr = Number(env.BE_PROFIT_LOCK_MIN_INR ?? env.PROFIT_LOCK_MIN_INR ?? 0);
     const lockByR =
       Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0 && Number.isFinite(beLockKeepR) && beLockKeepR > 0
         ? beLockKeepR * riskPerTradeInr
@@ -574,7 +571,7 @@ function applyMinGreenExitRules({
       Number.isFinite(estCostInr) && estCostInr > 0 && Number.isFinite(beLockCostMult) && beLockCostMult > 0
         ? beLockCostMult * estCostInr
         : 0;
-    const lockInr = Math.max(lockByR, lockByCost, Number.isFinite(beLockMinInr) ? beLockMinInr : 0);
+    const lockInr = Math.max(lockByR, lockByCost);
     if (Number.isFinite(lockInr) && lockInr > 0) {
       const lockPts = lockInr / qty;
       const raw = side === "BUY" ? entry + lockPts : entry - lockPts;
@@ -596,14 +593,13 @@ function applyMinGreenExitRules({
   const profitLockEnabled = String(env.PROFIT_LOCK_ENABLED || "false") === "true";
   const profitLockR = Number(env.PROFIT_LOCK_R ?? 1.0);
   const profitLockKeepR = Number(env.PROFIT_LOCK_KEEP_R ?? 0.25);
-  const profitLockMinInr = Number(env.PROFIT_LOCK_MIN_INR ?? 0);
   const profitLockArmed =
     profitLockEnabled && Number.isFinite(mfeR) && mfeR >= profitLockR;
   if (profitLockArmed && !trade?.profitLockArmedAt) {
     tradePatch.profitLockArmedAt = new Date(now);
   }
   if (profitLockArmed && Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0 && qty > 0) {
-    const lockInr = Math.max(profitLockMinInr, profitLockKeepR * riskPerTradeInr);
+    const lockInr = profitLockKeepR * riskPerTradeInr;
     if (Number.isFinite(lockInr) && lockInr > 0) {
       const lockPts = lockInr / qty;
       const lockSlRaw = side === "BUY" ? entry + lockPts : entry - lockPts;
@@ -697,7 +693,7 @@ function applyMinGreenExitRules({
     String(env.OPT_EXIT_ALLOW_WIDEN_SL || "true") === "true" &&
     holdMin <= Number(env.OPT_EXIT_WIDEN_WINDOW_MIN ?? 2);
 
-  const baseRiskInr = Number(trade?.riskInr ?? env.RISK_PER_TRADE_INR ?? 0);
+  const baseRiskInr = Number(trade?.riskInr ?? 0);
   const widenMult = Number(env.OPT_EXIT_WIDEN_MAX_RISK_MULT ?? 1.3);
   const maxRiskInr =
     allowWiden && Number.isFinite(baseRiskInr) && baseRiskInr > 0
