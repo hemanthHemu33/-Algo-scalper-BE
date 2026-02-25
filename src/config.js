@@ -899,6 +899,13 @@ const schema = z.object({
   // Cost/edge gating (prevents tiny targets that cannot beat costs)
   ENABLE_COST_GATE: z.string().default("true"),
   COST_GATE_MULT: z.coerce.number().default(3), // expected move must be >= 3x estimated all-in costs
+  COST_GATE_DYNAMIC_ENABLED: boolFromEnv.default(true),
+  COST_GATE_MULT_MIN: z.coerce.number().default(2.5),
+  COST_GATE_MULT_MAX: z.coerce.number().default(4.0),
+  COST_GATE_MULT_OPT_BONUS: z.coerce.number().default(0.3),
+  COST_GATE_MULT_WIDE_SPREAD_BONUS: z.coerce.number().default(0.5),
+  COST_GATE_MULT_PROFIT_LOCK_BONUS: z.coerce.number().default(0.2),
+  COST_GATE_MULT_THROTTLED_BONUS: z.coerce.number().default(0.35),
   // Planned fee-multiple gate: (plannedProfit @ RR target) / estCosts. 0 disables.
   FEE_MULTIPLE_PLANNED_MIN: z.coerce.number().default(0),
   EXPECTED_MOVE_ATR_PERIOD: z.coerce.number().default(14),

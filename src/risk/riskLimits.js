@@ -30,6 +30,38 @@ function defaultLimits() {
   };
 }
 
+
+function evaluateDailyRiskState({ dayPnlR, limits } = {}) {
+  const pnlR = Number(dayPnlR);
+  const pauseR = Number(limits?.dailyDrawdownPauseR ?? env.DAILY_DD_PAUSE_R ?? 3.0);
+  const throttleR = Number(limits?.dailyDrawdownThrottleR ?? env.DAILY_DD_THROTTLE_R ?? 2.0);
+  const profitLockStartR = Number(env.DAILY_PROFIT_LOCK_START_R ?? 2.0);
+
+  if (Number.isFinite(pnlR) && Number.isFinite(pauseR) && pnlR <= -pauseR) {
+    return { state: "PAUSED", reason: "DAILY_DD_PAUSE_R" };
+  }
+  if (Number.isFinite(pnlR) && Number.isFinite(throttleR) && pnlR <= -throttleR) {
+    return { state: "THROTTLED", reason: "DAILY_DD_THROTTLE_R" };
+  }
+  if (Number.isFinite(pnlR) && Number.isFinite(profitLockStartR) && pnlR >= profitLockStartR) {
+    return { state: "PROFIT_LOCK", reason: "DAILY_PROFIT_LOCK_START_R" };
+  }
+  return { state: "RUNNING", reason: null };
+}
+
+function isEntryAllowedForState(state) {
+  const s = String(state || "RUNNING").toUpperCase();
+  return s !== "PAUSED";
+}
+
+function riskMultiplierForState(state) {
+  const s = String(state || "RUNNING").toUpperCase();
+  if (s === "THROTTLED") return Number(env.DAILY_DD_THROTTLE_RISK_MULT ?? 0.6);
+  if (s === "PROFIT_LOCK") return Number(env.DAILY_PROFIT_LOCK_RISK_MULT ?? 0.5);
+  if (s === "PAUSED") return 0;
+  return 1;
+}
+
 async function getRiskLimits() {
   let db;
   try {
@@ -56,4 +88,11 @@ async function setRiskLimits(patch) {
   return clean;
 }
 
-module.exports = { getRiskLimits, setRiskLimits, defaultLimits };
+module.exports = {
+  getRiskLimits,
+  setRiskLimits,
+  defaultLimits,
+  evaluateDailyRiskState,
+  isEntryAllowedForState,
+  riskMultiplierForState,
+};

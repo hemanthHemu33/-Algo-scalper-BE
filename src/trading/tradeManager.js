@@ -1139,8 +1139,10 @@ class TradeManager {
     const sessionRInr = sessionRInrRaw > 0 ? sessionRInrRaw : Number(env.RISK_PER_TRADE_INR ?? 1);
     const dayPnlR = sessionRInr > 0 ? Number(total) / sessionRInr : 0;
 
-    let state = "RUNNING";
-    let reason = null;
+    const limits = this.risk?.getLimits?.() || {};
+    const evaluated = evaluateDailyRiskState({ dayPnlR, limits });
+    const state = evaluated.state;
+    const reason = evaluated.reason;
 
     if (dayPnlR <= -Number(env.DAILY_DD_PAUSE_R ?? 3.0)) {
       state = "PAUSED";
@@ -9903,6 +9905,10 @@ class TradeManager {
       spreadBps: Number(sp?.meta?.bps ?? 0),
       env,
       instrument,
+      ctx: {
+        dayState: this.riskBudget?.getDayState?.() || "RUNNING",
+        regime: s.regime || planMeta?.style || null,
+      },
     });
     if (!edge.ok) {
       logger.info(

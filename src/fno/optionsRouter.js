@@ -93,6 +93,27 @@ function finiteNumberOrNull(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+
+function estimateRiskStopPtsForOption({ row, fallbackStopPts = 0 }) {
+  const ltp = Number(row?.ltp);
+  const tick = normalizeTickSize(row?.tick_size);
+  const minTicks = Math.max(1, Number(env.OPT_SL_FIT_MIN_TICKS ?? env.MIN_SL_TICKS ?? 2));
+  const minPts = (Number.isFinite(tick) && tick > 0 ? tick : 0.05) * minTicks;
+
+  const stopPct = Math.max(0, Number(env.OPT_SL_PCT ?? 12));
+  const maxStopPct = Math.max(stopPct, Number(env.OPT_MAX_SL_PCT ?? stopPct));
+  const clampedPct = Math.min(stopPct, maxStopPct);
+  const pctPts = Number.isFinite(ltp) && ltp > 0 ? (clampedPct / 100) * ltp : NaN;
+
+  const fallback = Math.max(0, Number(fallbackStopPts ?? 0));
+  const pts = Math.max(
+    Number.isFinite(pctPts) ? pctPts : 0,
+    Number.isFinite(minPts) ? minPts : 0,
+    fallback,
+  );
+  return Number.isFinite(pts) ? pts : 0;
+}
+
 function strikeStepFallback(underlying) {
   const u = String(underlying || "").toUpperCase();
   if (u === "NIFTY") return Number(env.OPT_STRIKE_STEP_NIFTY ?? 50);
