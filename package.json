@@ -17,7 +17,8 @@
     "test": "node --check src/index.js",
     "test:recovery-gate": "node scripts/test_recovery_coordinator_gate.js",
     "test:stale-merge": "node scripts/test_stale_event_merge_regression.js",
-    "test:lifecycle-pending": "node scripts/test_lifecycle_pending_validations.js"
+    "test:lifecycle-pending": "node scripts/test_lifecycle_pending_validations.js",
+    "test:jest": "jest --runInBand"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
@@ -31,6 +32,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "nodemon": "^3.1.11"
+    "nodemon": "^3.1.11",
+    "jest": "^29.7.0"
   }
 }

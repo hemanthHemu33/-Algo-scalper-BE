@@ -33,6 +33,7 @@ const {
 const { getRecentCandles } = require("../market/candleStore");
 const { getEffectivePrice } = require("../market/effectivePrice");
 const {
+  getQuoteGuarded,
   isQuoteGuardBreakerOpen,
   getQuoteGuardStats,
 } = require("../kite/quoteGuard");
@@ -47,6 +48,14 @@ const {
 } = require("./costModel");
 const { costCalibrator } = require("./costCalibrator");
 const { backfillCandles } = require("../market/backfill");
+const {
+  computeSpreadBps,
+  getTickSize,
+  decidePolicy,
+  computePassiveLimitPrice,
+  computeAggressiveIocPrice,
+  computeChaseBps,
+} = require("./execution/entryMicrostructure");
 const { optimizer } = require("../optimizer/adaptiveOptimizer");
 const { equityService } = require("../account/equityService");
 const { buildPositionsSnapshot } = require("./positionService");
@@ -1891,21 +1900,57 @@ class TradeManager {
   }
 
   async _getBestBidAsk(instrument) {
+    const token = Number(instrument?.instrument_token);
+    const cached = this.lastQuoteByToken.get(token) || null;
+    const bidCached = Number(cached?.bestBid);
+    const askCached = Number(cached?.bestAsk);
+    const ltpCached = Number(cached?.ltp ?? this.lastPriceByToken.get(token));
+
+    if (Number.isFinite(bidCached) && bidCached > 0 && Number.isFinite(askCached) && askCached > 0) {
+      return {
+        bid: bidCached,
+        ask: askCached,
+        ltp: Number.isFinite(ltpCached) ? ltpCached : null,
+        hasDepth: true,
+        source: "tick_cache",
+      };
+    }
+
     const ex = instrument?.exchange || env.DEFAULT_EXCHANGE || "NSE";
     const sym = instrument?.tradingsymbol;
-    if (!sym || typeof this.kite.getQuote !== "function") return null;
+    if (!sym || typeof this.kite.getQuote !== "function") {
+      return {
+        bid: Number.isFinite(bidCached) ? bidCached : null,
+        ask: Number.isFinite(askCached) ? askCached : null,
+        ltp: Number.isFinite(ltpCached) ? ltpCached : null,
+        hasDepth: false,
+        source: "none",
+      };
+    }
+
     const key = `${String(ex).toUpperCase()}:${String(sym).toUpperCase()}`;
     try {
-      const resp = await this.kite.getQuote([key]);
+      const resp = await getQuoteGuarded(this.kite, [key], { label: "entry_get_best_bid_ask" });
       const q = resp?.[key];
       const bid = Number(q?.depth?.buy?.[0]?.price);
       const ask = Number(q?.depth?.sell?.[0]?.price);
-      const bidQty = Number(q?.depth?.buy?.[0]?.quantity);
-      const askQty = Number(q?.depth?.sell?.[0]?.quantity);
       const ltp = Number(q?.last_price);
-      return { bid, ask, ltp };
+      const hasDepth = Number.isFinite(bid) && bid > 0 && Number.isFinite(ask) && ask > 0 && ask >= bid;
+      return {
+        bid: hasDepth ? bid : null,
+        ask: hasDepth ? ask : null,
+        ltp: Number.isFinite(ltp) ? ltp : Number.isFinite(ltpCached) ? ltpCached : null,
+        hasDepth,
+        source: "quote_guard",
+      };
     } catch {
-      return null;
+      return {
+        bid: Number.isFinite(bidCached) ? bidCached : null,
+        ask: Number.isFinite(askCached) ? askCached : null,
+        ltp: Number.isFinite(ltpCached) ? ltpCached : null,
+        hasDepth: false,
+        source: "fallback_cache",
+      };
     }
   }
 
@@ -1994,6 +2039,136 @@ class TradeManager {
         return;
       }
     }
+  }
+
+  _isIocUnmatched(order) {
+    const msg = `${order?.status_message || ""} ${order?.status_message_raw || ""}`.toLowerCase();
+    return msg.includes("unmatched") || msg.includes("cancelled by the system");
+  }
+
+  async _waitForIocOutcome(orderId, { attempts = 4, delayMs = 120 } = {}) {
+    let last = null;
+    for (let i = 0; i < attempts; i += 1) {
+      last = await this._getOrderStatus(orderId);
+      const st = String(last?.status || "").toUpperCase();
+      if (isDead(st) || st === "COMPLETE" || st === "PARTIAL") return last;
+      if (i < attempts - 1) await sleep(delayMs);
+    }
+    return last;
+  }
+
+  async _executeEntryByMicrostructure({ tradeId, instrument, side, qty, expectedEntryPrice, segment }) {
+    const tickSize = getTickSize(instrument);
+    const passiveValidity = String(env.ENTRY_PASSIVE_VALIDITY || "DAY").toUpperCase();
+    const aggressiveValidity = String(env.ENTRY_AGGRESSIVE_VALIDITY || "IOC").toUpperCase();
+    const basePassiveMax = Number(env.ENTRY_PASSIVE_MAX_SPREAD_BPS ?? 8);
+    const baseAggressiveMax = Number(env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS ?? 20);
+    const passiveMax = segment === "OPT" ? Number(env.ENTRY_PASSIVE_MAX_SPREAD_BPS_OPT ?? 25) : basePassiveMax;
+    const aggressiveMax = segment === "OPT" ? Number(env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS_OPT ?? 60) : baseAggressiveMax;
+    const marketFallbackMax = segment === "OPT"
+      ? Number(env.ENTRY_MARKET_FALLBACK_MAX_SPREAD_BPS_OPT ?? aggressiveMax)
+      : aggressiveMax;
+
+    const depth0 = await this._getBestBidAsk(instrument);
+    const spread0 = computeSpreadBps(depth0?.bid, depth0?.ask);
+    const decision0 = decidePolicy({
+      spread_bps: spread0,
+      passiveMax,
+      aggressiveMax,
+      hasDepth: !!depth0?.hasDepth,
+    });
+
+    if (decision0.policy === "ABORT" && decision0.reason === "spread_too_wide") {
+      return { ok: false, reason: "spread_too_wide", spreadBps: spread0 };
+    }
+
+    const placeParamsBase = {
+      exchange: instrument.exchange,
+      tradingsymbol: instrument.tradingsymbol,
+      transaction_type: side,
+      quantity: qty,
+      product: env.DEFAULT_PRODUCT,
+      tag: makeTag(tradeId, "ENTRY"),
+    };
+
+    const logDecision = (meta) => logger.info(meta, "[entry_exec] decision");
+    const logResult = (meta) => logger.info(meta, "[entry_exec] result");
+
+    if (decision0.policy === "PASSIVE") {
+      const chosenPrice = computePassiveLimitPrice({ side, bid: depth0?.bid, ask: depth0?.ask, tickSize });
+      const entryParams = {
+        ...placeParamsBase,
+        order_type: "LIMIT",
+        validity: passiveValidity,
+        price: chosenPrice,
+      };
+      logDecision({ tradeId, token: instrument.instrument_token, tradingsymbol: instrument.tradingsymbol, side, segment, policy: "PASSIVE", order_type: "LIMIT", validity: passiveValidity, attempt: 1, bufferTicks: 0, tickSize, ltp: depth0?.ltp ?? null, bid: depth0?.bid ?? null, ask: depth0?.ask ?? null, spread_bps: spread0, chosenPrice, qty, reason: decision0.reason });
+      const out = await this._safePlaceOrder(env.DEFAULT_ORDER_VARIETY, entryParams, { purpose: "ENTRY", tradeId });
+      logResult({ tradeId, orderId: out.orderId, status: "placed", attempt: 1, fallbackUsed: false });
+      return { ok: true, entryParams, orderId: out.orderId, orderType: "LIMIT", validity: passiveValidity, policy: "PASSIVE", spreadBps: spread0 };
+    }
+
+    if (decision0.policy === "AGGRESSIVE") {
+      const extraSteps = Math.max(0, Number(env.ENTRY_LADDER_TICKS ?? 2));
+      const maxAttempts = 1 + extraSteps;
+      const baseBufferTicks = Math.max(1, Number(env.ENTRY_IOC_BASE_BUFFER_TICKS ?? 1));
+      const maxChaseBps = Math.max(0, Number(env.ENTRY_LADDER_MAX_CHASE_BPS ?? 35));
+      const stepDelayMs = Math.max(0, Number(env.ENTRY_LADDER_STEP_DELAY_MS ?? 350));
+      let baseRefPrice = null;
+      let lastSpread = spread0;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const depth = await this._getBestBidAsk(instrument);
+        const spreadBps = computeSpreadBps(depth?.bid, depth?.ask);
+        lastSpread = spreadBps;
+        if (!depth?.hasDepth) {
+          return { ok: false, reason: "no_depth", spreadBps };
+        }
+        const bufferTicks = baseBufferTicks + attempt - 1;
+        const chosenPrice = computeAggressiveIocPrice({ side, bid: depth.bid, ask: depth.ask, tickSize, bufferTicks });
+        const ref = side === "BUY" ? Number(depth.ask) : Number(depth.bid);
+        if (!Number.isFinite(baseRefPrice) || baseRefPrice <= 0) baseRefPrice = ref;
+        const chaseBps = computeChaseBps({ basePrice: baseRefPrice, chosenPrice, side });
+        if (chaseBps > maxChaseBps) {
+          return { ok: false, reason: "chase_cap", spreadBps, chaseBps };
+        }
+
+        const entryParams = {
+          ...placeParamsBase,
+          order_type: "LIMIT",
+          validity: aggressiveValidity,
+          price: chosenPrice,
+        };
+        logDecision({ tradeId, token: instrument.instrument_token, tradingsymbol: instrument.tradingsymbol, side, segment, policy: "AGGRESSIVE", order_type: "LIMIT", validity: aggressiveValidity, attempt, bufferTicks, tickSize, ltp: depth?.ltp ?? null, bid: depth.bid, ask: depth.ask, spread_bps: spreadBps, chosenPrice, qty, reason: attempt === 1 ? decision0.reason : "ioc_retry_unmatched" });
+
+        const out = await this._safePlaceOrder(env.DEFAULT_ORDER_VARIETY, entryParams, { purpose: "ENTRY", tradeId });
+        const latest = await this._waitForIocOutcome(out.orderId);
+        const status = String(latest?.status || "OPEN").toUpperCase();
+        const filledQty = Number(latest?.order?.filled_quantity ?? 0);
+        const unmatched = status === "CANCELLED" && this._isIocUnmatched(latest?.order);
+        logResult({ tradeId, orderId: out.orderId, status: unmatched ? "unmatched" : status.toLowerCase(), attempt, filledQty, fallbackUsed: false });
+        if (status === "COMPLETE" || filledQty > 0 || (status === "CANCELLED" && !unmatched)) {
+          return { ok: true, entryParams, orderId: out.orderId, orderType: "LIMIT", validity: aggressiveValidity, policy: "AGGRESSIVE", spreadBps, iocAttempt: attempt };
+        }
+        if (!unmatched || attempt >= maxAttempts) break;
+        if (stepDelayMs > 0) await sleep(stepDelayMs);
+      }
+
+      const allowMktFallback = String(env.ENTRY_LIMIT_FALLBACK_TO_MARKET || "false") === "true";
+      if (allowMktFallback && Number.isFinite(lastSpread) && lastSpread <= marketFallbackMax) {
+        const entryParams = {
+          ...placeParamsBase,
+          order_type: "MARKET",
+          validity: "DAY",
+        };
+        logDecision({ tradeId, token: instrument.instrument_token, tradingsymbol: instrument.tradingsymbol, side, segment, policy: "AGGRESSIVE", order_type: "MARKET", validity: "DAY", attempt: maxAttempts + 1, bufferTicks: null, tickSize, ltp: depth0?.ltp ?? null, bid: depth0?.bid ?? null, ask: depth0?.ask ?? null, spread_bps: lastSpread, chosenPrice: null, qty, reason: "market_fallback_after_ioc_unmatched" });
+        const out = await this._safePlaceOrder(env.DEFAULT_ORDER_VARIETY, entryParams, { purpose: "ENTRY", tradeId });
+        logResult({ tradeId, orderId: out.orderId, status: "placed", attempt: maxAttempts + 1, fallbackUsed: true });
+        return { ok: true, entryParams, orderId: out.orderId, orderType: "MARKET", validity: "DAY", policy: "FALLBACK_MARKET", spreadBps: lastSpread };
+      }
+      return { ok: false, reason: "ioc_unmatched", spreadBps: lastSpread };
+    }
+
+    return { ok: false, reason: decision0.reason || "entry_policy_abort", spreadBps: spread0 };
   }
 
   _parseQuoteTimeMs(q) {
@@ -9684,51 +9859,20 @@ class TradeManager {
     const spreadBpsAtEntry = Number(quoteAtEntry?.bps ?? NaN);
     const microPolicyEnabled =
       String(env.ENTRY_MICROSTRUCTURE_POLICY_ENABLED || "true") === "true";
+    const segment = isOptContract
+      ? "OPT"
+      : String(instrument?.segment || "").toUpperCase().includes("FUT")
+        ? "FUT"
+        : "EQ";
     const execPolicyMeta = {
       bucket: "DEFAULT",
       spreadBps: Number.isFinite(spreadBpsAtEntry) ? spreadBpsAtEntry : null,
       layering: String(env.ENTRY_EXEC_LAYERING_ENABLED || "false") === "true",
+      segment,
     };
 
     let finalEntryOrderType = entryOrderType;
     let entryValidity = "DAY";
-    let entryPriceHint = Number(expectedEntryPrice) || Number(entryGuess);
-
-    if (microPolicyEnabled && isOptContract && Number.isFinite(spreadBpsAtEntry)) {
-      const passiveMax = Number(env.ENTRY_PASSIVE_MAX_SPREAD_BPS ?? 8);
-      const aggressiveMax = Number(env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS ?? 20);
-      const bidPx = Number(quoteAtEntry?.bid ?? 0);
-      const askPx = Number(quoteAtEntry?.ask ?? 0);
-      const bidQtyTop = Number(quoteAtEntry?.bidQty ?? 0);
-      const askQtyTop = Number(quoteAtEntry?.askQty ?? 0);
-      const oppositeTopQty = side === "BUY" ? askQtyTop : bidQtyTop;
-      const minAggressiveTopQty = Math.max(
-        0,
-        Number(env.ENTRY_AGGRESSIVE_MIN_TOP_QTY ?? 1),
-      );
-
-      if (spreadBpsAtEntry <= passiveMax) {
-        execPolicyMeta.bucket = "PASSIVE";
-        finalEntryOrderType = "LIMIT";
-        entryValidity = String(env.ENTRY_PASSIVE_VALIDITY || "DAY").toUpperCase();
-        if (side === "BUY" && Number.isFinite(bidPx) && bidPx > 0) entryPriceHint = bidPx;
-        if (side === "SELL" && Number.isFinite(askPx) && askPx > 0) entryPriceHint = askPx;
-      } else if (spreadBpsAtEntry <= aggressiveMax) {
-        if (oppositeTopQty < minAggressiveTopQty) {
-          execPolicyMeta.bucket = "AGGRESSIVE_NO_DEPTH";
-          finalEntryOrderType = "MARKET";
-        } else {
-          execPolicyMeta.bucket = "AGGRESSIVE";
-          finalEntryOrderType = "LIMIT";
-          entryValidity = String(env.ENTRY_AGGRESSIVE_VALIDITY || "DAY").toUpperCase();
-          if (side === "BUY" && Number.isFinite(askPx) && askPx > 0) entryPriceHint = askPx;
-          if (side === "SELL" && Number.isFinite(bidPx) && bidPx > 0) entryPriceHint = bidPx;
-        }
-      } else {
-        execPolicyMeta.bucket = "WIDE_SPREAD";
-        finalEntryOrderType = "MARKET";
-      }
-    }
 
     const tradeId = crypto.randomUUID();
     const trade = {
@@ -9806,48 +9950,64 @@ class TradeManager {
 
     await insertTrade(trade);
 
-    // ENTRY order (MARKET by default; optional LIMIT to reduce slippage)
-    const entryParams = {
-      exchange: instrument.exchange,
-      tradingsymbol: instrument.tradingsymbol,
-      transaction_type: side,
-      quantity: qty,
-      product: env.DEFAULT_PRODUCT,
-      order_type: finalEntryOrderType,
-      validity: entryValidity,
-      tag: makeTag(tradeId, "ENTRY"),
-    };
-
-    if (finalEntryOrderType === "LIMIT") {
-      // Use top-of-book price from spread check if available.
-      // BUY -> ask; SELL -> bid
-      const px = Number(entryPriceHint) || Number(expectedEntryPrice) || Number(entryGuess);
-      entryParams.price = roundToTick(px, tick, side === "BUY" ? "up" : "down");
-    }
-
-    logger.info({ tradeId, entryParams }, "[trade] placing ENTRY");
-    trackDecision("ENTRY_PLACED", "entry", "ENTRY_PLACED", {
-      tradeId,
-      entryParams,
-    });
-    alert("info", "🟢 ENTRY placing", {
-      tradeId,
-      symbol: instrument.tradingsymbol,
-      side: side,
-      qty,
-      entryRef: Number(expectedEntryPrice) || Number(entryGuess) || null,
-      stopLoss,
-      strategyId: s.strategyId,
-    }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
-
+    let entryParams = null;
     let entryOrderId = null;
+    let microResult = null;
+
     try {
-      const out = await this._safePlaceOrder(
-        env.DEFAULT_ORDER_VARIETY,
-        entryParams,
-        { purpose: "ENTRY", tradeId },
-      );
-      entryOrderId = out.orderId;
+      if (microPolicyEnabled) {
+        microResult = await this._executeEntryByMicrostructure({
+          tradeId,
+          instrument,
+          side,
+          qty,
+          expectedEntryPrice: Number(expectedEntryPrice) || Number(entryGuess),
+          segment,
+        });
+
+        if (!microResult?.ok) {
+          await updateTrade(tradeId, {
+            status: STATUS.ENTRY_CANCELLED,
+            closeReason: `ENTRY_ABORTED | ${microResult?.reason || "entry_policy_abort"}`,
+          });
+          await this._finalizeClosed(tradeId, token);
+          return;
+        }
+
+        entryParams = microResult.entryParams;
+        entryOrderId = microResult.orderId;
+        finalEntryOrderType = microResult.orderType || finalEntryOrderType;
+        entryValidity = microResult.validity || entryValidity;
+        execPolicyMeta.bucket = microResult.policy || execPolicyMeta.bucket;
+        execPolicyMeta.spreadBps = Number.isFinite(Number(microResult.spreadBps))
+          ? Number(microResult.spreadBps)
+          : execPolicyMeta.spreadBps;
+      } else {
+        entryParams = {
+          exchange: instrument.exchange,
+          tradingsymbol: instrument.tradingsymbol,
+          transaction_type: side,
+          quantity: qty,
+          product: env.DEFAULT_PRODUCT,
+          order_type: finalEntryOrderType,
+          validity: entryValidity,
+          tag: makeTag(tradeId, "ENTRY"),
+        };
+        if (finalEntryOrderType === "LIMIT") {
+          const dir = side === "BUY" ? "up" : "down";
+          entryParams.price = roundToTick(
+            Number(expectedEntryPrice) || Number(entryGuess),
+            tick,
+            dir,
+          );
+        }
+        const out = await this._safePlaceOrder(
+          env.DEFAULT_ORDER_VARIETY,
+          entryParams,
+          { purpose: "ENTRY", tradeId },
+        );
+        entryOrderId = out.orderId;
+      }
     } catch (e) {
       logger.error({ tradeId, e: e.message }, "[trade] ENTRY place failed");
       alert("error", "❌ ENTRY rejected/failed", {
@@ -9871,16 +10031,28 @@ class TradeManager {
       return;
     }
 
-    // Pro: if LIMIT entry is not filled quickly, fallback to MARKET (options only)
-    if (finalEntryOrderType === "LIMIT") {
+    logger.info({ tradeId, entryParams }, "[trade] placing ENTRY");
+    trackDecision("ENTRY_PLACED", "entry", "ENTRY_PLACED", {
+      tradeId,
+      entryParams,
+    });
+    alert("info", "🟢 ENTRY placing", {
+      tradeId,
+      symbol: instrument.tradingsymbol,
+      side: side,
+      qty,
+      entryRef: Number(expectedEntryPrice) || Number(entryGuess) || null,
+      stopLoss,
+      strategyId: s.strategyId,
+    }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
+
+    if (finalEntryOrderType === "LIMIT" && String(entryValidity).toUpperCase() === "DAY") {
       this._startEntryLadder({
         tradeId,
         entryOrderId,
         instrument,
         side,
-        basePrice: Number(
-          entryParams.price ?? expectedEntryPrice ?? entryGuess,
-        ),
+        basePrice: Number(entryParams?.price ?? expectedEntryPrice ?? entryGuess),
       }).catch((e) => {
         logger.warn(
           { tradeId, e: e?.message || String(e) },
@@ -9889,10 +10061,10 @@ class TradeManager {
       });
     }
 
-    // Pro: if LIMIT entry is not filled quickly, fallback to MARKET (options only)
     if (
       isOptContract &&
       finalEntryOrderType === "LIMIT" &&
+      String(entryValidity).toUpperCase() === "DAY" &&
       String(env.ENTRY_LIMIT_FALLBACK_TO_MARKET || "false") === "true" &&
       Number(env.ENTRY_LIMIT_TIMEOUT_MS ?? 0) > 0
     ) {
@@ -9913,6 +10085,8 @@ class TradeManager {
 
     await updateTrade(tradeId, {
       entryOrderId,
+      entryOrderType: finalEntryOrderType,
+      executionPolicy: execPolicyMeta,
       entryPlacedAt: new Date(),
       status: STATUS.ENTRY_OPEN,
       entryFinalized: false,
@@ -10571,6 +10745,32 @@ class TradeManager {
 
       if (isDead(status)) {
         this._clearEntryLimitFallbackTimer(trade.tradeId);
+        const deadFilledQty = Number(order.filled_quantity ?? 0);
+        const deadAvg = Number(order.average_price ?? trade.entryPrice ?? 0);
+        if (deadFilledQty > 0) {
+          logger.info(
+            { tradeId: trade.tradeId, orderId, status, filledQty: deadFilledQty, avg: deadAvg },
+            "[entry_exec] result",
+          );
+          await updateTrade(trade.tradeId, {
+            status: STATUS.ENTRY_OPEN,
+            entryPrice: deadAvg > 0 ? deadAvg : trade.entryPrice,
+            qty: deadFilledQty,
+            entryFinalized: true,
+            ...this._eventPatch("ENTRY_PARTIAL_FILL", {
+              avg: deadAvg,
+              filledQty: deadFilledQty,
+              source: "ioc_cancel_partial",
+            }),
+          });
+          await this._placeExitsIfMissing({
+            ...trade,
+            qty: deadFilledQty,
+            entryPrice: deadAvg > 0 ? deadAvg : trade.entryPrice,
+          });
+          await this._ensureExitQty(trade.tradeId, deadFilledQty);
+          return;
+        }
         if (!isCurrentEntry) {
           logger.warn(
             {
