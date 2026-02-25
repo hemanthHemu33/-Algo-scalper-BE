@@ -95,6 +95,10 @@ function _shouldControlTrading() {
   return _bool(env.MARKET_GATE_CONTROL_TRADING, true);
 }
 
+function _isLifecycleEnabled() {
+  return String(process.env.ENGINE_LIFECYCLE_ENABLED || "false") === "true";
+}
+
 function _marketGatePollMs() {
   return _num(env.MARKET_GATE_POLL_MS, 5000);
 }
@@ -133,6 +137,10 @@ function startMarketGate() {
   });
 
   marketGate.on("open", () => {
+    if (_isLifecycleEnabled()) {
+      logger.info("[market] OPEN (lifecycle controls tradingEnabled)");
+      return;
+    }
     logger.info("[market] OPEN -> enabling signals/trading");
     if (_shouldControlTrading()) {
       setTradingEnabled(null);
@@ -140,6 +148,10 @@ function startMarketGate() {
   });
 
   marketGate.on("close", () => {
+    if (_isLifecycleEnabled()) {
+      logger.info("[market] CLOSE (lifecycle controls tradingEnabled)");
+      return;
+    }
     logger.info("[market] CLOSE -> disabling new entries");
     if (_shouldControlTrading()) {
       setTradingEnabled(false);
@@ -640,26 +652,40 @@ async function getSessionStatus() {
 }
 
 async function getOpenPositionsSummary() {
-  if (!kite || !currentToken) return { openCount: 0, positions: [] };
+  if (!kite || !currentToken) {
+    return {
+      openCount: -1,
+      positions: [],
+      error: "SESSION_UNAVAILABLE",
+      source: "kite",
+    };
+  }
   try {
     const positions = await kite.getPositions();
     const net = positions?.net || positions?.day || [];
     const open = (Array.isArray(net) ? net : []).filter((p) => Number(p?.quantity ?? p?.net_quantity ?? 0) !== 0);
-    return { openCount: open.length, positions: open };
+    return { openCount: open.length, positions: open, source: "kite" };
   } catch (e) {
     logger.warn({ e: e?.message || String(e) }, "[kite] getOpenPositionsSummary failed");
     return {
-      openCount: null,
+      openCount: -1,
       positions: [],
       error: e?.message || String(e),
+      source: "kite",
     };
   }
 }
 
-async function isFlat() {
+async function isFlatSafe() {
   const s = await getOpenPositionsSummary();
-  if (s?.error) return false;
-  return Number(s?.openCount) === 0;
+  const openCount = Number(s?.openCount);
+  if (openCount === 0) return true;
+  if (openCount === -1) return false;
+  return false;
+}
+
+async function isFlat() {
+  return isFlatSafe();
 }
 
 async function forceFlatten(reason = "ENGINE_FORCE_FLATTEN") {
@@ -947,6 +973,7 @@ module.exports = {
   setTradingEnabled: setSessionTradingEnabled,
   getSessionStatus,
   getOpenPositionsSummary,
+  isFlatSafe,
   isFlat,
   forceFlatten,
   getPipeline,

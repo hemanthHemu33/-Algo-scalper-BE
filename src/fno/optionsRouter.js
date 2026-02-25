@@ -790,7 +790,7 @@ async function pickOptionContractForSignal({
       ? liquidityEligible.slice(0, liqGateTopN).map((x) => x.row)
       : liquidityEligible.map((x) => x.row);
 
-  const desiredStrike =
+  const rawDesiredStrike =
     strikeSelectionMode === "DELTA_NEAREST"
       ? pickDeltaAnchorStrike({
           rows: liquidityScopedRows.length ? liquidityScopedRows : chain?.snapshot?.rows || [],
@@ -801,6 +801,22 @@ async function pickOptionContractForSignal({
           deltaMax,
         })
       : baseDesiredStrike;
+
+  // Safety: don't let delta anchor drift too far from ATM intent.
+  // This prevents occasional far OTM/ITM picks when greeks are sparse/noisy intraday.
+  const deltaAnchorMaxShiftSteps = Math.max(
+    0,
+    Number(env.OPT_DELTA_ANCHOR_MAX_SHIFT_STEPS ?? Math.max(radius, 2)),
+  );
+  const desiredShiftSteps =
+    step > 0
+      ? Math.abs(Number(rawDesiredStrike) - Number(baseDesiredStrike)) / step
+      : 0;
+  const desiredStrike =
+    desiredShiftSteps > deltaAnchorMaxShiftSteps
+      ? baseDesiredStrike
+      : rawDesiredStrike;
+  const desiredStrikeClamped = desiredStrike !== rawDesiredStrike;
 
   const oiContext = computeOiWallContext({
     rows: chain?.snapshot?.rows || [],
@@ -1247,7 +1263,10 @@ async function pickOptionContractForSignal({
       strikeSelection: {
         mode: strikeSelectionMode,
         baseDesiredStrike,
+        rawDesiredStrike,
         finalDesiredStrike: desiredStrike,
+        maxShiftSteps: deltaAnchorMaxShiftSteps,
+        clamped: desiredStrikeClamped,
       },
       premiumBandFallback: premiumBandFallbackUsed
         ? {
