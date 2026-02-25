@@ -653,7 +653,12 @@ async function getSessionStatus() {
 
 async function getOpenPositionsSummary() {
   if (!kite || !currentToken) {
-    return { openCount: 0, positions: [], source: "kite" };
+    return {
+      openCount: -1,
+      positions: [],
+      error: "SESSION_UNAVAILABLE",
+      source: "kite",
+    };
   }
   try {
     const positions = await kite.getPositions();

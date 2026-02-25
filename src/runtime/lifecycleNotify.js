@@ -3,7 +3,15 @@ const { alert } = require("../alerts/alertService");
 
 const DEDUPE_MS = 10 * 60 * 1000;
 const lastByEvent = new Map();
-const DEDUPE_EVENTS = new Set(["TOKEN_MISSING", "TOKEN_RESTORED"]);
+const DEDUPE_EVENTS = new Set([
+  "TOKEN_MISSING",
+  "TOKEN_RESTORED",
+  "TOKEN_REFRESHED",
+  "WARMUP_START_FAILED",
+  "LIVE_START_FAILED",
+  "COOLDOWN_SESSION_START_FAILED",
+  "FLAT_CHECK_ERROR_HOLDING",
+]);
 
 function toIstNow() {
   return DateTime.now().setZone("Asia/Kolkata").toFormat("yyyy-LL-dd HH:mm:ss ZZZZ");
@@ -11,6 +19,7 @@ function toIstNow() {
 
 function pickLevel(event, payload = {}) {
   if (event === "TOKEN_MISSING") return "warn";
+  if (["WARMUP_START_FAILED", "LIVE_START_FAILED", "COOLDOWN_SESSION_START_FAILED", "FLAT_CHECK_ERROR_HOLDING"].includes(event)) return "warn";
   if (event === "FORCE_FLATTEN_RESULT") return payload?.ok ? "info" : "warn";
   return "info";
 }

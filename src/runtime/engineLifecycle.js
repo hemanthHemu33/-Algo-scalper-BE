@@ -54,6 +54,7 @@ function makeLifecycle(ops = {}) {
 
   let state = "IDLE";
   let token = null;
+  let tokenSig = null;
   let nextTransitionAt = null;
   let wakeTimer = null;
   let idleGuardTimer = null;
@@ -130,8 +131,25 @@ function makeLifecycle(ops = {}) {
   }
 
   async function maybeStartSession(reason) {
-    if (!token) return { ok: false, reason: "TOKEN_MISSING" };
-    return ops.startSession?.(token, reason);
+    if (!token) return false;
+    try {
+      const res = await ops.startSession?.(token, reason);
+      if (!res?.ok) return false;
+      const status = await ops.getSessionStatus?.();
+      return !!(status?.tickerConnected && status?.pipelineReady);
+    } catch {
+      return false;
+    }
+  }
+
+  async function safeRestartSession(reason = "token_refresh") {
+    try {
+      await ops.setTradingEnabled?.(false, reason);
+      await ops.stopSession?.(reason);
+      return await maybeStartSession(reason);
+    } catch {
+      return false;
+    }
   }
 
   async function evaluateCooldown(now = nowIst()) {
@@ -140,11 +158,22 @@ function makeLifecycle(ops = {}) {
     let openCount = null;
     try {
       const p = await ops.getOpenPositionsSummary?.();
-      const hasError = !!p?.error;
       openCount = Number.isFinite(Number(p?.openCount)) ? Number(p.openCount) : null;
-      flat = !hasError && openCount === 0;
+      if (openCount === -1) {
+        flat = false;
+        await notifyLifecycle("FLAT_CHECK_ERROR_HOLDING", {
+          error: p?.error || "unknown",
+          source: p?.source || "kite",
+        });
+      } else {
+        flat = openCount === 0;
+      }
     } catch {
       flat = false;
+      await notifyLifecycle("FLAT_CHECK_ERROR_HOLDING", {
+        error: "exception",
+        source: "lifecycle",
+      });
     }
 
     if (!cfg.requireFlat || flat) {
@@ -195,8 +224,8 @@ function makeLifecycle(ops = {}) {
     cooldownTimer.unref?.();
   }
 
-  async function transit(target, reason = "schedule") {
-    if (state === target) {
+  async function transit(target, reason = "schedule", opts = {}) {
+    if (state === target && !opts?.force) {
       scheduleNext();
       return;
     }
@@ -210,9 +239,13 @@ function makeLifecycle(ops = {}) {
     }
 
     if (target === "WARMUP") {
-      const res = await maybeStartSession(reason);
-      if (!res?.ok && res?.reason === "TOKEN_MISSING") {
+      const ok = await maybeStartSession(reason);
+      if (!ok) {
         state = "IDLE";
+        await ops.setTradingEnabled?.(false, "warmup_start_failed");
+        await stopHeavy("warmup_start_failed");
+        await notifyLifecycle("WARMUP_START_FAILED", { reason });
+        await notifyLifecycle("IDLE_ENTER", { reason: "warmup_start_failed" });
       } else {
         state = "WARMUP";
         const warmupReason = normalizeWarmupReason(reason);
@@ -220,11 +253,29 @@ function makeLifecycle(ops = {}) {
         await notifyLifecycle("WARMUP_START", { reason: warmupReason });
       }
     } else if (target === "LIVE") {
-      await maybeStartSession(reason);
-      state = "LIVE";
-      await ops.setTradingEnabled?.(true, "live");
-      await notifyLifecycle("LIVE_START", { reason });
+      const ok = await maybeStartSession(reason);
+      if (!ok) {
+        state = "IDLE";
+        await ops.setTradingEnabled?.(false, "live_start_failed");
+        await stopHeavy("live_start_failed");
+        await notifyLifecycle("LIVE_START_FAILED", { reason });
+        await notifyLifecycle("IDLE_ENTER", { reason: "live_start_failed" });
+      } else {
+        state = "LIVE";
+        await ops.setTradingEnabled?.(true, "live");
+        await notifyLifecycle("LIVE_START", { reason });
+      }
     } else if (target === "COOLDOWN") {
+      const ok = await maybeStartSession(reason || "cooldown");
+      if (!ok) {
+        state = "IDLE";
+        await ops.setTradingEnabled?.(false, "cooldown_start_failed");
+        await stopHeavy("cooldown_start_failed");
+        await notifyLifecycle("COOLDOWN_SESSION_START_FAILED", { reason });
+        await notifyLifecycle("IDLE_ENTER", { reason: "cooldown_start_failed" });
+        scheduleNext();
+        return;
+      }
       state = "COOLDOWN";
       await ops.setTradingEnabled?.(false, "close");
       const p = await ops.getOpenPositionsSummary?.();
@@ -248,9 +299,9 @@ function makeLifecycle(ops = {}) {
     scheduleNext();
   }
 
-  async function reconcileNow(reason = "reconcile") {
+  async function applyDesiredStateNow({ force = false, reason = "reconcile" } = {}) {
     const target = desiredStateAt(nowIst());
-    await transit(target, reason);
+    await transit(target, reason, { force });
   }
 
   function scheduleNext() {
@@ -289,13 +340,19 @@ function makeLifecycle(ops = {}) {
   async function start() {
     if (!cfg.enabled) return;
     startIdleGuard();
-    await reconcileNow("startup");
+    await applyDesiredStateNow({ reason: "startup" });
   }
 
-  async function setToken(accessToken) {
+  function tokenSignature(accessToken) {
+    if (!accessToken) return null;
+    return String(accessToken);
+  }
+
+  async function onTokenUpdated(accessToken) {
     const had = !!token;
-    const prevToken = token;
+    const prevSig = tokenSig;
     token = accessToken ? String(accessToken) : null;
+    tokenSig = tokenSignature(token);
     if (!token && had) {
       await notifyLifecycle("TOKEN_MISSING", {});
       await transit("IDLE", "token_missing");
@@ -303,18 +360,27 @@ function makeLifecycle(ops = {}) {
     }
     if (token && !had) {
       await notifyLifecycle("TOKEN_RESTORED", {});
-      await reconcileNow("token_restored");
+      await applyDesiredStateNow({ reason: "token_restored" });
       return;
     }
 
-    const tokenChanged = !!token && prevToken !== token;
-    if (tokenChanged && (state === "WARMUP" || state === "LIVE" || state === "COOLDOWN")) {
-      await maybeStartSession("token_updated");
+    const tokenChanged = !!token && prevSig !== tokenSig;
+    if (!tokenChanged) return;
+
+    await notifyLifecycle("TOKEN_REFRESHED", { reason: "token_refresh" });
+    if (state === "WARMUP" || state === "LIVE" || state === "COOLDOWN") {
+      const ok = await safeRestartSession("token_refresh");
+      if (!ok) {
+        state = "IDLE";
+        await stopHeavy("token_refresh_failed");
+      }
     }
 
-    if (token) {
-      await reconcileNow("token_updated");
-    }
+    await applyDesiredStateNow({ force: true, reason: "token_refresh" });
+  }
+
+  async function setToken(accessToken) {
+    await onTokenUpdated(accessToken);
   }
 
   function status() {
