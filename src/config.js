@@ -957,6 +957,8 @@ const schema = z.object({
   ENTRY_AGGRESSIVE_MAX_SPREAD_BPS_OPT: z.coerce.number().default(60),
   ENTRY_MARKET_FALLBACK_MAX_SPREAD_BPS_OPT: z.coerce.number().default(60),
   ENTRY_IOC_BASE_BUFFER_TICKS: z.coerce.number().default(1),
+  ENTRY_IOC_BASE_BUFFER_TICKS_OPT: z.coerce.number().optional(),
+  ENTRY_LADDER_MAX_CHASE_BPS_OPT: z.coerce.number().optional(),
   ENTRY_PASSIVE_VALIDITY: z.string().default("DAY"),
   ENTRY_AGGRESSIVE_VALIDITY: z.string().default("IOC"),
   ENTRY_EXEC_LAYERING_ENABLED: boolFromEnv.default(false),
