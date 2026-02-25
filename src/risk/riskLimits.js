@@ -6,10 +6,14 @@ const DOC_ID = "active";
 
 function defaultLimits() {
   const dailyLossCap = Number(env.DAILY_MAX_LOSS_INR ?? 0);
+  const ddThrottleR = Number(env.DAILY_DD_THROTTLE_R ?? 2.0);
+  const ddPauseR = Number(env.DAILY_DD_PAUSE_R ?? 3.0);
   const maxOpenTrades = Number(env.MAX_OPEN_POSITIONS ?? 1);
   const maxTradesPerDay = Number(env.MAX_TRADES_PER_DAY ?? 0);
   return {
     dailyLossCapInr: Number.isFinite(dailyLossCap) ? dailyLossCap : null,
+    dailyDrawdownThrottleR: Number.isFinite(ddThrottleR) ? ddThrottleR : null,
+    dailyDrawdownPauseR: Number.isFinite(ddPauseR) ? ddPauseR : null,
     maxDrawdownInr: Number(env.RISK_MAX_DRAWDOWN_INR ?? dailyLossCap * 2 ?? 0),
     maxOpenTrades: Number.isFinite(maxOpenTrades) ? maxOpenTrades : null,
     maxTradesPerDay: Number.isFinite(maxTradesPerDay)

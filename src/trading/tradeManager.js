@@ -60,6 +60,7 @@ const { optimizer } = require("../optimizer/adaptiveOptimizer");
 const { equityService } = require("../account/equityService");
 const { buildPositionsSnapshot } = require("./positionService");
 const { getRiskLimits } = require("../risk/riskLimits");
+const { RiskBudget } = require("../risk/riskBudget");
 const {
   ensureTradeIndexes,
   insertTrade,
@@ -267,6 +268,8 @@ class TradeManager {
         this._persistRiskState(state).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
       });
     }
+
+    this.riskBudget = new RiskBudget({ kite: this.kite });
 
     this.lastPriceByToken = new Map(); // token -> ltp
     this.lastQuoteByToken = new Map(); // token -> latest quote snapshot
@@ -1119,6 +1122,7 @@ class TradeManager {
         state: "RUNNING",
         stateReason: null,
       });
+      this.riskBudget?.setDayState?.("RUNNING");
       return;
     }
     // Backfill newer fields
@@ -1127,33 +1131,36 @@ class TradeManager {
     if (!cur.state) patch.state = "RUNNING";
     if (cur.stateReason === undefined) patch.stateReason = null;
     if (Object.keys(patch).length) await upsertDailyRisk(key, patch);
+    this.riskBudget?.setDayState?.(cur.state || "RUNNING");
   }
 
   async _updateDailyPnlState({ realized, openPnl, total, prevState }) {
-    const lossCap = Number(
-      (this.risk?.getLimits?.().dailyLossCapInr ?? env.DAILY_MAX_LOSS_INR) ?? 0,
-    );
-    const profitGoal = Number(env.DAILY_PROFIT_GOAL_INR ?? 0);
+    const sessionRInrRaw = Number(this.riskBudget?.getSessionRInr?.() ?? 0);
+    const sessionRInr = sessionRInrRaw > 0 ? sessionRInrRaw : Number(env.RISK_PER_TRADE_INR ?? 1);
+    const dayPnlR = sessionRInr > 0 ? Number(total) / sessionRInr : 0;
 
     let state = "RUNNING";
     let reason = null;
 
-    if (Number.isFinite(lossCap) && lossCap > 0 && total <= -lossCap) {
-      state = "HARD_STOP";
-      reason = "DAILY_MAX_LOSS";
-    } else if (
-      Number.isFinite(profitGoal) &&
-      profitGoal > 0 &&
-      total >= profitGoal
-    ) {
-      state = "SOFT_STOP";
-      reason = "DAILY_PROFIT_GOAL";
+    if (dayPnlR <= -Number(env.DAILY_DD_PAUSE_R ?? 3.0)) {
+      state = "PAUSED";
+      reason = "DAILY_DD_PAUSE_R";
+    } else if (dayPnlR <= -Number(env.DAILY_DD_THROTTLE_R ?? 2.0)) {
+      state = "THROTTLED";
+      reason = "DAILY_DD_THROTTLE_R";
+    } else if (dayPnlR >= Number(env.DAILY_PROFIT_LOCK_START_R ?? 2.0)) {
+      state = "PROFIT_LOCK";
+      reason = "DAILY_PROFIT_LOCK_START_R";
     }
+
+    this.riskBudget?.setDayState?.(state);
 
     const patch = {
       lastRealizedPnl: realized,
       lastOpenPnl: openPnl,
       lastTotal: total,
+      lastTotalR: dayPnlR,
+      sessionRInr,
       state,
       stateReason: reason,
     };
@@ -1163,8 +1170,8 @@ class TradeManager {
         { prevState: prevState || "RUNNING", state, reason },
         "[risk] daily state changed",
       );
-      if (state === "SOFT_STOP") {
-        alert("warn", "⚠️ Daily soft stop reached", {
+      if (state === "PROFIT_LOCK") {
+        alert("warn", "✅ Daily profit-lock mode", {
           state,
           reason,
           total,
@@ -1177,8 +1184,8 @@ class TradeManager {
           meta: { context: "trade_manager" },
         }),
       );
-      } else if (state === "HARD_STOP") {
-        alert("error", "🛑 Daily hard stop reached", {
+      } else if (state === "PAUSED") {
+        alert("error", "🛑 Daily paused mode reached", {
           state,
           reason,
           total,
@@ -3596,17 +3603,13 @@ class TradeManager {
       prevState,
     });
 
-    if (state === "HARD_STOP") {
-      const lossCap = Number(
-        (this.risk?.getLimits?.().dailyLossCapInr ?? env.DAILY_MAX_LOSS_INR) ??
-          1000,
-      );
+    if (state === "PAUSED") {
       logger.error(
         { total, realized, openPnl },
-        "[risk] DAILY_MAX_LOSS hit -> kill switch",
+        "[risk] daily PAUSED state reached -> entries blocked",
       );
-      if (prevState !== "HARD_STOP") {
-        alert("error", "🛑 DAILY_MAX_LOSS hit -> kill switch", {
+      if (prevState !== "PAUSED") {
+        alert("error", "🛑 Daily state PAUSED -> entries blocked", {
           total,
           realized,
           openPnl,
@@ -3620,23 +3623,18 @@ class TradeManager {
         }),
       );
       }
-      this.risk.setKillSwitch(true);
       await upsertDailyRisk(todayKey(), {
-        kill: true,
-        reason: "DAILY_MAX_LOSS",
+        kill: false,
+        reason: "DAILY_DD_PAUSE_R",
         lastTotal: total,
       });
-
-      if (String(env.AUTO_EXIT_ON_DAILY_LOSS) === "true") {
-        await this._panicExit(trade, "DAILY_MAX_LOSS");
-      }
-    } else if (state === "SOFT_STOP") {
-      if (prevState !== "SOFT_STOP") {
+    } else if (state === "PROFIT_LOCK") {
+      if (prevState !== "PROFIT_LOCK") {
         logger.warn(
           { total, realized, openPnl },
-          "[risk] DAILY_PROFIT_GOAL reached -> soft stop entries",
+          "[risk] daily PROFIT_LOCK state reached",
         );
-        alert("info", "✅ DAILY_PROFIT_GOAL reached -> soft stop entries", {
+        alert("info", "✅ Daily PROFIT_LOCK state reached", {
           total,
           realized,
           openPnl,
@@ -8715,6 +8713,12 @@ class TradeManager {
         side: underlyingSide,
         underlyingLtp: routeLtp,
         maxSpreadBpsOverride: policy?.maxSpreadBpsOpt,
+        riskTradeInr: Number(await this.riskBudget.getTradeRiskInr({
+          confidence: Number(s.confidence),
+          regime: s.regime,
+        })),
+        stopDistancePts: Number(env.MIN_SL_POINTS ?? env.EXPECTED_SLIPPAGE_POINTS ?? 0),
+        expectedSlippagePts: Number(env.EXPECTED_SLIPPAGE_POINTS ?? 0),
       });
 
       // PATCH-10: Hard-focus one underlying (prevents accidental multi-index trading)
@@ -8879,12 +8883,8 @@ class TradeManager {
     });
     const dailyRisk = await getDailyRisk(todayKey());
     const dailyState = String(dailyRisk?.state || "RUNNING");
-    if (dailyState === "SOFT_STOP") {
-      logger.warn({ token, dailyState }, "[trade] blocked (daily soft stop)");
-      return;
-    }
-    if (dailyState === "HARD_STOP") {
-      logger.warn({ token, dailyState }, "[trade] blocked (daily hard stop)");
+    if (dailyState === "PAUSED") {
+      logger.warn({ token, dailyState }, "[trade] blocked (daily paused)");
       return;
     }
     const check = this.risk.canTrade(riskKey);
@@ -9353,14 +9353,32 @@ class TradeManager {
     const _openMult = _styleForSizing.includes("OPEN")
       ? Number(env.OPEN_RISK_MULT ?? 0.7)
       : 1.0;
-    const _riskInrOverride = Number(env.RISK_PER_TRADE_INR ?? 0) * _openMult;
+    const _baseRiskInr = env.RISK_BUDGET_ENABLED
+      ? await this.riskBudget.getTradeRiskInr({
+          confidence: confidenceUsed,
+          regime: s.regime || planMeta?.style,
+          spreadBps: Number(sp?.meta?.bps ?? 0),
+          atrPct: Number(reg?.meta?.atrPct ?? reg?.meta?.atr_pct ?? NaN),
+        })
+      : Number(env.RISK_PER_TRADE_INR ?? 0);
+    const _riskInrOverride = Number(_baseRiskInr) * _openMult;
+    const _sessionRiskInr = Number(this.riskBudget?.getSessionRInr?.() ?? 0);
+    logger.info(
+      {
+        token,
+        riskSessionInr: _sessionRiskInr,
+        riskTradeInr: _riskInrOverride,
+        openMult: _openMult,
+      },
+      "[risk] computed dynamic risk budget",
+    );
 
     // Option SL fitter: if 1-lot risk exceeds cap, tighten SL toward entry to fit.
     // This avoids frequent LOT_RISK_CAP blocks when lot sizes are large.
     // We only attempt this for the option-leg (not the underlying future token).
     if (
       s.option_meta &&
-      Boolean(env.OPT_SL_FIT_ENABLED) &&
+      Boolean(env.OPT_SL_FIT_ENABLED) && !env.RISK_BUDGET_ENABLED &&
       Boolean(env.LOT_RISK_CAP_ENFORCE) &&
       Number(instrument?.lot_size ?? 1) > 1
     ) {
@@ -9712,7 +9730,7 @@ class TradeManager {
               String(env.OPT_SL_FIT_WHEN_CAP_BLOCKS || "true") !== "false";
 
             const canRescueBySlFit =
-              forceOneLot && lot > 1 && !!s.option_meta && slFitWhenCapBlocks;
+              !env.RISK_BUDGET_ENABLED && forceOneLot && lot > 1 && !!s.option_meta && slFitWhenCapBlocks;
 
             if (canRescueBySlFit) {
               const tickSize = Number(instrument.tick_size ?? tick ?? 0.05);
@@ -9978,6 +9996,7 @@ class TradeManager {
       minGreenPts: minGreen.minGreenPts,
       // planned risk cap used for sizing / gating (₹)
       riskInr: Number(_riskInrOverride ?? env.RISK_PER_TRADE_INR ?? 0),
+      sessionRiskInr: Number(this.riskBudget?.getSessionRInr?.() ?? 0),
       entryOrderType: finalEntryOrderType,
       maxEntrySlippageBps: maxEntrySlipBps,
       maxEntrySlippageKillBps: maxEntrySlipKillBps,
