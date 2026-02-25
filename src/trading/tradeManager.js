@@ -2149,7 +2149,8 @@ class TradeManager {
     }
 
     if (decision0.policy === "AGGRESSIVE") {
-      const extraSteps = Math.max(0, Number(env.ENTRY_LADDER_TICKS ?? 2));
+      const ladderEnabled = String(env.ENTRY_LADDER_ENABLED ?? "true") !== "false";
+      const extraSteps = ladderEnabled ? Math.max(0, Number(env.ENTRY_LADDER_TICKS ?? 2)) : 0;
       const maxAttempts = 1 + extraSteps;
       const baseBufferTicks = segment === "OPT"
         ? Math.max(1, Number(env.ENTRY_IOC_BASE_BUFFER_TICKS_OPT ?? env.ENTRY_IOC_BASE_BUFFER_TICKS ?? 1))
@@ -2191,7 +2192,17 @@ class TradeManager {
         const unmatched = status === "CANCELLED" && this._isIocUnmatched(latest?.order);
         logResult({ tradeId, orderId: out.orderId, status: unmatched ? "unmatched" : status.toLowerCase(), attempt, filledQty, fallbackUsed: false });
         if (status === "COMPLETE" || filledQty > 0 || (status === "CANCELLED" && !unmatched)) {
-          return { ok: true, entryParams, orderId: out.orderId, orderType: "LIMIT", validity: aggressiveValidity, policy: "AGGRESSIVE", spreadBps, iocAttempt: attempt };
+          return {
+            ok: true,
+            entryParams,
+            orderId: out.orderId,
+            orderType: "LIMIT",
+            validity: aggressiveValidity,
+            policy: "AGGRESSIVE",
+            spreadBps,
+            iocAttempt: attempt,
+            filledQty,
+          };
         }
         if (!unmatched || attempt >= maxAttempts) break;
         if (stepDelayMs > 0) await sleep(stepDelayMs);
@@ -10127,6 +10138,11 @@ class TradeManager {
       }
     }
 
+    const placedQty =
+      Number(microResult?.filledQty) > 0
+        ? Number(microResult.filledQty)
+        : Number(qty);
+
     await updateTrade(tradeId, {
       entryOrderId,
       entryOrderType: finalEntryOrderType,
@@ -10134,9 +10150,10 @@ class TradeManager {
       entryPlacedAt: new Date(),
       status: STATUS.ENTRY_OPEN,
       entryFinalized: false,
+      qty: placedQty,
       ...this._eventPatch("ENTRY_PLACED", {
         orderId: entryOrderId,
-        qty,
+        qty: placedQty,
         side,
       }),
     });
@@ -10146,7 +10163,7 @@ class TradeManager {
     this.activeTradeId = tradeId;
     this._activeTradeToken = token;
     this._activeTradeSide = side;
-    this.risk.markTradeOpened(token, { tradeId, side: side, qty });
+    this.risk.markTradeOpened(token, { tradeId, side: side, qty: placedQty });
 
     // watchdog fallback (in case order_update is missing)
     this._watchEntryUntilDone(tradeId, String(entryOrderId)).catch((e) => {

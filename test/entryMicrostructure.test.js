@@ -26,7 +26,7 @@ describe('entryMicrostructure', () => {
   test('no depth never chooses IOC', () => {
     const out = decidePolicy({ spread_bps: 40, passiveMax: 25, aggressiveMax: 60, hasDepth: false });
     expect(out.policy).not.toBe('AGGRESSIVE');
-    expect(out.reason).toBe('no_depth_for_aggressive');
+    expect(out.reason).toBe('no_depth');
   });
 
   test('ladder buffer ticks increments and stops at chase cap', () => {

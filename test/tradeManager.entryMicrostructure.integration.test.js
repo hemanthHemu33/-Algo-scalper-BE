@@ -12,6 +12,7 @@ describe('TradeManager IOC lifecycle integration', () => {
     'ENTRY_IOC_BASE_BUFFER_TICKS_OPT',
     'ENTRY_LADDER_MAX_CHASE_BPS',
     'ENTRY_LADDER_MAX_CHASE_BPS_OPT',
+    'ENTRY_LADDER_ENABLED',
     'ENTRY_LADDER_TICKS',
     'ENTRY_LADDER_STEP_DELAY_MS',
     'ENTRY_LIMIT_FALLBACK_TO_MARKET',
@@ -143,6 +144,82 @@ describe('TradeManager IOC lifecycle integration', () => {
     expect(out.iocAttempt).toBe(2);
     expect(placed).toHaveLength(2);
     expect(placed.every((x) => x.order_type === 'LIMIT')).toBe(true);
+  });
+
+
+
+  test('does not use IOC when depth is missing', async () => {
+    const tm = buildTm();
+    env.DEFAULT_PRODUCT = 'MIS';
+    env.DEFAULT_ORDER_VARIETY = 'regular';
+    env.ENTRY_PASSIVE_MAX_SPREAD_BPS = 1;
+    env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS = 30;
+
+    tm._getBestBidAsk = jest
+      .fn()
+      .mockResolvedValue({ bid: null, ask: null, ltp: 100, hasDepth: false });
+
+    tm._safePlaceOrder = jest.fn();
+
+    const out = await tm._executeEntryByMicrostructure({
+      tradeId: 'T-4',
+      instrument: { exchange: 'NSE', tradingsymbol: 'NODEPTH', instrument_token: 4, tick_size: 0.05 },
+      side: 'BUY',
+      qty: 10,
+      expectedEntryPrice: 100,
+      segment: 'EQ',
+    });
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe('no_depth');
+    expect(tm._safePlaceOrder).not.toHaveBeenCalled();
+  });
+
+  test('honors ENTRY_LADDER_ENABLED=false for IOC retries', async () => {
+    const tm = buildTm();
+    env.DEFAULT_PRODUCT = 'MIS';
+    env.DEFAULT_ORDER_VARIETY = 'regular';
+    env.ENTRY_LADDER_ENABLED = 'false';
+    env.ENTRY_LADDER_TICKS = 3;
+    env.ENTRY_IOC_BASE_BUFFER_TICKS = 1;
+    env.ENTRY_LADDER_STEP_DELAY_MS = 0;
+    env.ENTRY_LIMIT_FALLBACK_TO_MARKET = 'false';
+    env.ENTRY_PASSIVE_MAX_SPREAD_BPS = 1;
+    env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS = 30;
+
+    tm._getBestBidAsk = jest
+      .fn()
+      .mockResolvedValue({ bid: 99.95, ask: 100, ltp: 100, hasDepth: true });
+
+    const placed = [];
+    tm._safePlaceOrder = jest.fn(async (_variety, params) => {
+      placed.push(params);
+      return { orderId: `oid-${placed.length}` };
+    });
+
+    tm._getOrderStatus = jest.fn(async (orderId) => ({
+      status: 'CANCELLED',
+      order: {
+        order_id: orderId,
+        status: 'CANCELLED',
+        status_message_raw: 'IOC unmatched and cancelled by the system',
+        filled_quantity: 0,
+      },
+    }));
+
+    const out = await tm._executeEntryByMicrostructure({
+      tradeId: 'T-5',
+      instrument: { exchange: 'NSE', tradingsymbol: 'NO-LADDER', instrument_token: 5, tick_size: 0.05 },
+      side: 'BUY',
+      qty: 10,
+      expectedEntryPrice: 100,
+      segment: 'EQ',
+    });
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe('ioc_unmatched');
+    expect(placed).toHaveLength(1);
+    expect(placed[0]).toMatchObject({ order_type: 'LIMIT', validity: 'IOC', price: 100.05 });
   });
 
   test('applies OPT-specific IOC buffer/chase thresholds', async () => {

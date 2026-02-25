@@ -25,11 +25,13 @@ function getTickSize(instrument) {
 }
 
 function decidePolicy({ spread_bps, passiveMax, aggressiveMax, hasDepth }) {
+  if (!hasDepth) return { policy: "ABORT", reason: "no_depth" };
   const spread = Number(spread_bps);
-  if (!Number.isFinite(spread)) return { policy: "ABORT", reason: "spread_unavailable" };
+  if (!(spread_bps !== null && spread_bps !== undefined && Number.isFinite(spread) && spread >= 0)) {
+    return { policy: "ABORT", reason: "spread_unavailable" };
+  }
   if (spread <= Number(passiveMax)) return { policy: "PASSIVE", reason: "tight_spread" };
   if (spread <= Number(aggressiveMax)) {
-    if (!hasDepth) return { policy: "ABORT", reason: "no_depth_for_aggressive" };
     return { policy: "AGGRESSIVE", reason: "spread_in_aggressive_band" };
   }
   return { policy: "ABORT", reason: "spread_too_wide" };
