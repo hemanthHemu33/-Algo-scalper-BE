@@ -1900,6 +1900,8 @@ class TradeManager {
       const q = resp?.[key];
       const bid = Number(q?.depth?.buy?.[0]?.price);
       const ask = Number(q?.depth?.sell?.[0]?.price);
+      const bidQty = Number(q?.depth?.buy?.[0]?.quantity);
+      const askQty = Number(q?.depth?.sell?.[0]?.quantity);
       const ltp = Number(q?.last_price);
       return { bid, ask, ltp };
     } catch {
@@ -7726,6 +7728,8 @@ class TradeManager {
       const q = resp?.[key];
       const bid = Number(q?.depth?.buy?.[0]?.price);
       const ask = Number(q?.depth?.sell?.[0]?.price);
+      const bidQty = Number(q?.depth?.buy?.[0]?.quantity);
+      const askQty = Number(q?.depth?.sell?.[0]?.quantity);
       const ltp = Number(q?.last_price);
 
       const hasDepth =
@@ -7754,23 +7758,27 @@ class TradeManager {
           return {
             ok: false,
             reason: "SPREAD_BPS_NAN",
-            meta: { bid, ask, ltp, bps },
+            meta: { bid, ask, ltp, bps, bidQty, askQty },
           };
         }
-        return { ok: true, note: "spread_nan", meta: { bid, ask, ltp, bps } };
+        return {
+          ok: true,
+          note: "spread_nan",
+          meta: { bid, ask, ltp, bps, bidQty, askQty },
+        };
       }
 
       if (!sampleOnly && enabled && bps > maxBps) {
         return {
           ok: false,
           reason: `SPREAD_TOO_WIDE (${bps.toFixed(1)} bps > ${maxBps})`,
-          meta: { bid, ask, ltp, bps },
+          meta: { bid, ask, ltp, bps, bidQty, askQty },
         };
       }
 
       return {
         ok: true,
-        meta: { bid, ask, ltp, bps },
+        meta: { bid, ask, ltp, bps, bidQty, askQty },
         note: bps > maxBps ? "spread_wide_sample" : null,
       };
     } catch (e) {
@@ -9691,6 +9699,13 @@ class TradeManager {
       const aggressiveMax = Number(env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS ?? 20);
       const bidPx = Number(quoteAtEntry?.bid ?? 0);
       const askPx = Number(quoteAtEntry?.ask ?? 0);
+      const bidQtyTop = Number(quoteAtEntry?.bidQty ?? 0);
+      const askQtyTop = Number(quoteAtEntry?.askQty ?? 0);
+      const oppositeTopQty = side === "BUY" ? askQtyTop : bidQtyTop;
+      const minAggressiveTopQty = Math.max(
+        0,
+        Number(env.ENTRY_AGGRESSIVE_MIN_TOP_QTY ?? 1),
+      );
 
       if (spreadBpsAtEntry <= passiveMax) {
         execPolicyMeta.bucket = "PASSIVE";
@@ -9699,11 +9714,16 @@ class TradeManager {
         if (side === "BUY" && Number.isFinite(bidPx) && bidPx > 0) entryPriceHint = bidPx;
         if (side === "SELL" && Number.isFinite(askPx) && askPx > 0) entryPriceHint = askPx;
       } else if (spreadBpsAtEntry <= aggressiveMax) {
-        execPolicyMeta.bucket = "AGGRESSIVE";
-        finalEntryOrderType = "LIMIT";
-        entryValidity = String(env.ENTRY_AGGRESSIVE_VALIDITY || "IOC").toUpperCase();
-        if (side === "BUY" && Number.isFinite(askPx) && askPx > 0) entryPriceHint = askPx;
-        if (side === "SELL" && Number.isFinite(bidPx) && bidPx > 0) entryPriceHint = bidPx;
+        if (oppositeTopQty < minAggressiveTopQty) {
+          execPolicyMeta.bucket = "AGGRESSIVE_NO_DEPTH";
+          finalEntryOrderType = "MARKET";
+        } else {
+          execPolicyMeta.bucket = "AGGRESSIVE";
+          finalEntryOrderType = "LIMIT";
+          entryValidity = String(env.ENTRY_AGGRESSIVE_VALIDITY || "DAY").toUpperCase();
+          if (side === "BUY" && Number.isFinite(askPx) && askPx > 0) entryPriceHint = askPx;
+          if (side === "SELL" && Number.isFinite(bidPx) && bidPx > 0) entryPriceHint = bidPx;
+        }
       } else {
         execPolicyMeta.bucket = "WIDE_SPREAD";
         finalEntryOrderType = "MARKET";
