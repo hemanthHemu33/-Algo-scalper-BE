@@ -59,11 +59,7 @@ const {
 const { optimizer } = require("../optimizer/adaptiveOptimizer");
 const { equityService } = require("../account/equityService");
 const { buildPositionsSnapshot } = require("./positionService");
-const {
-  getRiskLimits,
-  evaluateDailyRiskState,
-  isEntryAllowedForState,
-} = require("../risk/riskLimits");
+const { getRiskLimits } = require("../risk/riskLimits");
 const { RiskBudget } = require("../risk/riskBudget");
 const {
   ensureTradeIndexes,
@@ -1147,6 +1143,17 @@ class TradeManager {
     const evaluated = evaluateDailyRiskState({ dayPnlR, limits });
     const state = evaluated.state;
     const reason = evaluated.reason;
+
+    if (dayPnlR <= -Number(env.DAILY_DD_PAUSE_R ?? 3.0)) {
+      state = "PAUSED";
+      reason = "DAILY_DD_PAUSE_R";
+    } else if (dayPnlR <= -Number(env.DAILY_DD_THROTTLE_R ?? 2.0)) {
+      state = "THROTTLED";
+      reason = "DAILY_DD_THROTTLE_R";
+    } else if (dayPnlR >= Number(env.DAILY_PROFIT_LOCK_START_R ?? 2.0)) {
+      state = "PROFIT_LOCK";
+      reason = "DAILY_PROFIT_LOCK_START_R";
+    }
 
     this.riskBudget?.setDayState?.(state);
 
@@ -8711,9 +8718,8 @@ class TradeManager {
         riskTradeInr: Number(await this.riskBudget.getTradeRiskInr({
           confidence: Number(s.confidence),
           regime: s.regime,
-          spreadBps: Number(policy?.maxSpreadBpsOpt ?? NaN),
         })),
-        stopDistancePts: Number(env.MIN_SL_POINTS ?? 0),
+        stopDistancePts: Number(env.MIN_SL_POINTS ?? env.EXPECTED_SLIPPAGE_POINTS ?? 0),
         expectedSlippagePts: Number(env.EXPECTED_SLIPPAGE_POINTS ?? 0),
       });
 
@@ -8879,8 +8885,8 @@ class TradeManager {
     });
     const dailyRisk = await getDailyRisk(todayKey());
     const dailyState = String(dailyRisk?.state || "RUNNING");
-    if (!isEntryAllowedForState(dailyState)) {
-      logger.warn({ token, dailyState }, "[trade] blocked (daily risk state)");
+    if (dailyState === "PAUSED") {
+      logger.warn({ token, dailyState }, "[trade] blocked (daily paused)");
       return;
     }
     const check = this.risk.canTrade(riskKey);

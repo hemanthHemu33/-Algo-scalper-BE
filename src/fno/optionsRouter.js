@@ -1006,13 +1006,12 @@ async function pickOptionContractForSignal({
   const feesInrEst = Math.max(0, Number(expectedFeesInr ?? 0));
   const scoredWithRisk = scored.map((x) => {
     const lot = Math.max(1, Number(x?.row?.lot_size ?? 1));
-    const stopPtsCandidate = estimateRiskStopPtsForOption({ row: x?.row, fallbackStopPts: stopPtsEst });
-    const riskPerLot = (stopPtsCandidate + slipPtsEst) * lot + feesInrEst;
+    const riskPerLot = (stopPtsEst + slipPtsEst) * lot + feesInrEst;
     const riskFitOk =
       !riskFitEnabled ||
       !(Number.isFinite(riskFitCapInr) && riskFitCapInr > 0) ||
       (Number.isFinite(riskPerLot) && riskPerLot <= riskFitCapInr);
-    return { ...x, riskPerLot, riskFitOk, stopPtsCandidate };
+    return { ...x, riskPerLot, riskFitOk };
   });
 
   // Eligible candidates:
@@ -1126,8 +1125,6 @@ async function pickOptionContractForSignal({
               ivTrendOk: !!x.ivTrendOk,
               riskFitOk: !!x.riskFitOk,
               riskPerLot: Number(x.riskPerLot ?? 0),
-          stopPtsCandidate: Number(x.stopPtsCandidate ?? 0),
-              stopPtsCandidate: Number(x.stopPtsCandidate ?? 0),
               healthOk: !!x.healthOk,
               flickerOk: !!x.flickerOk,
             }))
@@ -1229,7 +1226,7 @@ async function pickOptionContractForSignal({
           },
           greeksRequired,
           oiContext,
-          riskFit: { enabled: riskFitEnabled, capInr: riskFitCapInr, stopPtsEst, slipPtsEst, feesInrEst, mode: "candidate_stop" },
+          riskFit: { enabled: riskFitEnabled, capInr: riskFitCapInr, stopPtsEst, slipPtsEst, feesInrEst },
           topCandidates: debugTop,
         },
       };
@@ -1342,7 +1339,7 @@ async function pickOptionContractForSignal({
         neutralPts: ivNeutralPts,
       },
       greeksRequired,
-      riskFit: { enabled: riskFitEnabled, capInr: riskFitCapInr, stopPtsEst, slipPtsEst, feesInrEst, mode: "candidate_stop", selectedRiskPerLot: Number(best.riskPerLot ?? 0), selectedStopPts: Number(best.stopPtsCandidate ?? 0) },
+      riskFit: { enabled: riskFitEnabled, capInr: riskFitCapInr, stopPtsEst, slipPtsEst, feesInrEst, selectedRiskPerLot: Number(best.riskPerLot ?? 0) },
       micro: { maxBps, spreadRiseBlockBps, minDepth, flickerBlock, minHealthScore },
       liquidityGate: {
         enabled: liqGateEnabled,

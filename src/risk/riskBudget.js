@@ -1,7 +1,6 @@
 const { env } = require("../config");
 const { logger } = require("../logger");
 const { equityService } = require("../account/equityService");
-const { riskMultiplierForState } = require("./riskLimits");
 
 function clamp(v, lo, hi) {
   const n = Number(v);
@@ -27,33 +26,6 @@ function regimeScaler(regime) {
   if (r.includes("OPEN")) return 0.95;
   if (r.includes("RANGE")) return 0.9;
   return 1;
-}
-
-function equityFromSnapshot(snapshot, source) {
-  const src = String(source || "AVAILABLE_MARGIN").trim().toUpperCase();
-  const available = Number(snapshot?.available);
-  const equity = Number(snapshot?.equity);
-  const cash = Number(snapshot?.cash);
-
-  if (src === "EQUITY") return Number.isFinite(equity) ? equity : NaN;
-  if (src === "CASH") return Number.isFinite(cash) ? cash : NaN;
-  if (src === "MAX_AVAILABLE_EQUITY") {
-    return Math.max(
-      Number.isFinite(available) ? available : 0,
-      Number.isFinite(equity) ? equity : 0,
-    );
-  }
-  if (src === "MIN_AVAILABLE_EQUITY") {
-    const vals = [available, equity].filter((v) => Number.isFinite(v));
-    return vals.length ? Math.min(...vals) : NaN;
-  }
-  if (src === "FIXED") return Number(env.RISK_EQUITY_FIXED_INR ?? NaN);
-
-  return Number.isFinite(available)
-    ? available
-    : Number.isFinite(equity)
-      ? equity
-      : NaN;
 }
 
 function spreadScaler(spreadBps) {
@@ -86,7 +58,6 @@ class RiskBudget {
         equityUsedInr: this.snapshot.equityUsedInr,
         volScaler: this.snapshot.volScaler,
         sessionRInr: this.snapshot.sessionRInr,
-        source: this.snapshot.source || null,
       },
       "[riskBudget] initialized",
     );
@@ -96,25 +67,16 @@ class RiskBudget {
     if (!env.RISK_BUDGET_ENABLED) return this.snapshot;
 
     const marginUsePct = clamp(env.MARGIN_USE_PCT ?? 0.9, 0, 1);
-    let usableEquityBase = 0;
-    let sourceResolved = String(env.RISK_EQUITY_SOURCE || "AVAILABLE_MARGIN");
+    let available = 0;
     try {
       const snap = await equityService.snapshot({ kite: this.kite });
-      const point = snap?.snapshot || null;
-      const picked = equityFromSnapshot(point, sourceResolved);
-      if (Number.isFinite(picked) && picked > 0) {
-        usableEquityBase = picked;
-      } else {
-        sourceResolved = "AVAILABLE_MARGIN_FALLBACK";
-        usableEquityBase = Number(point?.available ?? point?.equity ?? 0);
-      }
+      available = Number(snap?.snapshot?.available ?? snap?.snapshot?.equity ?? 0);
     } catch {
-      usableEquityBase = 0;
-      sourceResolved = `${sourceResolved}_ERROR_FALLBACK`;
+      available = 0;
     }
 
     const eqFloor = Math.max(0, Number(env.RISK_EQUITY_FLOOR_INR ?? 0));
-    const equityUsedInr = Math.max(eqFloor, usableEquityBase * marginUsePct);
+    const equityUsedInr = Math.max(eqFloor, available * marginUsePct);
 
     const volTargetBps = Math.max(1, Number(env.RISK_VOL_TARGET_BPS ?? 65));
     const atrBps = Number(signalCtx?.atrBps);
@@ -138,7 +100,6 @@ class RiskBudget {
       equityUsedInr,
       volScaler,
       sessionRInr,
-      source: sourceResolved,
       updatedAt: Date.now(),
     };
 
@@ -162,7 +123,11 @@ class RiskBudget {
   }
 
   _dayRiskMult() {
-    return riskMultiplierForState(this.getDayState());
+    const st = this.getDayState();
+    if (st === "THROTTLED") return Number(env.DAILY_DD_THROTTLE_RISK_MULT ?? 0.6);
+    if (st === "PROFIT_LOCK") return Number(env.DAILY_PROFIT_LOCK_RISK_MULT ?? 0.5);
+    if (st === "PAUSED") return 0;
+    return 1;
   }
 
   async getTradeRiskInr(signalCtx = {}) {
