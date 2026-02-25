@@ -16,7 +16,8 @@
     "test:phase8:live": "node scripts/phase8_live_matrix.js",
     "test": "node --check src/index.js",
     "test:recovery-gate": "node scripts/test_recovery_coordinator_gate.js",
-    "test:stale-merge": "node scripts/test_stale_event_merge_regression.js"
+    "test:stale-merge": "node scripts/test_stale_event_merge_regression.js",
+    "test:lifecycle-pending": "node scripts/test_lifecycle_pending_validations.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
