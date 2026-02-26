@@ -2,6 +2,7 @@ const { DateTime } = require("luxon");
 const { env } = require("../config");
 const { normalizeTickSize } = require("../utils/tickSize");
 const { logger } = require("../logger");
+const { buildTradePlan } = require("../trading/planBuilder");
 const {
   isQuoteGuardBreakerOpen,
   getQuoteGuardStats,
@@ -525,6 +526,7 @@ async function pickOptionContractForSignal({
   stopDistancePts,
   expectedSlippagePts = 0,
   expectedFeesInr = 0,
+  prePickPlan = null,
 }) {
   const u = resolveUnderlyingFromUniverse({
     universe,
@@ -1001,28 +1003,79 @@ async function pickOptionContractForSignal({
 
   const riskFitEnabled = !!env.OPT_RISK_FIT_ENABLED;
   const riskFitCapInr = Number(riskTradeInr);
-  const stopPtsEst = Math.max(0, Number(stopDistancePts ?? 0));
+  const stopPtsFallback = Math.max(0, Number(stopDistancePts ?? 0));
   const slipPtsEst = Math.max(0, Number(expectedSlippagePts ?? 0));
   const feesInrEst = Math.max(0, Number(expectedFeesInr ?? 0));
+  const prePickPlanEnabled =
+    !!prePickPlan &&
+    String(prePickPlan?.enabled ?? "true") !== "false" &&
+    Array.isArray(prePickPlan?.candles) &&
+    prePickPlan.candles.length >= 30;
+
   const scoredWithRisk = scored.map((x) => {
     const lot = Math.max(1, Number(x?.row?.lot_size ?? 1));
-    const riskPerLot = (stopPtsEst + slipPtsEst) * lot + feesInrEst;
+    let stopPtsUsed = stopPtsFallback;
+    let stopSource = "FALLBACK";
+
+    if (prePickPlanEnabled) {
+      const entryPremium = Number(x?.row?.ltp ?? 0);
+      const optionMeta = {
+        optionType: String(x?.row?.instrument_type || "").toUpperCase(),
+        delta: Number(x?.row?.delta),
+        gamma: Number(x?.row?.gamma),
+        daysToExpiry: Number(_dteDays(expiryISO, nowMs)),
+        strategyStyle: prePickPlan?.signalStyle || null,
+      };
+      const plan = buildTradePlan({
+        env,
+        candles: prePickPlan.candles,
+        premiumCandles: null,
+        intervalMin: Number(prePickPlan.intervalMin ?? 3),
+        side: String(prePickPlan.side || side || "").toUpperCase(),
+        signalStyle: prePickPlan.signalStyle,
+        entryUnderlying: Number(prePickPlan.entryUnderlying ?? underlyingLtp ?? 0),
+        expectedMoveUnderlying: Number(prePickPlan.expectedMoveUnderlying ?? 0),
+        atrPeriod: Number(prePickPlan.atrPeriod ?? env.EXPECTED_MOVE_ATR_PERIOD ?? 14),
+        optionMeta,
+        entryPremium,
+        premiumTick: Number(x?.row?.tick_size ?? 0.05),
+        atrPctUnderlying: Number(prePickPlan.atrPctUnderlying),
+      });
+      if (plan?.ok) {
+        const stopPtsPlan = Math.abs(entryPremium - Number(plan.stopLoss ?? 0));
+        if (Number.isFinite(stopPtsPlan) && stopPtsPlan > 0) {
+          stopPtsUsed = stopPtsPlan;
+          stopSource = "PLAN_BUILDER";
+        }
+      }
+    }
+
+    const riskPerLot = (stopPtsUsed + slipPtsEst) * lot + feesInrEst;
     const riskFitOk =
       !riskFitEnabled ||
       !(Number.isFinite(riskFitCapInr) && riskFitCapInr > 0) ||
       (Number.isFinite(riskPerLot) && riskPerLot <= riskFitCapInr);
-    return { ...x, riskPerLot, riskFitOk };
+    const riskFitReason = riskFitOk ? "PASS" : "risk_per_lot_exceeds_R_trade";
+    return { ...x, riskPerLot, riskFitOk, riskFitReason, stopPtsUsed, stopSource };
   });
 
   // Eligible candidates:
   // - premium band enforced for NIFTY when enabled
   // - and (pro) require ok => all gates must pass
-  const eligible = scoredWithRisk.filter((x) => {
-    if (enforcePremBand && !x.premOk) return false;
-    if (requireOk && !x.ok) return false;
-    if (!x.riskFitOk) return false;
-    return true;
-  });
+  const eligible = scoredWithRisk
+    .filter((x) => {
+      if (enforcePremBand && !x.premOk) return false;
+      if (requireOk && !x.ok) return false;
+      if (!x.riskFitOk) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      const liqA = Number(a?.liqScore ?? 0);
+      const liqB = Number(b?.liqScore ?? 0);
+      if (liqA !== liqB) return liqB - liqA;
+      if (a.score !== b.score) return a.score - b.score;
+      return a.dist - b.dist;
+    });
 
   // If nothing is eligible, optionally allow a *premium-band-only* fallback
   // (i.e., keep all other gates intact).
@@ -1124,6 +1177,9 @@ async function pickOptionContractForSignal({
               ivOk: !!x.ivOk,
               ivTrendOk: !!x.ivTrendOk,
               riskFitOk: !!x.riskFitOk,
+              riskFitReason: x.riskFitReason,
+              stopSource: x.stopSource,
+              stopPtsUsed: Number(x.stopPtsUsed ?? 0),
               riskPerLot: Number(x.riskPerLot ?? 0),
               healthOk: !!x.healthOk,
               flickerOk: !!x.flickerOk,
@@ -1271,6 +1327,9 @@ async function pickOptionContractForSignal({
           ivOk: !!x.ivOk,
           ivTrendOk: !!x.ivTrendOk,
           riskFitOk: !!x.riskFitOk,
+          riskFitReason: x.riskFitReason,
+          stopSource: x.stopSource,
+          stopPtsUsed: Number(x.stopPtsUsed ?? 0),
           riskPerLot: Number(x.riskPerLot ?? 0),
         }))
       : undefined;
@@ -1339,7 +1398,17 @@ async function pickOptionContractForSignal({
         neutralPts: ivNeutralPts,
       },
       greeksRequired,
-      riskFit: { enabled: riskFitEnabled, capInr: riskFitCapInr, stopPtsEst, slipPtsEst, feesInrEst, selectedRiskPerLot: Number(best.riskPerLot ?? 0) },
+      riskFit: {
+        enabled: riskFitEnabled,
+        capInr: riskFitCapInr,
+        stopPtsFallback,
+        prePickPlanEnabled,
+        slipPtsEst,
+        feesInrEst,
+        selectedStopSource: best.stopSource,
+        selectedStopPts: Number(best.stopPtsUsed ?? 0),
+        selectedRiskPerLot: Number(best.riskPerLot ?? 0),
+      },
       micro: { maxBps, spreadRiseBlockBps, minDepth, flickerBlock, minHealthScore },
       liquidityGate: {
         enabled: liqGateEnabled,

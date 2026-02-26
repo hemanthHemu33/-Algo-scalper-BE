@@ -350,8 +350,9 @@ const schema = z.object({
   // If disabled, engine may block trades when 1-lot risk exceeds cap after lot-normalization.
   OPT_SL_FIT_ENABLED: boolFromEnv.default(false),
   // When FORCE_ONE_LOT + LOT_RISK_CAP_ENFORCE would otherwise BLOCK, auto-tighten SL to fit 1 lot within cap.
-  // Safe default: it never increases INR risk; it either tightens SL or blocks if it cannot fit within MIN ticks.
-  OPT_SL_FIT_WHEN_CAP_BLOCKS: boolFromEnv.default(true),
+  // Pro default is OFF (STRICT risk-fit). Enable only as an explicit emergency fallback.
+  OPT_SL_FIT_WHEN_CAP_BLOCKS: boolFromEnv.default(false),
+  ALLOW_SL_FIT_RESCUE: boolFromEnv.default(false),
   // Minimum SL distance enforced by fitter (in ticks). Helps avoid ultra-tight “0.05 SL” fitting.
   OPT_SL_FIT_MIN_TICKS: z.coerce.number().default(10),
 
@@ -906,6 +907,8 @@ const schema = z.object({
   COST_GATE_MULT_WIDE_SPREAD_BONUS: z.coerce.number().default(0.5),
   COST_GATE_MULT_PROFIT_LOCK_BONUS: z.coerce.number().default(0.2),
   COST_GATE_MULT_THROTTLED_BONUS: z.coerce.number().default(0.35),
+  COST_GATE_MULT_RANGE_BONUS: z.coerce.number().default(0.25),
+  COST_GATE_MULT_TREND_BONUS: z.coerce.number().default(-0.2),
   // Planned fee-multiple gate: (plannedProfit @ RR target) / estCosts. 0 disables.
   FEE_MULTIPLE_PLANNED_MIN: z.coerce.number().default(0),
   EXPECTED_MOVE_ATR_PERIOD: z.coerce.number().default(14),

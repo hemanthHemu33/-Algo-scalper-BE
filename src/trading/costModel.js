@@ -136,7 +136,11 @@ function resolveCostGateMultiple({ env, instrument, spreadBps, ctx } = {}) {
   if (dayState === "PROFIT_LOCK") k += n(env?.COST_GATE_MULT_PROFIT_LOCK_BONUS, 0.2);
 
   const regime = up(ctx?.regime);
-  if (regime.includes("RANGE")) k += 0.15;
+  if (regime.includes("RANGE")) {
+    k += n(env?.COST_GATE_MULT_RANGE_BONUS, 0.25);
+  } else if (regime.includes("TREND")) {
+    k += n(env?.COST_GATE_MULT_TREND_BONUS, -0.2);
+  }
 
   const kMin = n(env?.COST_GATE_MULT_MIN, 2.5);
   const kMax = n(env?.COST_GATE_MULT_MAX, 4.0);

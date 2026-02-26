@@ -1144,17 +1144,6 @@ class TradeManager {
     const state = evaluated.state;
     const reason = evaluated.reason;
 
-    if (dayPnlR <= -Number(env.DAILY_DD_PAUSE_R ?? 3.0)) {
-      state = "PAUSED";
-      reason = "DAILY_DD_PAUSE_R";
-    } else if (dayPnlR <= -Number(env.DAILY_DD_THROTTLE_R ?? 2.0)) {
-      state = "THROTTLED";
-      reason = "DAILY_DD_THROTTLE_R";
-    } else if (dayPnlR >= Number(env.DAILY_PROFIT_LOCK_START_R ?? 2.0)) {
-      state = "PROFIT_LOCK";
-      reason = "DAILY_PROFIT_LOCK_START_R";
-    }
-
     this.riskBudget?.setDayState?.(state);
 
     const patch = {
@@ -8707,6 +8696,18 @@ class TradeManager {
         }
       }
 
+      const intervalMinForPick = Number(s.intervalMin ?? s.candle?.interval_min ?? 3);
+      let prePickCandles = null;
+      try {
+        prePickCandles = await getRecentCandles(
+          underlyingToken,
+          intervalMinForPick,
+          Number(env.PLAN_CANDLE_LIMIT ?? 300),
+        );
+      } catch {
+        prePickCandles = null;
+      }
+
       const picked = await pickOptionContractForSignal({
         kite: this.kite,
         universe: uni,
@@ -8721,6 +8722,16 @@ class TradeManager {
         })),
         stopDistancePts: Number(env.MIN_SL_POINTS ?? env.EXPECTED_SLIPPAGE_POINTS ?? 0),
         expectedSlippagePts: Number(env.EXPECTED_SLIPPAGE_POINTS ?? 0),
+        prePickPlan: {
+          enabled: true,
+          candles: Array.isArray(prePickCandles) ? prePickCandles : [],
+          intervalMin: intervalMinForPick,
+          side: underlyingSide,
+          signalStyle: s.strategyStyle,
+          entryUnderlying: Number(routeLtp || underLtp || s.candle?.close || 0),
+          expectedMoveUnderlying: Number(s.expectedMovePerShare ?? 0),
+          atrPeriod: Number(env.EXPECTED_MOVE_ATR_PERIOD ?? 14),
+        },
       });
 
       // PATCH-10: Hard-focus one underlying (prevents accidental multi-index trading)
@@ -9365,11 +9376,16 @@ class TradeManager {
       : Number(env.RISK_PER_TRADE_INR ?? 0);
     const _riskInrOverride = Number(_baseRiskInr) * _openMult;
     const _sessionRiskInr = Number(this.riskBudget?.getSessionRInr?.() ?? 0);
+    const _tradeRiskR =
+      Number.isFinite(_sessionRiskInr) && _sessionRiskInr > 0
+        ? _riskInrOverride / _sessionRiskInr
+        : null;
     logger.info(
       {
         token,
-        riskSessionInr: _sessionRiskInr,
-        riskTradeInr: _riskInrOverride,
+        R_session_inr: _sessionRiskInr,
+        tradeRiskR: _tradeRiskR,
+        R_trade_inr: _riskInrOverride,
         openMult: _openMult,
       },
       "[risk] computed dynamic risk budget",
@@ -9729,10 +9745,17 @@ class TradeManager {
               String(env.FNO_MIN_LOT_POLICY || "STRICT").toUpperCase() ===
               "FORCE_ONE_LOT";
             const slFitWhenCapBlocks =
-              String(env.OPT_SL_FIT_WHEN_CAP_BLOCKS || "true") !== "false";
+              String(env.OPT_SL_FIT_WHEN_CAP_BLOCKS || "false") === "true";
+            const allowSlFitRescue =
+              String(env.ALLOW_SL_FIT_RESCUE || "false") === "true";
 
             const canRescueBySlFit =
-              !env.RISK_BUDGET_ENABLED && forceOneLot && lot > 1 && !!s.option_meta && slFitWhenCapBlocks;
+              allowSlFitRescue &&
+              !env.RISK_BUDGET_ENABLED &&
+              forceOneLot &&
+              lot > 1 &&
+              !!s.option_meta &&
+              slFitWhenCapBlocks;
 
             if (canRescueBySlFit) {
               const tickSize = Number(instrument.tick_size ?? tick ?? 0.05);
@@ -9811,6 +9834,7 @@ class TradeManager {
                       qtyMode,
                       intendedRiskInr,
                       forceOneLot,
+                      allowSlFitRescue,
                       slFitWhenCapBlocks,
                       fitReason: fit.reason,
                       fitMeta: fit.meta || null,
@@ -9834,6 +9858,8 @@ class TradeManager {
                     lot,
                     qtyMode,
                     intendedRiskInr,
+                    policy: String(env.FNO_MIN_LOT_POLICY || "STRICT").toUpperCase(),
+                    allowSlFitRescue,
                   },
                 },
                 "[trade] blocked (lot risk cap after lot-normalization)",
@@ -9864,6 +9890,33 @@ class TradeManager {
         }
       }
     }
+
+    if (qty < 1) {
+      logger.info(
+        {
+          token,
+          side,
+          reason: "lot_risk_exceeds_trade_risk",
+          policy: String(env.FNO_MIN_LOT_POLICY || "STRICT").toUpperCase(),
+        },
+        "[trade] blocked (strict lot policy)",
+      );
+      return;
+    }
+
+    logger.info(
+      {
+        token,
+        riskPerLot_inr:
+          Math.abs(Number(expectedEntryPrice ?? entryGuess ?? 0) - Number(stopLoss ?? 0)) *
+          Math.max(1, Number(instrument?.lot_size ?? 1)),
+        lotsChosen:
+          Number(instrument?.lot_size ?? 1) > 1
+            ? Number(qty) / Number(instrument?.lot_size ?? 1)
+            : Number(qty),
+      },
+      "[risk] final lot sizing",
+    );
 
     const exposureCheck = await this._checkExposureLimits({
       instrument,

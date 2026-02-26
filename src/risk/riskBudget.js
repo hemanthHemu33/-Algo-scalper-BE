@@ -66,11 +66,13 @@ class RiskBudget {
   async refresh({ signalCtx } = {}) {
     if (!env.RISK_BUDGET_ENABLED) return this.snapshot;
 
-    const marginUsePct = clamp(env.MARGIN_USE_PCT ?? 0.9, 0, 1);
+    const marginUsePct = clamp(Number(env.MARGIN_USE_PCT ?? 100) / 100, 0, 1);
     let available = 0;
     try {
       const snap = await equityService.snapshot({ kite: this.kite });
-      available = Number(snap?.snapshot?.available ?? snap?.snapshot?.equity ?? 0);
+      available = Number(
+        snap?.snapshot?.available ?? snap?.snapshot?.equity ?? 0,
+      );
     } catch {
       available = 0;
     }
@@ -86,14 +88,21 @@ class RiskBudget {
       : Number.isFinite(atrPct)
         ? atrPct * 100
         : NaN;
-    const volRaw = Number.isFinite(signalVolBps) && signalVolBps > 0 ? volTargetBps / signalVolBps : 1;
+    const volRaw =
+      Number.isFinite(signalVolBps) && signalVolBps > 0
+        ? volTargetBps / signalVolBps
+        : 1;
     const volScaler = clamp(
       volRaw,
       Number(env.RISK_VOL_SCALER_MIN ?? 0.65),
       Number(env.RISK_VOL_SCALER_MAX ?? 1.4),
     );
 
-    const baseRiskPct = clamp(env.RISK_BASE_PCT_PER_TRADE ?? 0.0035, 0.0001, 0.05);
+    const baseRiskPct = clamp(
+      env.RISK_BASE_PCT_PER_TRADE ?? 0.0035,
+      0.0001,
+      0.05,
+    );
     const sessionRInr = Math.max(0, equityUsedInr * baseRiskPct * volScaler);
 
     this.snapshot = {
@@ -117,15 +126,19 @@ class RiskBudget {
 
   setDayState(state) {
     const s = String(state || "RUNNING").toUpperCase();
-    this.dayState = ["RUNNING", "THROTTLED", "PAUSED", "PROFIT_LOCK"].includes(s)
+    this.dayState = ["RUNNING", "THROTTLED", "PAUSED", "PROFIT_LOCK"].includes(
+      s,
+    )
       ? s
       : "RUNNING";
   }
 
   _dayRiskMult() {
     const st = this.getDayState();
-    if (st === "THROTTLED") return Number(env.DAILY_DD_THROTTLE_RISK_MULT ?? 0.6);
-    if (st === "PROFIT_LOCK") return Number(env.DAILY_PROFIT_LOCK_RISK_MULT ?? 0.5);
+    if (st === "THROTTLED")
+      return Number(env.DAILY_DD_THROTTLE_RISK_MULT ?? 0.6);
+    if (st === "PROFIT_LOCK")
+      return Number(env.DAILY_PROFIT_LOCK_RISK_MULT ?? 0.5);
     if (st === "PAUSED") return 0;
     return 1;
   }
@@ -134,7 +147,10 @@ class RiskBudget {
     if (!env.RISK_BUDGET_ENABLED) return Number(env.RISK_PER_TRADE_INR ?? 0);
     await this.refresh({ signalCtx });
     const base = this.getSessionRInr();
-    const q = confidenceScaler(signalCtx.confidence) * regimeScaler(signalCtx.regime) * spreadScaler(signalCtx.spreadBps);
+    const q =
+      confidenceScaler(signalCtx.confidence) *
+      regimeScaler(signalCtx.regime) *
+      spreadScaler(signalCtx.spreadBps);
     const baseMult = Number(env.RISK_TRADE_R_BASE ?? 1.0);
     const qClamped = clamp(
       q * (Number.isFinite(baseMult) ? baseMult : 1),
