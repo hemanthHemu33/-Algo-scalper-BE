@@ -279,7 +279,8 @@ const scenarios = [
       assert.equal(plan.ok, true);
       assert.equal(Boolean(plan.tradePatch?.profitLockArmedAt), true);
       assert.equal(plan.tradePatch?.profitLockInr, 25);
-      assert.equal(plan.tradePatch?.profitLockR, 0.25);
+      assert.equal(plan.tradePatch?.profitLockKeepR, 0.25);
+      assert.equal(plan.tradePatch?.profitLockArmR, 1);
       assert.ok(Number(plan.meta?.desiredStopLoss) >= 102.5);
       assert.ok(Number(plan.meta?.desiredStopLoss) >= Number(plan.meta?.beFloor ?? 0));
       assert.ok(Number(plan.sl?.stopLoss) < ltp, 'SL trigger must stay below LTP for BUY');
