@@ -1066,7 +1066,6 @@ async function pickOptionContractForSignal({
     .filter((x) => {
       if (enforcePremBand && !x.premOk) return false;
       if (requireOk && !x.ok) return false;
-      if (!x.riskFitOk) return false;
       return true;
     })
     .sort((a, b) => {
@@ -1143,7 +1142,7 @@ async function pickOptionContractForSignal({
     // Still nothing? Return original failure.
     if (!best) {
       const why = requireOk
-        ? "no OK candidate (spread/depth/greeks/oi gates or risk-fit)"
+        ? "no OK candidate (spread/depth/greeks/oi gates)"
         : "no candidate in premium band";
 
       const msg = `[options] ${why} for ${underlying} ${optType} (minPrem=${minPrem}, maxPrem=${maxPrem}, maxBps=${maxBps}, minDepth=${minDepth})`;
@@ -1408,6 +1407,8 @@ async function pickOptionContractForSignal({
         selectedStopSource: best.stopSource,
         selectedStopPts: Number(best.stopPtsUsed ?? 0),
         selectedRiskPerLot: Number(best.riskPerLot ?? 0),
+        selectedRiskFitOk: !!best.riskFitOk,
+        selectedRiskFitReason: best.riskFitReason,
       },
       micro: { maxBps, spreadRiseBlockBps, minDepth, flickerBlock, minHealthScore },
       liquidityGate: {

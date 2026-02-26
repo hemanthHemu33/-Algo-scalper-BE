@@ -278,7 +278,8 @@ class RiskEngine {
     const feesPerLot = Math.max(0, Number(feePerLotInr ?? env.EXPECTED_FEES_PER_LOT_INR ?? 0));
     const effRiskPerLot = (slPts + slipPts) * lot + feesPerLot;
     const perLot = Math.max(0.05, effRiskPerLot);
-    return Math.max(1, Math.floor(riskInr / perLot) * lot);
+    const lotsByRisk = Math.max(0, Math.floor(riskInr / perLot));
+    return lotsByRisk * lot;
   }
 }
 

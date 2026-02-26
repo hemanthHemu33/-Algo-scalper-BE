@@ -9,7 +9,11 @@ const {
 const { logger } = require("../logger");
 const { telemetry } = require("../telemetry/signalTelemetry");
 const { tradeTelemetry } = require("../telemetry/tradeTelemetry");
-const { marginAwareQty } = require("./marginSizer");
+const {
+  marginAwareQty,
+  getAvailableEquityMargin,
+  calcMarginsForOrder,
+} = require("./marginSizer");
 const { alert } = require("../alerts/alertService");
 const { halt, isHalted } = require("../runtime/halt");
 const { getDb } = require("../db");
@@ -9607,6 +9611,10 @@ class TradeManager {
       feePerLotInr: Number(env.EXPECTED_FEES_PER_LOT_INR ?? 0),
     });
 
+    const lotSize = Math.max(1, Number(instrument.lot_size ?? 1));
+    const lotsByRisk = Math.max(0, Math.floor(Number(qtyByRisk ?? 0) / lotSize));
+    const qtyUnitsByRisk = lotsByRisk * lotSize;
+
     // If you want sizing purely from available margin, set:
     //   QTY_SIZING_MODE=MARGIN
     // and optionally tune:
@@ -9617,12 +9625,27 @@ class TradeManager {
     let qtyWanted =
       qtyMode === "MARGIN"
         ? Number(env.MAX_QTY_HARDCAP ?? env.MAX_QTY ?? 10000)
-        : qtyByRisk;
+        : qtyUnitsByRisk;
+
+    if (qtyMode !== "MARGIN" && qtyUnitsByRisk < 1) {
+      logger.info(
+        {
+          token,
+          side,
+          lotSize,
+          lotsByRisk,
+          qtyUnitsByRisk,
+          R_trade_inr: _riskInrOverride,
+        },
+        "[trade] skipped: risk budget too small for minimum tradable lot",
+      );
+      return;
+    }
 
     // Lot-aware sizing: if policy forces at least 1 lot, ensure the marginSizer checks margin for >= 1 lot
     // (otherwise we might validate margin for a smaller qty and then normalize up to a lot later).
     if (
-      String(env.FNO_MIN_LOT_POLICY || "FORCE_ONE_LOT").toUpperCase() ===
+      String(env.FNO_MIN_LOT_POLICY || "STRICT").toUpperCase() ===
         "FORCE_ONE_LOT" &&
       Number(instrument.lot_size ?? 0) > 1
     ) {
@@ -9683,14 +9706,87 @@ class TradeManager {
       qty = freezeCheck.qty;
     }
     if (qty < 1) {
+      const minOrderQty = lotSize > 1 ? lotSize : 1;
+      let availableMarginInr = null;
+      let requiredInr = null;
+      let reason = "UNKNOWN";
+      let usedEstimatedRequired = false;
+
+      try {
+        const margins = await this.kite.getMargins();
+        const available = Number(getAvailableEquityMargin(margins));
+        if (Number.isFinite(available)) availableMarginInr = available;
+      } catch {
+        // fallback to equity service snapshot when margins API is flaky
+      }
+
+      if (!Number.isFinite(availableMarginInr) || availableMarginInr <= 0) {
+        try {
+          const eqSnap = await equityService.snapshot({ kite: this.kite });
+          const available = Number(
+            eqSnap?.snapshot?.available ?? eqSnap?.snapshot?.equity ?? 0,
+          );
+          if (Number.isFinite(available) && available > 0) {
+            availableMarginInr = available;
+          }
+        } catch {
+          // keep null; reason will capture unavailable funds telemetry
+        }
+      }
+
+      try {
+        const m = await calcMarginsForOrder({
+          kite: this.kite,
+          params: entryParamsForSizing,
+          qty: minOrderQty,
+          entryPriceGuess: entryGuess,
+        });
+        if (Number.isFinite(Number(m?.required)) && Number(m.required) > 0) {
+          requiredInr = Number(m.required);
+        }
+      } catch {
+        // fallback estimate below
+      }
+
+      if (!Number.isFinite(requiredInr) || requiredInr <= 0) {
+        const notional = Number(entryGuess) * Number(minOrderQty);
+        const fallbackMult = Math.max(
+          0.05,
+          Number(env.MARGIN_DIAG_REQUIRED_FALLBACK_MULT ?? 1.15),
+        );
+        if (Number.isFinite(notional) && notional > 0) {
+          requiredInr = notional * fallbackMult;
+          usedEstimatedRequired = true;
+        }
+      }
+
+      if (!Number.isFinite(availableMarginInr) || availableMarginInr <= 0) {
+        reason = "FUNDS_UNAVAILABLE";
+      } else if (!Number.isFinite(requiredInr) || requiredInr <= 0) {
+        reason = "MARGIN_CALC_UNAVAILABLE";
+      } else if (requiredInr > availableMarginInr) {
+        reason = usedEstimatedRequired
+          ? "INSUFFICIENT_MARGIN_EST"
+          : "INSUFFICIENT_MARGIN";
+      } else {
+        reason = usedEstimatedRequired ? "INVALID_QTY_EST" : "INVALID_QTY";
+      }
+
       logger.warn(
         {
           token,
           side,
-          qtyByRisk,
-          availableMargin: "check /admin/status funds",
+          qtyByRisk: qtyUnitsByRisk,
+          lotsByRisk,
+          qtyUnits: qty,
+          lotSize,
+          minOrderQty,
+          availableMarginInr,
+          requiredInr,
+          usedEstimatedRequired,
+          reason,
         },
-        "[trade] blocked: insufficient margin for even 1 qty",
+        "[trade] blocked: qty below tradable minimum",
       );
       return;
     }

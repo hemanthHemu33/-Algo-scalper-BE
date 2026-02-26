@@ -573,7 +573,7 @@ const schema = z.object({
   RISK_BUDGET_ENABLED: boolFromEnv.default(true),
   RISK_EQUITY_SOURCE: z.string().default("AVAILABLE_MARGIN"),
   RISK_EQUITY_FLOOR_INR: z.coerce.number().default(0),
-  RISK_BASE_PCT_PER_TRADE: z.coerce.number().default(0.0035),
+  RISK_BASE_PCT_PER_TRADE: z.coerce.number().default(0.018),
   RISK_VOL_TARGET_BPS: z.coerce.number().default(65),
   RISK_VOL_SCALER_MIN: z.coerce.number().default(0.65),
   RISK_VOL_SCALER_MAX: z.coerce.number().default(1.4),
