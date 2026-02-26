@@ -310,7 +310,9 @@ function applyMinGreenExitRules({
   const trailStartInr =
     Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
       ? trailArmR * riskPerTradeInr
-      : Number(env.DYN_TRAIL_START_PROFIT_INR ?? 0);
+      : env.RISK_BUDGET_ENABLED
+        ? 0
+        : Number(env.DYN_TRAIL_START_PROFIT_INR ?? 0);
   const beArmEpsInr = pnlStepInr;
   const trailArmEpsInr = pnlStepInr;
 
