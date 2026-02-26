@@ -75,9 +75,23 @@ async function updateTrade(tradeId, patch) {
       // Ignore late ENTRY_FILLED updates once a trade already has SL/LIVE state.
       const staleEntryFill =
         toStatus === "ENTRY_FILLED" &&
-        ["SL_PLACED", "SL_OPEN", "SL_CONFIRMED", "LIVE"].includes(
-          normalizeTradeStatus(fromStatus),
-        );
+        [
+          "SL_PLACED",
+          "SL_OPEN",
+          "SL_CONFIRMED",
+          "LIVE",
+          "EXIT_PLACED",
+          "EXIT_OPEN",
+          "EXIT_PARTIAL",
+          "EXIT_FILLED",
+          "PANIC_EXIT_PLACED",
+          "PANIC_EXIT_CONFIRMED",
+          "RECOVERY_REHYDRATED",
+          "EXITED_TARGET",
+          "EXITED_SL",
+          "GUARD_FAILED",
+          "CLOSED",
+        ].includes(normalizeTradeStatus(fromStatus));
       if (staleEntryFill) {
         const mergedFactKeys = ["entryPrice", "qty", "entryFilledAt", "entry"].filter(
           (k) => Object.prototype.hasOwnProperty.call(update, k),
