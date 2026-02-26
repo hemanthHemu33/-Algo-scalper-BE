@@ -67,6 +67,7 @@ class RiskBudget {
     if (!env.RISK_BUDGET_ENABLED) return this.snapshot;
 
     const marginUsePct = clamp(Number(env.MARGIN_USE_PCT ?? 100) / 100, 0, 1);
+
     let available = 0;
     try {
       const snap = await equityService.snapshot({ kite: this.kite });
