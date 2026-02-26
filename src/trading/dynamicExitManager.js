@@ -595,13 +595,15 @@ function applyMinGreenExitRules({
   const profitLockEnabled = String(env.PROFIT_LOCK_ENABLED || "false") === "true";
   const profitLockR = Number(env.PROFIT_LOCK_R ?? 1.0);
   const profitLockKeepR = Number(env.PROFIT_LOCK_KEEP_R ?? 0.25);
+  const profitLockMinInr = Number(env.PROFIT_LOCK_MIN_INR ?? 0);
   const profitLockArmed =
     profitLockEnabled && Number.isFinite(mfeR) && mfeR >= profitLockR;
   if (profitLockArmed && !trade?.profitLockArmedAt) {
     tradePatch.profitLockArmedAt = new Date(now);
   }
   if (profitLockArmed && Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0 && qty > 0) {
-    const lockInr = profitLockKeepR * riskPerTradeInr;
+    const keepInr = profitLockKeepR * riskPerTradeInr;
+    const lockInr = Math.max(keepInr, profitLockMinInr);
     if (Number.isFinite(lockInr) && lockInr > 0) {
       const lockPts = lockInr / qty;
       const lockSlRaw = side === "BUY" ? entry + lockPts : entry - lockPts;
@@ -609,7 +611,9 @@ function applyMinGreenExitRules({
       if (side === "BUY") newSL = Math.max(newSL, lockSl);
       else newSL = Math.min(newSL, lockSl);
       tradePatch.profitLockInr = lockInr;
-      tradePatch.profitLockR = profitLockKeepR;
+      tradePatch.profitLockKeepR = profitLockKeepR;
+      tradePatch.profitLockArmR = profitLockR;
+      tradePatch.profitLockMinInr = profitLockMinInr;
     }
   }
 

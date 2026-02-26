@@ -18,7 +18,10 @@
     "test:recovery-gate": "node scripts/test_recovery_coordinator_gate.js",
     "test:stale-merge": "node scripts/test_stale_event_merge_regression.js",
     "test:lifecycle-pending": "node scripts/test_lifecycle_pending_validations.js",
-    "test:jest": "jest --runInBand"
+    "test:jest": "jest --runInBand",
+    "test:guard-panic-transition": "node scripts/test_guard_failed_panic_transition.js",
+    "test:order-rejection-cooldown": "node scripts/test_order_rejection_cooldown_key_regression.js",
+    "investigate:target-reject": "node scripts/investigate_target_reject_reason.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

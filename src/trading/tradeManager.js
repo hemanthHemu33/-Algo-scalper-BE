@@ -109,6 +109,15 @@ const STATUS = {
   CLOSED: "CLOSED",
 };
 
+const LIVE_ELIGIBLE_ENTRY_STATUSES = new Set([
+  STATUS.ENTRY_FILLED,
+  STATUS.SL_PLACED,
+  STATUS.SL_OPEN,
+  STATUS.SL_CONFIRMED,
+  STATUS.RECOVERY_REHYDRATED,
+  STATUS.LIVE,
+]);
+
 function todayKey() {
   return DateTime.now()
     .setZone(env.CANDLE_TZ || "Asia/Kolkata")
@@ -4460,8 +4469,8 @@ class TradeManager {
     );
     if (Number.isFinite(token) && token > 0) {
       const riskKey = this._buildRiskKey({
-        strategyId: params?.strategyId,
-        underlying: params?.underlying_symbol,
+        strategyId: trade?.strategyId,
+        underlying: trade?.underlying_symbol,
         token,
       });
       this.risk.setCooldown(riskKey, cooldownMin * 60, reason.code);
@@ -11566,15 +11575,25 @@ class TradeManager {
     // Adjust TARGET qty (nice-to-have)
     if (fresh.targetOrderId && typeof this.kite.modifyOrder === "function") {
       try {
-        await this._safeModifyOrder(
+        const targetModify = await this._safeModifyOrder(
           env.DEFAULT_ORDER_VARIETY,
           fresh.targetOrderId,
           { quantity: qty },
           { purpose: "TARGET_QTY_MODIFY", tradeId },
         );
+        const targetSkipped = Boolean(targetModify?.skipped);
         logger.info(
-          { tradeId, targetOrderId: fresh.targetOrderId, qty },
-          "[trade] TARGET qty modified",
+          {
+            tradeId,
+            targetOrderId: fresh.targetOrderId,
+            qty,
+            result: targetSkipped
+              ? String(targetModify?.reason || "skipped")
+              : "modified",
+          },
+          targetSkipped
+            ? "[trade] TARGET qty sync skipped"
+            : "[trade] TARGET qty modified",
         );
       } catch (e) {
         logger.warn(
@@ -11923,9 +11942,7 @@ class TradeManager {
     );
 
     const fresh = await getTrade(tradeId);
-    const shouldMarkLive = [STATUS.ENTRY_FILLED, STATUS.LIVE].includes(
-      fresh?.status,
-    );
+    const shouldMarkLive = LIVE_ELIGIBLE_ENTRY_STATUSES.has(fresh?.status);
     const patch = {
       targetOrderId,
       targetPrice,
@@ -12155,9 +12172,7 @@ class TradeManager {
     );
 
     const fresh = await getTrade(tradeId);
-    const shouldMarkLive = [STATUS.ENTRY_FILLED, STATUS.LIVE].includes(
-      fresh?.status,
-    );
+    const shouldMarkLive = LIVE_ELIGIBLE_ENTRY_STATUSES.has(fresh?.status);
     const patch = {
       targetOrderId,
       targetPrice,
@@ -12496,9 +12511,7 @@ class TradeManager {
     try {
       const fresh = await getTrade(tradeId);
       if (!fresh) return;
-      const shouldMarkLive = [STATUS.ENTRY_FILLED, STATUS.LIVE].includes(
-        fresh.status,
-      );
+      const shouldMarkLive = LIVE_ELIGIBLE_ENTRY_STATUSES.has(fresh?.status);
 
       // place SL if missing
       if (!fresh.slOrderId) {
