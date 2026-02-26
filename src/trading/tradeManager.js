@@ -4439,7 +4439,7 @@ class TradeManager {
       Number(env.CIRCUIT_BREAKER_COOLDOWN_MINUTES ?? 5),
     );
     if (Number.isFinite(token) && token > 0) {
-      const riskKey = this._riskKeyForTrade(trade) || this._buildRiskKey({ token });
+      const riskKey = this._buildRiskKey({ token });
       this.risk.setCooldown(riskKey, cooldownMin * 60, reason.code);
     }
     logger.warn(
