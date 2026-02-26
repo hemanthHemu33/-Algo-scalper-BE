@@ -93,6 +93,27 @@ function finiteNumberOrNull(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+
+function estimateRiskStopPtsForOption({ row, fallbackStopPts = 0 }) {
+  const ltp = Number(row?.ltp);
+  const tick = normalizeTickSize(row?.tick_size);
+  const minTicks = Math.max(1, Number(env.OPT_SL_FIT_MIN_TICKS ?? env.MIN_SL_TICKS ?? 2));
+  const minPts = (Number.isFinite(tick) && tick > 0 ? tick : 0.05) * minTicks;
+
+  const stopPct = Math.max(0, Number(env.OPT_SL_PCT ?? 12));
+  const maxStopPct = Math.max(stopPct, Number(env.OPT_MAX_SL_PCT ?? stopPct));
+  const clampedPct = Math.min(stopPct, maxStopPct);
+  const pctPts = Number.isFinite(ltp) && ltp > 0 ? (clampedPct / 100) * ltp : NaN;
+
+  const fallback = Math.max(0, Number(fallbackStopPts ?? 0));
+  const pts = Math.max(
+    Number.isFinite(pctPts) ? pctPts : 0,
+    Number.isFinite(minPts) ? minPts : 0,
+    fallback,
+  );
+  return Number.isFinite(pts) ? pts : 0;
+}
+
 function strikeStepFallback(underlying) {
   const u = String(underlying || "").toUpperCase();
   if (u === "NIFTY") return Number(env.OPT_STRIKE_STEP_NIFTY ?? 50);
@@ -500,6 +521,10 @@ async function pickOptionContractForSignal({
   gateStage = 0,
   triedExpiries = [],
   nowMs = Date.now(),
+  riskTradeInr,
+  stopDistancePts,
+  expectedSlippagePts = 0,
+  expectedFeesInr = 0,
 }) {
   const u = resolveUnderlyingFromUniverse({
     universe,
@@ -974,12 +999,28 @@ async function pickOptionContractForSignal({
 
   const requireOk = !!env.OPT_PICK_REQUIRE_OK;
 
+  const riskFitEnabled = !!env.OPT_RISK_FIT_ENABLED;
+  const riskFitCapInr = Number(riskTradeInr);
+  const stopPtsEst = Math.max(0, Number(stopDistancePts ?? 0));
+  const slipPtsEst = Math.max(0, Number(expectedSlippagePts ?? 0));
+  const feesInrEst = Math.max(0, Number(expectedFeesInr ?? 0));
+  const scoredWithRisk = scored.map((x) => {
+    const lot = Math.max(1, Number(x?.row?.lot_size ?? 1));
+    const riskPerLot = (stopPtsEst + slipPtsEst) * lot + feesInrEst;
+    const riskFitOk =
+      !riskFitEnabled ||
+      !(Number.isFinite(riskFitCapInr) && riskFitCapInr > 0) ||
+      (Number.isFinite(riskPerLot) && riskPerLot <= riskFitCapInr);
+    return { ...x, riskPerLot, riskFitOk };
+  });
+
   // Eligible candidates:
   // - premium band enforced for NIFTY when enabled
   // - and (pro) require ok => all gates must pass
-  const eligible = scored.filter((x) => {
+  const eligible = scoredWithRisk.filter((x) => {
     if (enforcePremBand && !x.premOk) return false;
     if (requireOk && !x.ok) return false;
+    if (!x.riskFitOk) return false;
     return true;
   });
 
@@ -999,7 +1040,7 @@ async function pickOptionContractForSignal({
       // Find best contract that passes ALL gates except premium band.
       // Choose by score then ATM distance.
       let bestHard = null;
-      for (const x of scored) {
+      for (const x of scoredWithRisk) {
         if (!x?.hardOk) continue;
         const ltp = Number(x.row.ltp);
         if (!Number.isFinite(ltp)) continue;
@@ -1049,14 +1090,14 @@ async function pickOptionContractForSignal({
     // Still nothing? Return original failure.
     if (!best) {
       const why = requireOk
-        ? "no OK candidate (spread/depth/greeks/oi gates)"
+        ? "no OK candidate (spread/depth/greeks/oi gates or risk-fit)"
         : "no candidate in premium band";
 
       const msg = `[options] ${why} for ${underlying} ${optType} (minPrem=${minPrem}, maxPrem=${maxPrem}, maxBps=${maxBps}, minDepth=${minDepth})`;
 
       const debugTop =
         debugTopN > 0
-          ? scored.slice(0, debugTopN).map((x) => ({
+          ? scoredWithRisk.slice(0, debugTopN).map((x) => ({
               tradingsymbol: x.row.tradingsymbol,
               instrument_token: Number(x.row.instrument_token),
               strike: Number(x.row.strike),
@@ -1082,6 +1123,8 @@ async function pickOptionContractForSignal({
               gammaOk: !!x.gammaOk,
               ivOk: !!x.ivOk,
               ivTrendOk: !!x.ivTrendOk,
+              riskFitOk: !!x.riskFitOk,
+              riskPerLot: Number(x.riskPerLot ?? 0),
               healthOk: !!x.healthOk,
               flickerOk: !!x.flickerOk,
             }))
@@ -1126,6 +1169,10 @@ async function pickOptionContractForSignal({
           maxSpreadBpsOverride,
           minPremiumOverride,
           maxPremiumOverride,
+          riskTradeInr,
+          stopDistancePts,
+          expectedSlippagePts,
+          expectedFeesInr,
           forceExpiryISO: nextExpiry || expiryISO,
           gateStage: nextStage,
           triedExpiries: Array.from(triedSet),
@@ -1148,7 +1195,12 @@ async function pickOptionContractForSignal({
 
       return {
         ok: false,
-        reason: requireOk ? "NO_OK_CANDIDATE" : "NO_PREMIUM_BAND_CANDIDATE",
+        reason:
+          riskFitEnabled && Number.isFinite(riskFitCapInr) && riskFitCapInr > 0
+            ? "RISK_FIT_NO_CONTRACT"
+            : requireOk
+              ? "NO_OK_CANDIDATE"
+              : "NO_PREMIUM_BAND_CANDIDATE",
         message: msg,
         underlying,
         optType,
@@ -1174,13 +1226,14 @@ async function pickOptionContractForSignal({
           },
           greeksRequired,
           oiContext,
+          riskFit: { enabled: riskFitEnabled, capInr: riskFitCapInr, stopPtsEst, slipPtsEst, feesInrEst },
           topCandidates: debugTop,
         },
       };
     }
   }
 
-  const poolForDebug = eligible.length > 0 ? eligible : scored;
+  const poolForDebug = eligible.length > 0 ? eligible : scoredWithRisk;
   const topCandidates =
     debugTopN > 0
       ? poolForDebug.slice(0, debugTopN).map((x) => ({
@@ -1217,6 +1270,8 @@ async function pickOptionContractForSignal({
           gammaOk: !!x.gammaOk,
           ivOk: !!x.ivOk,
           ivTrendOk: !!x.ivTrendOk,
+          riskFitOk: !!x.riskFitOk,
+          riskPerLot: Number(x.riskPerLot ?? 0),
         }))
       : undefined;
 
@@ -1284,6 +1339,7 @@ async function pickOptionContractForSignal({
         neutralPts: ivNeutralPts,
       },
       greeksRequired,
+      riskFit: { enabled: riskFitEnabled, capInr: riskFitCapInr, stopPtsEst, slipPtsEst, feesInrEst, selectedRiskPerLot: Number(best.riskPerLot ?? 0) },
       micro: { maxBps, spreadRiseBlockBps, minDepth, flickerBlock, minHealthScore },
       liquidityGate: {
         enabled: liqGateEnabled,
