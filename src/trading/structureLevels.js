@@ -35,8 +35,7 @@ function computeVwap(rows) {
     const l = toNum(c.low);
     const cl = toNum(c.close);
     const v = toNum(c.volume);
-    if (!(Number.isFinite(h) && Number.isFinite(l) && Number.isFinite(cl))) continue;
-    if (!(Number.isFinite(v) && v > 0)) continue;
+    if (!(Number.isFinite(h) && Number.isFinite(l) && Number.isFinite(cl) && Number.isFinite(v) && v > 0)) continue;
     const typical = (h + l + cl) / 3;
     pv += typical * v;
     volSum += v;
@@ -46,7 +45,6 @@ function computeVwap(rows) {
 
 function computeSwingLevels(rows, look = 2) {
   if (!Array.isArray(rows) || rows.length < look * 2 + 3) return { swingHL: null, swingLH: null };
-
   const pivotLows = [];
   const pivotHighs = [];
   for (let i = look; i < rows.length - look; i += 1) {
@@ -84,33 +82,6 @@ function computeSwingLevels(rows, look = 2) {
   return { swingHL, swingLH };
 }
 
-function dayKey(ts, tz) {
-  return DateTime.fromMillis(ts, { zone: tz }).toFormat("yyyy-LL-dd");
-}
-
-function isTradingDay(dt) {
-  const session = getSessionForDateTime(dt);
-  return Boolean(session?.allowTradingDay);
-}
-
-function findPreviousTradingDayKey(nowDt, tz) {
-  let probe = nowDt.minus({ days: 1 });
-  for (let i = 0; i < 10; i += 1) {
-    if (isTradingDay(probe)) return probe.toFormat("yyyy-LL-dd");
-    probe = probe.minus({ days: 1 });
-  }
-  return null;
-}
-
-function resolveSessionOpenTs(nowDt, sessionOpenTs) {
-  if (Number.isFinite(Number(sessionOpenTs))) return Number(sessionOpenTs);
-  const session = getSessionForDateTime(nowDt);
-  const bounds = buildBoundsForToday(session, nowDt);
-  return bounds?.open?.isValid
-    ? bounds.open.toMillis()
-    : nowDt.startOf("day").plus({ hours: 9, minutes: 15 }).toMillis();
-}
-
 function computeStructureLevels({
   env = {},
   tz = "Asia/Kolkata",
@@ -119,7 +90,7 @@ function computeStructureLevels({
   underlyingCandles,
   underlyingTicksOrLtpSeries,
   breakoutLevel,
-  // backward compatibility
+  // backwards compatibility
   candles,
   nowTs,
   sessionOpenTs,
@@ -150,34 +121,35 @@ function computeStructureLevels({
     };
   }
 
-  const now = Number.isFinite(Number(nowMs))
-    ? Number(nowMs)
-    : Number.isFinite(Number(nowTs))
-      ? Number(nowTs)
-      : parsed[parsed.length - 1]._ts;
+  const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Number.isFinite(Number(nowTs)) ? Number(nowTs) : parsed[parsed.length - 1]._ts;
   const nowDt = DateTime.fromMillis(now, { zone: tz });
-  const nowDayKey = nowDt.toFormat("yyyy-LL-dd");
-  const sessionOpen = resolveSessionOpenTs(nowDt, sessionOpenTs);
+  const sessionOpen = Number.isFinite(Number(sessionOpenTs))
+    ? Number(sessionOpenTs)
+    : nowDt.startOf("day").plus({ hours: 9, minutes: 15 }).toMillis();
+  const orbM = Math.max(1, Number(orbMinutes ?? env.ORB_MINUTES ?? 15));
 
+  const nowDayKey = nowDt.toFormat("yyyy-LL-dd");
   const dayBuckets = new Map();
   for (const c of parsed) {
-    const key = dayKey(c._ts, tz);
+    const key = DateTime.fromMillis(c._ts, { zone: tz }).toFormat("yyyy-LL-dd");
     if (!dayBuckets.has(key)) dayBuckets.set(key, []);
     dayBuckets.get(key).push(c);
   }
-
-  const prevTradingDayKey = findPreviousTradingDayKey(nowDt, tz);
-  const prevDayRows = prevTradingDayKey ? dayBuckets.get(prevTradingDayKey) || [] : [];
+  const orderedDayKeys = Array.from(dayBuckets.keys()).sort();
+  const prevDayKey = orderedDayKeys.filter((k) => k < nowDayKey).pop() || null;
 
   const dayRows = parsed.filter((c) => c._ts >= sessionOpen && c._ts <= now);
-  const orderedDayKeys = Array.from(dayBuckets.keys()).sort();
-  const tradingSessionKeys = orderedDayKeys.filter((k) => k <= nowDayKey).slice(-5);
-  const weekRows = tradingSessionKeys.flatMap((k) => dayBuckets.get(k) || []);
+  const prevDayRows = prevDayKey ? dayBuckets.get(prevDayKey) || [] : [];
+  const weekRows = parsed.filter((c) => {
+    const dt = DateTime.fromMillis(c._ts, { zone: tz });
+    return dt.weekYear === nowDt.weekYear && dt.weekNumber === nowDt.weekNumber && c._ts <= now;
+  });
+  const recentSessionRows = orderedDayKeys.slice(-5).flatMap((key) => dayBuckets.get(key) || []);
+  const effectiveWeekRows = weekRows.length ? weekRows : recentSessionRows;
 
   const day = hiLo(dayRows);
   const prev = hiLo(prevDayRows);
-  const week = hiLo(weekRows);
-  const orbM = Math.max(1, Number(orbMinutes ?? env.ORB_MINUTES ?? 15));
+  const week = hiLo(effectiveWeekRows);
   const orbRows = dayRows.filter((c) => c._ts <= sessionOpen + orbM * 60 * 1000);
   const orb = hiLo(orbRows);
   const vwap = computeVwap(dayRows);
@@ -205,11 +177,9 @@ function computeStructureLevels({
       usedBars: parsed.length,
       dayBars: dayRows.length,
       prevDayBars: prevDayRows.length,
-      weekBars: weekRows.length,
+      weekBars: effectiveWeekRows.length,
       sessionOpenTs: sessionOpen,
       orbMinutes: orbM,
-      nowDayKey,
-      prevTradingDayKey,
       underlyingToken: underlyingToken ?? null,
     },
   };

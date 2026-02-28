@@ -7,7 +7,7 @@ function c(ts, o, h, l, cl, v = 100) {
 describe('structureLevels', () => {
   test('computes day/prevday/week/ORB/vwap + swings', () => {
     const dayOpen = Date.UTC(2026, 1, 2, 3, 45); // 09:15 IST
-    const prevOpen = dayOpen - 3 * 24 * 60 * 60 * 1000; // prior trading day (Friday)
+    const prevOpen = dayOpen - 24 * 60 * 60 * 1000;
     const candles = [
       c(prevOpen + 0 * 60000, 95, 98, 94, 97, 100),
       c(prevOpen + 5 * 60000, 97, 99, 96, 98, 100),
@@ -32,7 +32,7 @@ describe('structureLevels', () => {
     expect(out.prevDayHigh).toBe(99);
     expect(out.prevDayLow).toBe(94);
     expect(out.weekHigh).toBe(106);
-    expect(out.weekLow).toBe(94);
+    expect(out.weekLow).toBe(99);
     expect(out.orbHigh).toBe(105);
     expect(out.orbLow).toBe(99);
     expect(out.vwap).toBeGreaterThan(100);

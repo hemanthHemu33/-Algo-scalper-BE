@@ -228,34 +228,6 @@ function normalizeAnchorToken(token, side) {
   return t;
 }
 
-
-function parseEnabledAnchorFamilies(raw) {
-  const normalized = String(raw ?? "DAY,PREVDAY,WEEK,ORB,VWAP,SWING").trim();
-  if (!normalized || normalized.toLowerCase() === "true") {
-    return new Set(["DAY", "PREVDAY", "WEEK", "ORB", "VWAP", "SWING"]);
-  }
-  if (normalized.toLowerCase() === "false") {
-    return new Set();
-  }
-  return new Set(
-    normalized
-      .split(",")
-      .map((x) => x.trim().toUpperCase())
-      .filter(Boolean),
-  );
-}
-
-function anchorTokenToFamily(anchorKey) {
-  const token = String(anchorKey || "").toUpperCase();
-  if (token.startsWith("ORB")) return "ORB";
-  if (token.startsWith("DAY")) return "DAY";
-  if (token.startsWith("PREVDAY")) return "PREVDAY";
-  if (token.startsWith("WEEK")) return "WEEK";
-  if (token.startsWith("SWING")) return "SWING";
-  if (token === "VWAP") return "VWAP";
-  if (token === "BREAKOUT_LEVEL") return "SWING";
-  return null;
-}
 function resolveAnchorPrice(levels, anchorKey) {
   const map = {
     ORB_HIGH: levels?.orbHigh,
@@ -1026,25 +998,16 @@ function applyMinGreenExitRules({
       });
       structureLevelsMeta = levels?.meta || null;
       const anchorMap = parseAnchorMap(env.STOP_ANCHOR_MAP);
-      const enabledFamilies = parseEnabledAnchorFamilies(env.STRUCTURE_ANCHORS_ENABLED);
-      const rawAnchor =
-        anchorMap.get(strategyId) ||
-        anchorMap.get(String(strategyId || "").toLowerCase()) ||
-        "SWING";
+      const rawAnchor = anchorMap.get(strategyId) || anchorMap.get(String(strategyId || "").toLowerCase()) || "SWING";
       let anchorKey = normalizeAnchorToken(rawAnchor, side);
-      let anchorFamily = anchorTokenToFamily(anchorKey);
-      if (anchorFamily && !enabledFamilies.has(anchorFamily)) {
-        structureSkipReason = `anchor_family_disabled:${anchorFamily}`;
-      }
-      let anchorPrice = structureSkipReason ? null : resolveAnchorPrice(levels, anchorKey);
-      if (!Number.isFinite(anchorPrice) && !structureSkipReason) {
-        anchorKey = normalizeAnchorToken("SWING", side);
-        anchorFamily = anchorTokenToFamily(anchorKey);
-        anchorPrice = enabledFamilies.has(anchorFamily) ? resolveAnchorPrice(levels, anchorKey) : null;
+      let anchorPrice = resolveAnchorPrice(levels, anchorKey);
+      if (!Number.isFinite(anchorPrice)) {
+        anchorKey = "VWAP";
+        anchorPrice = resolveAnchorPrice(levels, anchorKey);
       }
       structureCandidatesCount = anchorPrice != null ? 1 : 0;
       if (!Number.isFinite(anchorPrice)) {
-        structureSkipReason = structureSkipReason || `anchor_unavailable:${anchorKey}`;
+        structureSkipReason = `anchor_unavailable:${anchorKey}`;
       } else {
         structureFloorBeforeBuffer = Number(anchorPrice);
         const buffered = applyLiquidityBuffer({
