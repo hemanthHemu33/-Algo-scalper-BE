@@ -17,7 +17,8 @@ const { atr, rollingVWAP, maxHigh, minLow } = require("../strategy/utils");
 const { estimateRoundTripCostInr } = require("./costModel");
 const { getEffectivePrice } = require("../market/effectivePrice");
 const { computeStructureLevels } = require("./structureLevels");
-const { computeStructureStopFloor } = require("./structureStop");
+const { applyLiquidityBuffer } = require("./liquidityBuffer");
+const { computeVolScaler, applyScalerToRThreshold } = require("./volScaler");
 
 function clamp(n, lo, hi) {
   if (!Number.isFinite(n)) return n;
@@ -202,6 +203,77 @@ function parseProfitLockLadder(raw, env) {
     : [];
 }
 
+function parseAnchorMap(raw) {
+  const out = new Map();
+  const entries = String(raw || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  for (const entry of entries) {
+    const [kRaw, vRaw] = entry.split(":");
+    const key = String(kRaw || "").trim();
+    const val = String(vRaw || "").trim().toUpperCase();
+    if (key && val) out.set(key, val);
+  }
+  return out;
+}
+
+function normalizeAnchorToken(token, side) {
+  const t = String(token || "SWING").toUpperCase();
+  if (t === "SWING") return side === "BUY" ? "SWING_HL" : "SWING_LH";
+  if (t === "DAY_LEVEL") return side === "BUY" ? "DAY_LOW" : "DAY_HIGH";
+  if (t === "PREVDAY_LEVEL") return side === "BUY" ? "PREVDAY_LOW" : "PREVDAY_HIGH";
+  if (t === "WEEK_LEVEL") return side === "BUY" ? "WEEK_LOW" : "WEEK_HIGH";
+  if (t === "ORB") return side === "BUY" ? "ORB_LOW" : "ORB_HIGH";
+  return t;
+}
+
+
+function parseEnabledAnchorFamilies(raw) {
+  const normalized = String(raw ?? "DAY,PREVDAY,WEEK,ORB,VWAP,SWING").trim();
+  if (!normalized || normalized.toLowerCase() === "true") {
+    return new Set(["DAY", "PREVDAY", "WEEK", "ORB", "VWAP", "SWING"]);
+  }
+  if (normalized.toLowerCase() === "false") {
+    return new Set();
+  }
+  return new Set(
+    normalized
+      .split(",")
+      .map((x) => x.trim().toUpperCase())
+      .filter(Boolean),
+  );
+}
+
+function anchorTokenToFamily(anchorKey) {
+  const token = String(anchorKey || "").toUpperCase();
+  if (token.startsWith("ORB")) return "ORB";
+  if (token.startsWith("DAY")) return "DAY";
+  if (token.startsWith("PREVDAY")) return "PREVDAY";
+  if (token.startsWith("WEEK")) return "WEEK";
+  if (token.startsWith("SWING")) return "SWING";
+  if (token === "VWAP") return "VWAP";
+  if (token === "BREAKOUT_LEVEL") return "SWING";
+  return null;
+}
+function resolveAnchorPrice(levels, anchorKey) {
+  const map = {
+    ORB_HIGH: levels?.orbHigh,
+    ORB_LOW: levels?.orbLow,
+    DAY_HIGH: levels?.dayHigh,
+    DAY_LOW: levels?.dayLow,
+    PREVDAY_HIGH: levels?.prevDayHigh,
+    PREVDAY_LOW: levels?.prevDayLow,
+    WEEK_HIGH: levels?.weekHigh,
+    WEEK_LOW: levels?.weekLow,
+    VWAP: levels?.vwap,
+    SWING_HL: levels?.swingHL,
+    SWING_LH: levels?.swingLH,
+    BREAKOUT_LEVEL: levels?.breakoutLevel,
+  };
+  const px = Number(map[String(anchorKey || "").toUpperCase()]);
+  return Number.isFinite(px) ? px : null;
+}
 function detectRegimeTag(trade) {
   return String(
     trade?.marketContextAtEntry?.regimeTag ||
@@ -249,7 +321,7 @@ function applyMinGreenExitRules({
 }) {
   const qty = Number(trade?.qty ?? trade?.initialQty ?? 0);
   const minGreenEnabled = String(env.MIN_GREEN_ENABLED || "true") === "true";
-  const minGreenInr = minGreenEnabled ? Number(trade?.minGreenInr ?? 0) : 0;
+  let minGreenInr = minGreenEnabled ? Number(trade?.minGreenInr ?? 0) : 0;
   const minGreenPts = minGreenEnabled ? Number(trade?.minGreenPts ?? 0) : 0;
   const minGreenR = Number(trade?.minGreenR ?? env.MIN_GREEN_R ?? 0.2);
 
@@ -347,9 +419,58 @@ function applyMinGreenExitRules({
       : null;
   const timeStopLatched = Boolean(trade?.timeStopTriggeredAt);
 
-  const beArmR = Number(env.BE_ARM_R ?? 0.6);
+  const baseMinGreenR = Number(trade?.minGreenR ?? env.MIN_GREEN_R ?? 0.2);
+  const baseBeArmR = Number(env.BE_ARM_R ?? 0.6);
   const beArmCostMult = Number(env.BE_ARM_COST_MULT ?? 2.0);
-  const trailArmR = Number(env.TRAIL_ARM_R ?? 1.1);
+  const baseTrailArmR = Number(env.TRAIL_ARM_R ?? 1.1);
+  const volAtrLen = Number(env.VOL_ATR_LEN ?? 14);
+  const volPremiumAtr = atr(candles, volAtrLen);
+  const volPremiumAtrPts = Number.isFinite(volPremiumAtr) && volPremiumAtr > 0 ? volPremiumAtr : null;
+  const volUnderlyingAtrRaw = Number(
+    trade?.regimeMeta?.underlyingAtr ??
+      trade?.regimeMeta?.atrUnderlying ??
+      trade?.regimeMeta?.atr ??
+      trade?.marketContextAtEntry?.atr ??
+      trade?.planMeta?.regimeMeta?.atr,
+  );
+  const volUnderlyingAtrPts = mapUnderlyingAtrToPremiumPts({
+    trade,
+    atrUnderlying: volUnderlyingAtrRaw,
+    env,
+  });
+  const volAtrSource = String(env.VOL_ATR_SOURCE || "UNDERLYING").toUpperCase();
+  const volAtrPts =
+    volAtrSource === "UNDERLYING"
+      ? volUnderlyingAtrPts ?? volPremiumAtrPts
+      : volPremiumAtrPts ?? volUnderlyingAtrPts;
+  const volRefLtp = volAtrSource === "UNDERLYING"
+    ? Number(underlyingLtp ?? trade?.underlyingLtp ?? ltp)
+    : Number(ltp);
+  const atrBps =
+    Number.isFinite(volAtrPts) && Number.isFinite(volRefLtp) && volRefLtp > 0
+      ? (volAtrPts / volRefLtp) * 10000
+      : null;
+  const volScalerEnabled = String(env.VOL_SCALER_ENABLED ?? "true") === "true";
+  const volScaler = volScalerEnabled ? computeVolScaler({ env, atrBps }) : 1;
+  const scaledMinGreenR = clamp(
+    applyScalerToRThreshold(baseMinGreenR, volScaler, String(env.VOL_SCALE_MIN_GREEN_R ?? "true") === "true"),
+    0.1,
+    0.35,
+  );
+  const beArmR = clamp(
+    applyScalerToRThreshold(baseBeArmR, volScaler, String(env.VOL_SCALE_BE_ARM_R ?? "true") === "true"),
+    0.4,
+    0.95,
+  );
+  const trailArmR = clamp(
+    applyScalerToRThreshold(baseTrailArmR, volScaler, String(env.VOL_SCALE_TRAIL_ARM_R ?? "true") === "true"),
+    0.9,
+    1.6,
+  );
+  if (minGreenEnabled && Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0) {
+    const minGreenFromR = scaledMinGreenR * riskPerTradeInr;
+    minGreenInr = Math.max(minGreenInr, Number.isFinite(minGreenFromR) ? minGreenFromR : 0);
+  }
   const pnlStepInr = Number.isFinite(qty) && qty > 0 && Number.isFinite(tick) && tick > 0
     ? qty * tick
     : 0;
@@ -869,71 +990,79 @@ function applyMinGreenExitRules({
   const curSlRounded = roundToTick(curSL, tick, side === "BUY" ? "down" : "up");
   let desiredStopLoss = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
 
-  const structureEnabled = String(env.STRUCTURE_ANCHORS_ENABLED ?? "true") === "true";
+  const structureEnabled = String(env.STRUCTURE_EXIT_ENABLED ?? env.STRUCTURE_ANCHORS_ENABLED ?? "false") === "true";
   let structureStop = null;
   let structureChosen = null;
   let structureLevelsMeta = null;
   let structureCandidatesCount = 0;
   let structureSkipReason = null;
+  let structureFloorBeforeBuffer = null;
+  let structureFloorAfterBuffer = null;
+  let structureBufferTicks = null;
+  let structureBufferPts = null;
+  let structureRoundGuardApplied = false;
+  const strategyId = String(trade?.strategyId ?? trade?.strategy ?? trade?.signal?.strategyId ?? "").trim();
   if (structureEnabled) {
-    const mustAfterMinGreen = String(env.ANCHOR_APPLY_AFTER_MIN_GREEN ?? "true") === "true";
-    const mustAfterBe = String(env.ANCHOR_APPLY_AFTER_BE_ARM ?? "true") === "true";
-    const mustAfterProfitLock = String(env.ANCHOR_APPLY_AFTER_PROFIT_LOCK_STEP ?? "true") === "true";
-    const firstStep = parseProfitLockLadder(env.PROFIT_LOCK_LADDER, env)[0]?.stepR ?? null;
-    const hasProfitStep =
-      Boolean(trade?.profitLockArmedAt) ||
-      (Number.isFinite(bestProfitLockStep?.stepR) && Number.isFinite(firstStep)
-        ? bestProfitLockStep.stepR >= firstStep
-        : Boolean(bestProfitLockStep));
-
-    if (mustAfterMinGreen && pnlInr < minGreenInr) {
-      structureSkipReason = "before_min_green";
-    } else if (mustAfterBe && !beLockedNow) {
-      structureSkipReason = "before_be_arm";
-    } else if (mustAfterProfitLock && !hasProfitStep) {
-      structureSkipReason = "before_profit_lock_step";
+    const structureActivateAtR = Number(env.STRUCTURE_ACTIVATE_AT_R ?? 0.6);
+    const structureMaxTightenR = Number(env.STRUCTURE_MAX_TIGHTEN_R ?? 2.5);
+    const inRWindow = Number.isFinite(pnlRForRules) && pnlRForRules >= structureActivateAtR && pnlRForRules <= structureMaxTightenR;
+    const stageActive = beLockedNow || trailLockedNow || profitLockArmed;
+    if (!stageActive) {
+      structureSkipReason = "stage_not_active";
+    } else if (!inRWindow) {
+      structureSkipReason = "outside_structure_r_window";
     } else {
-      const levelSourceCandles = Array.isArray(structureCandles) && structureCandles.length
-        ? structureCandles
-        : candles;
+      const levelSourceCandles = Array.isArray(structureCandles) && structureCandles.length ? structureCandles : candles;
       const tz = env.CANDLE_TZ || "Asia/Kolkata";
       const levels = computeStructureLevels({
-        candles: levelSourceCandles,
-        tz,
-        nowTs: now,
-        sessionOpenTs,
-        orbMinutes: Number(env.ORB_MINUTES ?? 15),
         env,
+        tz,
+        nowMs: now,
+        underlyingToken: trade?.underlying_token,
+        underlyingCandles: levelSourceCandles,
+        underlyingTicksOrLtpSeries: { ltp: underlyingLtp },
+        breakoutLevel: trade?.signal?.breakoutLevel ?? trade?.planMeta?.breakoutLevel,
+        sessionOpenTs,
       });
-      if (!levels?.ok) {
-        structureSkipReason = `levels_unavailable:${levels?.reason || "unknown"}`;
+      structureLevelsMeta = levels?.meta || null;
+      const anchorMap = parseAnchorMap(env.STOP_ANCHOR_MAP);
+      const enabledFamilies = parseEnabledAnchorFamilies(env.STRUCTURE_ANCHORS_ENABLED);
+      const rawAnchor =
+        anchorMap.get(strategyId) ||
+        anchorMap.get(String(strategyId || "").toLowerCase()) ||
+        "SWING";
+      let anchorKey = normalizeAnchorToken(rawAnchor, side);
+      let anchorFamily = anchorTokenToFamily(anchorKey);
+      if (anchorFamily && !enabledFamilies.has(anchorFamily)) {
+        structureSkipReason = `anchor_family_disabled:${anchorFamily}`;
+      }
+      let anchorPrice = structureSkipReason ? null : resolveAnchorPrice(levels, anchorKey);
+      if (!Number.isFinite(anchorPrice) && !structureSkipReason) {
+        anchorKey = normalizeAnchorToken("SWING", side);
+        anchorFamily = anchorTokenToFamily(anchorKey);
+        anchorPrice = enabledFamilies.has(anchorFamily) ? resolveAnchorPrice(levels, anchorKey) : null;
+      }
+      structureCandidatesCount = anchorPrice != null ? 1 : 0;
+      if (!Number.isFinite(anchorPrice)) {
+        structureSkipReason = structureSkipReason || `anchor_unavailable:${anchorKey}`;
       } else {
-        const sStop = computeStructureStopFloor({
-          side,
-          ltp,
-          peakLtp: Number(tradePatch?.peakLtp ?? trade?.peakLtp ?? ltp),
-          tick,
-          atrPts: trailAtrPts,
-          levels,
-          candles: levelSourceCandles,
+        structureFloorBeforeBuffer = Number(anchorPrice);
+        const buffered = applyLiquidityBuffer({
           env,
-          nowTs: now,
+          side,
+          candidateSL: anchorPrice,
+          tickSize: tick,
+          atrPts: trailAtrPts ?? volAtrPts,
+          roundNumberStep: env.ROUND_NUMBER_STEP,
+          ltp,
         });
-        structureLevelsMeta = {
-          ...(Number.isFinite(levels.vwap) ? { vwap: levels.vwap } : {}),
-          ...(Number.isFinite(levels.orbHigh) ? { orbHigh: levels.orbHigh } : {}),
-          ...(Number.isFinite(levels.orbLow) ? { orbLow: levels.orbLow } : {}),
-          ...(Number.isFinite(levels.dayHigh) ? { dayHigh: levels.dayHigh } : {}),
-          ...(Number.isFinite(levels.dayLow) ? { dayLow: levels.dayLow } : {}),
-          ...(Number.isFinite(levels.prevDayHigh) ? { prevDayHigh: levels.prevDayHigh } : {}),
-          ...(Number.isFinite(levels.prevDayLow) ? { prevDayLow: levels.prevDayLow } : {}),
-          ...(Number.isFinite(levels.weekHigh) ? { weekHigh: levels.weekHigh } : {}),
-          ...(Number.isFinite(levels.weekLow) ? { weekLow: levels.weekLow } : {}),
-        };
-        structureCandidatesCount = Array.isArray(sStop?.candidates) ? sStop.candidates.length : 0;
-        if (sStop?.ok && Number.isFinite(sStop?.structureStop)) {
-          structureStop = sStop.structureStop;
-          structureChosen = sStop.chosen || null;
+        structureFloorAfterBuffer = Number(buffered?.bufferedSL);
+        structureBufferTicks = Number(buffered?.bufferTicks ?? 0);
+        structureBufferPts = Number(buffered?.bufferPts ?? 0);
+        structureRoundGuardApplied = Boolean(buffered?.roundGuardApplied);
+        if (Number.isFinite(structureFloorAfterBuffer)) {
+          structureStop = structureFloorAfterBuffer;
+          structureChosen = { anchorKey, anchorPrice };
           desiredStopLoss = roundToTick(
             side === "BUY"
               ? Math.max(desiredStopLoss, structureStop)
@@ -941,21 +1070,12 @@ function applyMinGreenExitRules({
             tick,
             side === "BUY" ? "down" : "up",
           );
-          const maxTightenPtsRaw = Number(env.ANCHOR_MAX_TIGHTEN_PER_EVAL_PTS ?? 999999);
-          const maxTightenPts = Number.isFinite(maxTightenPtsRaw)
-            ? Math.max(0, maxTightenPtsRaw)
-            : 999999;
-          if (Number.isFinite(curSlRounded) && maxTightenPts > 0) {
-            desiredStopLoss = roundToTick(
-              side === "BUY"
-                ? Math.min(desiredStopLoss, curSlRounded + maxTightenPts)
-                : Math.max(desiredStopLoss, curSlRounded - maxTightenPts),
-              tick,
-              side === "BUY" ? "down" : "up",
-            );
+          if (structureRoundGuardApplied) {
+            skipReasons.push("round_guard applied");
           }
+          skipReasons.push(`structure_anchor=${anchorKey} applied`);
         } else {
-          structureSkipReason = sStop?.reason || "no_valid_structure_candidate";
+          structureSkipReason = "buffered_structure_invalid";
         }
       }
     }
@@ -1068,7 +1188,8 @@ function applyMinGreenExitRules({
       pnlInr,
       minGreenInr,
       minGreenPts,
-      minGreenR,
+      minGreenR: scaledMinGreenR,
+      baseMinGreenR,
       pnlR,
       pnlPriceR,
       pnlRForRules,
@@ -1090,6 +1211,15 @@ function applyMinGreenExitRules({
       trailArmed: trailLockedNow,
       beArmR,
       trailArmR,
+      baseBeArmR,
+      baseTrailArmR,
+      volScaler,
+      atrBps,
+      scaledThresholds: {
+        minGreenR: scaledMinGreenR,
+        beArmR,
+        trailArmR,
+      },
       R_inr: riskPerTradeInr,
       trueBE: Number.isFinite(trueBE) ? trueBE : null,
       beFloor,
@@ -1132,6 +1262,17 @@ function applyMinGreenExitRules({
       widenMult: Number.isFinite(widenMult) ? widenMult : null,
       maxRiskInr: Number.isFinite(maxRiskInr) ? maxRiskInr : null,
       maxRiskPts: Number.isFinite(maxRiskPts) ? maxRiskPts : null,
+      structureEnabled,
+      structureStop,
+      structureChosen,
+      structureLevelsMeta,
+      structureCandidatesCount,
+      structureSkipReason,
+      structureFloorBeforeBuffer,
+      structureFloorAfterBuffer,
+      structureBufferTicks,
+      structureBufferPts,
+      structureRoundGuardApplied,
     },
   };
 }
