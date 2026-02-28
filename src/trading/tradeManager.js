@@ -8527,13 +8527,7 @@ class TradeManager {
       return;
     }
 
-    if (this._isBlockedByNoTradeWindow()) {
-      logger.info(
-        { token: signal.instrument_token },
-        "[trade] blocked (no-trade window)",
-      );
-      return;
-    }
+    const noTradeWindowBlocked = this._isBlockedByNoTradeWindow();
 
     if (!getTradingEnabled()) {
       logger.info(
@@ -8927,8 +8921,11 @@ class TradeManager {
     }
 
     let check = this.risk.canTrade(riskKey);
+    if (noTradeWindowBlocked) {
+      check = { ok: false, reason: "no_trade_window" };
+    }
     let reentry = { allowed: false, riskMult: 1.0, reason: null, meta: null };
-    if (!check.ok && ["cooldown", "after_entry_cutoff"].includes(check.reason)) {
+    if (!check.ok && ["cooldown", "after_entry_cutoff", "no_trade_window"].includes(check.reason)) {
       const originalReason = check.reason;
       const tz = env.CANDLE_TZ || "Asia/Kolkata";
       const nowDt = DateTime.fromMillis(Date.now()).setZone(tz);
@@ -9019,7 +9016,11 @@ class TradeManager {
     }
 
     if (!check.ok) {
-      logger.info({ token, reason: check.reason }, "[trade] blocked");
+      if (check.reason === "no_trade_window") {
+        logger.info({ token }, "[trade] blocked (no-trade window)");
+      } else {
+        logger.info({ token, reason: check.reason }, "[trade] blocked");
+      }
       return;
     }
 
@@ -13654,10 +13655,23 @@ class TradeManager {
 
     const closeReasonUpper = String(closeReason || "").toUpperCase();
     const exitReasonUpper = String(exitReason || "").toUpperCase();
-    const isSL =
-      String(status || "").toUpperCase() === STATUS.EXITED_SL ||
+    const statusUpper = String(status || "").toUpperCase();
+    const stopoutKeywords = String(
+      env.REENTRY_AFTER_SL_STOPOUT_REASON_KEYWORDS ||
+        "SL,STOPLOSS,STOP_LOSS,PANIC,GUARD,MANUAL",
+    )
+      .split(",")
+      .map((v) => String(v || "").trim().toUpperCase())
+      .filter(Boolean);
+    const reasonBlob = `${statusUpper} ${closeReasonUpper} ${exitReasonUpper}`;
+    const explicitSL =
+      statusUpper === STATUS.EXITED_SL ||
       closeReasonUpper.includes("SL") ||
       exitReasonUpper.includes("SL");
+    const keywordMatched = stopoutKeywords.some((kw) => reasonBlob.includes(kw));
+    const pnlNum = Number(pnl);
+    const isLikelyLoss = !Number.isFinite(pnlNum) || pnlNum <= 0;
+    const isSL = explicitSL || (keywordMatched && isLikelyLoss);
     if (isSL && riskKey) {
       this._recentStopouts.set(String(riskKey), {
         ts: Date.now(),

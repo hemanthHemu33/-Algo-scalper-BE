@@ -29,7 +29,7 @@ function evaluateReentryOverride({
     },
   };
 
-  if (!["cooldown", "after_entry_cutoff"].includes(String(blockedReason || ""))) {
+  if (!["cooldown", "after_entry_cutoff", "no_trade_window"].includes(String(blockedReason || ""))) {
     out.reason = "blocked_reason_not_eligible";
     return out;
   }
@@ -148,13 +148,20 @@ function evaluateReentryOverride({
 
   const canTradeCtx = { ignoreCooldown: true };
 
+  if (blockedReason === "no_trade_window" && !env.REENTRY_AFTER_SL_ALLOW_DURING_NO_TRADE_WINDOWS) {
+    out.reason = "no_trade_window_override_disabled";
+    return out;
+  }
+
   if (blockedReason === "after_entry_cutoff") {
     if (!env.LATE_ENTRY_OVERRIDE_ENABLED) {
       out.reason = "late_entry_override_disabled";
       return out;
     }
 
-    const lateMinConf = Number(env.LATE_ENTRY_MIN_CONF ?? 85);
+    const lateMinConf = Number(
+      env.REENTRY_AFTER_SL_LATE_MIN_CONF ?? env.LATE_ENTRY_MIN_CONF ?? 85,
+    );
     if (!Number.isFinite(confidence) || confidence < lateMinConf) {
       out.reason = "late_entry_confidence_below_min";
       out.meta.confidence = confidence;

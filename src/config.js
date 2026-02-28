@@ -664,11 +664,16 @@ const schema = z.object({
   REENTRY_AFTER_SL_WINDOW_SEC: z.coerce.number().default(180),
   REENTRY_AFTER_SL_MAX_TRIES: z.coerce.number().default(1),
   REENTRY_AFTER_SL_MIN_CONF: z.coerce.number().default(85),
+  REENTRY_AFTER_SL_LATE_MIN_CONF: z.coerce.number().optional(),
   REENTRY_AFTER_SL_R_MULT: z.coerce.number().default(0.5),
+  REENTRY_AFTER_SL_ALLOW_DURING_NO_TRADE_WINDOWS: boolFromEnv.default(false),
+  REENTRY_AFTER_SL_STOPOUT_REASON_KEYWORDS: z
+    .string()
+    .default("SL,STOPLOSS,STOP_LOSS,PANIC,GUARD,MANUAL"),
   REENTRY_AFTER_SL_ALLOWED_STRATEGIES: z
     .string()
     .default(
-      "breakout,vwap_reclaim,volume_spike,bollinger_squeeze,ema_pullback",
+      "breakout,vwap_reclaim,volume_spike,bollinger_squeeze,ema_pullback,ema_cross,wick_reversal,fakeout,orb",
     ),
   DAILY_MAX_LOSS_INR: z.coerce.number().default(1350),
   AUTO_EXIT_ON_DAILY_LOSS: z.string().default("true"),
