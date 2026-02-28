@@ -132,6 +132,31 @@ function dayRange() {
   return { start: start.toJSDate(), end: end.toJSDate() };
 }
 
+function computeEntryMinGreen({ costBasedMinGreenInr, riskInr, qty, envCfg = env }) {
+  const minGreenEnabled = String(envCfg.MIN_GREEN_ENABLED || "true") === "true";
+  const costMult = Number(envCfg.MIN_GREEN_COST_MULT ?? 1.0);
+  const minFloorInr = Number(envCfg.MIN_GREEN_MIN_INR ?? 0);
+  const minGreenR = Number(envCfg.MIN_GREEN_R ?? 0.2);
+  const safeCost = Number.isFinite(Number(costBasedMinGreenInr))
+    ? Number(costBasedMinGreenInr)
+    : 0;
+  const safeRiskInr = Number(riskInr ?? 0);
+  const rBasedMinGreenInr =
+    minGreenEnabled && Number.isFinite(safeRiskInr) && safeRiskInr > 0
+      ? Math.max(0, minGreenR) * safeRiskInr
+      : 0;
+  const finalMinGreenInr = minGreenEnabled
+    ? Math.max(safeCost * Math.max(0, costMult), rBasedMinGreenInr, Math.max(0, minFloorInr))
+    : 0;
+  const safeQty = Number(qty ?? 0);
+  return {
+    minGreenInr: finalMinGreenInr,
+    minGreenPts: safeQty > 0 ? finalMinGreenInr / safeQty : 0,
+    minGreenR,
+    rBasedMinGreenInr,
+  };
+}
+
 
 function toFiniteOrNaN(v) {
   const n = Number(v);
@@ -140,6 +165,14 @@ function toFiniteOrNaN(v) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function buildSessionOpenTs(nowTs, tz = "Asia/Kolkata") {
+  const now = Number.isFinite(Number(nowTs)) ? Number(nowTs) : Date.now();
+  return DateTime.fromMillis(now, { zone: tz })
+    .startOf("day")
+    .plus({ hours: 9, minutes: 15 })
+    .toMillis();
 }
 
 const IOC_UNMATCHED_MESSAGE_PATTERNS = [
@@ -316,6 +349,7 @@ class TradeManager {
 
     // Optional fallback LTP fetch throttle (helps OPT mode when ticks are sparse)
     this._lastLtpFetchAtByToken = new Map(); // token -> ts
+    this._lastStructCandleFetchByToken = new Map(); // token -> ts
 
     // Order rate limits + daily count
     this.orderLimiter = new OrderRateLimiter({
@@ -6526,6 +6560,7 @@ class TradeManager {
       } catch {
         candles = [];
       }
+      let structureCandles = candles;
       // For OPT trades we may not have full candle history immediately; exit model can fall back.
       let underlyingLtp;
       const uTok = Number(trade.underlying_token ?? 0);
@@ -6546,6 +6581,27 @@ class TradeManager {
               if (Number.isFinite(ul)) underlyingLtp = ul;
             } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
           }
+        }
+      }
+
+      const structureEnabled = Boolean(env.STRUCTURE_ANCHORS_ENABLED);
+      if (
+        structureEnabled &&
+        String(env.STRUCTURE_SOURCE || "TRADE").toUpperCase() === "UNDERLYING" &&
+        Number.isFinite(uTok) &&
+        uTok > 0
+      ) {
+        const lastStructFetch = Number(this._lastStructCandleFetchByToken.get(uTok) ?? 0);
+        const structThrottleMs = 30000;
+        if (now - lastStructFetch >= structThrottleMs) {
+          this._lastStructCandleFetchByToken.set(uTok, now);
+          try {
+            const structLimit = Math.max(120, Number(env.STRUCTURE_CANDLE_LIMIT ?? 800));
+            const uCandles = await getRecentCandles(uTok, intervalMin, structLimit);
+            if (Array.isArray(uCandles) && uCandles.length) {
+              structureCandles = uCandles;
+            }
+          } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
         }
       }
 
@@ -6599,6 +6655,8 @@ class TradeManager {
         : tradeWithFacts;
 
       const quoteSnapshot = this.lastQuoteByToken.get(token) || { ltp, quoteTsMs: now };
+      const tz = env.CANDLE_TZ || "Asia/Kolkata";
+      const sessionOpenTs = buildSessionOpenTs(now, tz);
       const plan = computeDynamicExitPlan({
         trade: tradeForPlan,
         ltp,
@@ -6607,6 +6665,8 @@ class TradeManager {
         env,
         underlyingLtp: Number.isFinite(underlyingLtp) ? underlyingLtp : undefined,
         quoteSnapshot,
+        structureCandles,
+        sessionOpenTs,
       });
       if (!plan?.ok) {
         this._dynExitCadenceStats.evalNoPlan += 1;
@@ -6631,6 +6691,9 @@ class TradeManager {
           trailArmed: Boolean(plan?.meta?.trailArmed),
           pendingMove: plan?.meta?.pendingMove ?? null,
           trailStep: plan?.meta?.trailStep ?? null,
+          structureChosen: plan?.meta?.structureChosen ?? null,
+          structureStop: plan?.meta?.structureStop ?? null,
+          structureLevels: plan?.meta?.structureLevels ?? null,
           skipReason: plan?.meta?.skipReason || null,
           recoveryEpoch: this._recoveryEpoch,
           exitLoopInstanceId: this._exitLoopInstanceId,
@@ -10204,6 +10267,13 @@ class TradeManager {
           minGreenPts: 0,
           meta: null,
         };
+    const tradeRiskInr = Number(_riskInrOverride ?? env.RISK_PER_TRADE_INR ?? 0);
+    const minGreenComputed = computeEntryMinGreen({
+      costBasedMinGreenInr: minGreen.minGreenInr,
+      riskInr: tradeRiskInr,
+      qty,
+      envCfg: env,
+    });
 
     const spreadBpsAtEntry = Number(quoteAtEntry?.bps ?? NaN);
     const microPolicyEnabled =
@@ -10241,11 +10311,17 @@ class TradeManager {
       initialStopLoss: stopLoss,
       slTrigger: stopLoss,
       beLocked: false,
+      beLockedAt: null,
+      beLockedAtPrice: null,
       beAppliedAt: null,
       beAppliedStopLoss: null,
       beApplyFails: 0,
       peakLtp: null,
+      peakPnlInr: null,
       trailSl: null,
+      profitLockArmedAt: null,
+      profitLockInr: null,
+      profitLockStepR: null,
       entryFilledAt: null,
       entryPlacedAt: null,
       timeStopAt: null,
@@ -10268,10 +10344,11 @@ class TradeManager {
       costMeta: edge?.meta || null,
       estChargesInr: minGreen.estChargesInr,
       slippageBufferInr: minGreen.slippageBufferInr,
-      minGreenInr: minGreen.minGreenInr,
-      minGreenPts: minGreen.minGreenPts,
+      minGreenInr: minGreenComputed.minGreenInr,
+      minGreenPts: minGreenComputed.minGreenPts,
+      minGreenR: minGreenComputed.minGreenR,
       // planned risk cap used for sizing / gating (₹)
-      riskInr: Number(_riskInrOverride ?? env.RISK_PER_TRADE_INR ?? 0),
+      riskInr: tradeRiskInr,
       sessionRiskInr: Number(this.riskBudget?.getSessionRInr?.() ?? 0),
       entryOrderType: finalEntryOrderType,
       maxEntrySlippageBps: maxEntrySlipBps,
@@ -10900,8 +10977,8 @@ class TradeManager {
               slippageBufferInr: 0,
               minGreenInr: 0,
               minGreenPts: 0,
-              meta: null,
-            };
+            meta: null,
+          };
 
         const riskStop = this._computeRiskStopLoss({
           entryPrice: avg,
@@ -10933,6 +11010,13 @@ class TradeManager {
           "[trade] risk/min-green computed",
         );
 
+        const minGreenComputed = computeEntryMinGreen({
+          costBasedMinGreenInr: minGreen.minGreenInr,
+          riskInr: riskStop.riskInr,
+          qty: filledQty,
+          envCfg: env,
+        });
+
         await updateTrade(trade.tradeId, {
           stopLoss: riskStop.stopLoss,
           initialStopLoss: riskStop.stopLoss,
@@ -10946,8 +11030,9 @@ class TradeManager {
           riskQty: riskStop.riskQty,
           estChargesInr: minGreen.estChargesInr,
           slippageBufferInr: minGreen.slippageBufferInr,
-          minGreenInr: minGreen.minGreenInr,
-          minGreenPts: minGreen.minGreenPts,
+          minGreenInr: minGreenComputed.minGreenInr,
+          minGreenPts: minGreenComputed.minGreenPts,
+          minGreenR: minGreenComputed.minGreenR,
           timeStopAt,
         });
 
@@ -11031,8 +11116,8 @@ class TradeManager {
               slippageBufferInr: 0,
               minGreenInr: 0,
               minGreenPts: 0,
-              meta: null,
-            };
+            meta: null,
+          };
         const riskStop = this._computeRiskStopLoss({
           entryPrice: avgNow,
           side: trade.side,
@@ -11061,6 +11146,13 @@ class TradeManager {
           "[trade] risk/min-green computed (partial)",
         );
 
+        const minGreenComputed = computeEntryMinGreen({
+          costBasedMinGreenInr: minGreen.minGreenInr,
+          riskInr: riskStop.riskInr,
+          qty: filledNow,
+          envCfg: env,
+        });
+
         await updateTrade(trade.tradeId, {
           stopLoss: riskStop.stopLoss,
           initialStopLoss: riskStop.stopLoss,
@@ -11074,8 +11166,9 @@ class TradeManager {
           riskQty: riskStop.riskQty,
           estChargesInr: minGreen.estChargesInr,
           slippageBufferInr: minGreen.slippageBufferInr,
-          minGreenInr: minGreen.minGreenInr,
-          minGreenPts: minGreen.minGreenPts,
+          minGreenInr: minGreenComputed.minGreenInr,
+          minGreenPts: minGreenComputed.minGreenPts,
+          minGreenR: minGreenComputed.minGreenR,
           timeStopAt,
         });
         await this._placeExitsIfMissing({
@@ -13994,4 +14087,4 @@ function percentileRank(hist, x) {
   return (less / vals.length) * 100;
 }
 
-module.exports = { TradeManager, STATUS };
+module.exports = { TradeManager, STATUS, computeEntryMinGreen };
