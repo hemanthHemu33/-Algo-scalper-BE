@@ -1,4 +1,8 @@
 const { DateTime } = require("luxon");
+const {
+  getSessionForDateTime,
+  buildBoundsForToday,
+} = require("../market/marketCalendar");
 
 function toNum(v) {
   const n = Number(v);

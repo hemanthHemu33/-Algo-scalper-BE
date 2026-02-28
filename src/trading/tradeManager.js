@@ -350,6 +350,7 @@ class TradeManager {
     // Optional fallback LTP fetch throttle (helps OPT mode when ticks are sparse)
     this._lastLtpFetchAtByToken = new Map(); // token -> ts
     this._lastStructCandleFetchByToken = new Map(); // token -> ts
+    this._structCandlesCacheByToken = new Map(); // token -> { ts, candles }
 
     // Order rate limits + daily count
     this.orderLimiter = new OrderRateLimiter({
@@ -6591,8 +6592,12 @@ class TradeManager {
         Number.isFinite(uTok) &&
         uTok > 0
       ) {
+        const cachedStruct = this._structCandlesCacheByToken.get(uTok);
+        if (Array.isArray(cachedStruct?.candles) && cachedStruct.candles.length) {
+          structureCandles = cachedStruct.candles;
+        }
         const lastStructFetch = Number(this._lastStructCandleFetchByToken.get(uTok) ?? 0);
-        const structThrottleMs = 30000;
+        const structThrottleMs = Math.max(30000, Number(env.STRUCTURE_CACHE_REFRESH_MS ?? 60000));
         if (now - lastStructFetch >= structThrottleMs) {
           this._lastStructCandleFetchByToken.set(uTok, now);
           try {
@@ -6600,6 +6605,7 @@ class TradeManager {
             const uCandles = await getRecentCandles(uTok, intervalMin, structLimit);
             if (Array.isArray(uCandles) && uCandles.length) {
               structureCandles = uCandles;
+              this._structCandlesCacheByToken.set(uTok, { ts: now, candles: uCandles });
             }
           } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
         }
