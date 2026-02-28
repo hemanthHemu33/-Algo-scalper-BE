@@ -16,6 +16,8 @@ const { roundToTick } = require("./priceUtils");
 const { atr, rollingVWAP, maxHigh, minLow } = require("../strategy/utils");
 const { estimateRoundTripCostInr } = require("./costModel");
 const { getEffectivePrice } = require("../market/effectivePrice");
+const { computeStructureLevels } = require("./structureLevels");
+const { computeStructureStopFloor } = require("./structureStop");
 
 function clamp(n, lo, hi) {
   if (!Number.isFinite(n)) return n;
@@ -242,6 +244,8 @@ function applyMinGreenExitRules({
   tick,
   candles,
   quoteSnapshot,
+  structureCandles,
+  sessionOpenTs,
 }) {
   const qty = Number(trade?.qty ?? trade?.initialQty ?? 0);
   const minGreenEnabled = String(env.MIN_GREEN_ENABLED || "true") === "true";
@@ -673,6 +677,7 @@ function applyMinGreenExitRules({
       const lockPts = lockInr / qty;
       const lockSlRaw = side === "BUY" ? entry + lockPts : entry - lockPts;
       const lockSl = roundToTick(lockSlRaw, tick, side === "BUY" ? "up" : "down");
+      profitLockFloorPrice = lockSl;
       if (side === "BUY") newSL = Math.max(newSL, lockSl);
       else newSL = Math.min(newSL, lockSl);
       tradePatch.profitLockInr = lockInr;
@@ -862,7 +867,100 @@ function applyMinGreenExitRules({
   }
   const step = adaptiveStepTicks * tick;
   const curSlRounded = roundToTick(curSL, tick, side === "BUY" ? "down" : "up");
-  const desiredStopLoss = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
+  let desiredStopLoss = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
+
+  const structureEnabled = String(env.STRUCTURE_ANCHORS_ENABLED ?? "true") === "true";
+  let structureStop = null;
+  let structureChosen = null;
+  let structureLevelsMeta = null;
+  let structureCandidatesCount = 0;
+  let structureSkipReason = null;
+  if (structureEnabled) {
+    const mustAfterMinGreen = String(env.ANCHOR_APPLY_AFTER_MIN_GREEN ?? "true") === "true";
+    const mustAfterBe = String(env.ANCHOR_APPLY_AFTER_BE_ARM ?? "true") === "true";
+    const mustAfterProfitLock = String(env.ANCHOR_APPLY_AFTER_PROFIT_LOCK_STEP ?? "true") === "true";
+    const firstStep = parseProfitLockLadder(env.PROFIT_LOCK_LADDER, env)[0]?.stepR ?? null;
+    const hasProfitStep =
+      Boolean(trade?.profitLockArmedAt) ||
+      (Number.isFinite(bestProfitLockStep?.stepR) && Number.isFinite(firstStep)
+        ? bestProfitLockStep.stepR >= firstStep
+        : Boolean(bestProfitLockStep));
+
+    if (mustAfterMinGreen && pnlInr < minGreenInr) {
+      structureSkipReason = "before_min_green";
+    } else if (mustAfterBe && !beLockedNow) {
+      structureSkipReason = "before_be_arm";
+    } else if (mustAfterProfitLock && !hasProfitStep) {
+      structureSkipReason = "before_profit_lock_step";
+    } else {
+      const levelSourceCandles = Array.isArray(structureCandles) && structureCandles.length
+        ? structureCandles
+        : candles;
+      const tz = env.CANDLE_TZ || "Asia/Kolkata";
+      const levels = computeStructureLevels({
+        candles: levelSourceCandles,
+        tz,
+        nowTs: now,
+        sessionOpenTs,
+        orbMinutes: Number(env.ORB_MINUTES ?? 15),
+        env,
+      });
+      if (!levels?.ok) {
+        structureSkipReason = `levels_unavailable:${levels?.reason || "unknown"}`;
+      } else {
+        const sStop = computeStructureStopFloor({
+          side,
+          ltp,
+          peakLtp: Number(tradePatch?.peakLtp ?? trade?.peakLtp ?? ltp),
+          tick,
+          atrPts: trailAtrPts,
+          levels,
+          candles: levelSourceCandles,
+          env,
+          nowTs: now,
+        });
+        structureLevelsMeta = {
+          ...(Number.isFinite(levels.vwap) ? { vwap: levels.vwap } : {}),
+          ...(Number.isFinite(levels.orbHigh) ? { orbHigh: levels.orbHigh } : {}),
+          ...(Number.isFinite(levels.orbLow) ? { orbLow: levels.orbLow } : {}),
+          ...(Number.isFinite(levels.dayHigh) ? { dayHigh: levels.dayHigh } : {}),
+          ...(Number.isFinite(levels.dayLow) ? { dayLow: levels.dayLow } : {}),
+          ...(Number.isFinite(levels.prevDayHigh) ? { prevDayHigh: levels.prevDayHigh } : {}),
+          ...(Number.isFinite(levels.prevDayLow) ? { prevDayLow: levels.prevDayLow } : {}),
+          ...(Number.isFinite(levels.weekHigh) ? { weekHigh: levels.weekHigh } : {}),
+          ...(Number.isFinite(levels.weekLow) ? { weekLow: levels.weekLow } : {}),
+        };
+        structureCandidatesCount = Array.isArray(sStop?.candidates) ? sStop.candidates.length : 0;
+        if (sStop?.ok && Number.isFinite(sStop?.structureStop)) {
+          structureStop = sStop.structureStop;
+          structureChosen = sStop.chosen || null;
+          desiredStopLoss = roundToTick(
+            side === "BUY"
+              ? Math.max(desiredStopLoss, structureStop)
+              : Math.min(desiredStopLoss, structureStop),
+            tick,
+            side === "BUY" ? "down" : "up",
+          );
+          const maxTightenPtsRaw = Number(env.ANCHOR_MAX_TIGHTEN_PER_EVAL_PTS ?? 999999);
+          const maxTightenPts = Number.isFinite(maxTightenPtsRaw)
+            ? Math.max(0, maxTightenPtsRaw)
+            : 999999;
+          if (Number.isFinite(curSlRounded) && maxTightenPts > 0) {
+            desiredStopLoss = roundToTick(
+              side === "BUY"
+                ? Math.min(desiredStopLoss, curSlRounded + maxTightenPts)
+                : Math.max(desiredStopLoss, curSlRounded - maxTightenPts),
+              tick,
+              side === "BUY" ? "down" : "up",
+            );
+          }
+        } else {
+          structureSkipReason = sStop?.reason || "no_valid_structure_candidate";
+        }
+      }
+    }
+  }
+
   const tightenDelta = side === "BUY"
     ? desiredStopLoss - curSlRounded
     : curSlRounded - desiredStopLoss;
@@ -1385,6 +1483,8 @@ function computeDynamicExitPlan({
   env,
   underlyingLtp = undefined,
   quoteSnapshot = undefined,
+  structureCandles = undefined,
+  sessionOpenTs = undefined,
 }) {
   const side = String(trade?.side || "").toUpperCase();
   const tick = Number(trade?.instrument?.tick_size ?? 0.05);
@@ -1624,6 +1724,8 @@ function computeDynamicExitPlan({
     tick,
     candles,
     quoteSnapshot,
+    structureCandles,
+    sessionOpenTs,
   });
 }
 

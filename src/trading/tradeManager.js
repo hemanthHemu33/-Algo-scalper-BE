@@ -167,6 +167,14 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function buildSessionOpenTs(nowTs, tz = "Asia/Kolkata") {
+  const now = Number.isFinite(Number(nowTs)) ? Number(nowTs) : Date.now();
+  return DateTime.fromMillis(now, { zone: tz })
+    .startOf("day")
+    .plus({ hours: 9, minutes: 15 })
+    .toMillis();
+}
+
 const IOC_UNMATCHED_MESSAGE_PATTERNS = [
   "unmatched",
   "cancelled by the system",
@@ -341,6 +349,7 @@ class TradeManager {
 
     // Optional fallback LTP fetch throttle (helps OPT mode when ticks are sparse)
     this._lastLtpFetchAtByToken = new Map(); // token -> ts
+    this._lastStructCandleFetchByToken = new Map(); // token -> ts
 
     // Order rate limits + daily count
     this.orderLimiter = new OrderRateLimiter({
@@ -6551,6 +6560,7 @@ class TradeManager {
       } catch {
         candles = [];
       }
+      let structureCandles = candles;
       // For OPT trades we may not have full candle history immediately; exit model can fall back.
       let underlyingLtp;
       const uTok = Number(trade.underlying_token ?? 0);
@@ -6571,6 +6581,27 @@ class TradeManager {
               if (Number.isFinite(ul)) underlyingLtp = ul;
             } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
           }
+        }
+      }
+
+      const structureEnabled = Boolean(env.STRUCTURE_ANCHORS_ENABLED);
+      if (
+        structureEnabled &&
+        String(env.STRUCTURE_SOURCE || "TRADE").toUpperCase() === "UNDERLYING" &&
+        Number.isFinite(uTok) &&
+        uTok > 0
+      ) {
+        const lastStructFetch = Number(this._lastStructCandleFetchByToken.get(uTok) ?? 0);
+        const structThrottleMs = 30000;
+        if (now - lastStructFetch >= structThrottleMs) {
+          this._lastStructCandleFetchByToken.set(uTok, now);
+          try {
+            const structLimit = Math.max(120, Number(env.STRUCTURE_CANDLE_LIMIT ?? 800));
+            const uCandles = await getRecentCandles(uTok, intervalMin, structLimit);
+            if (Array.isArray(uCandles) && uCandles.length) {
+              structureCandles = uCandles;
+            }
+          } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
         }
       }
 
@@ -6624,6 +6655,8 @@ class TradeManager {
         : tradeWithFacts;
 
       const quoteSnapshot = this.lastQuoteByToken.get(token) || { ltp, quoteTsMs: now };
+      const tz = env.CANDLE_TZ || "Asia/Kolkata";
+      const sessionOpenTs = buildSessionOpenTs(now, tz);
       const plan = computeDynamicExitPlan({
         trade: tradeForPlan,
         ltp,
@@ -6632,6 +6665,8 @@ class TradeManager {
         env,
         underlyingLtp: Number.isFinite(underlyingLtp) ? underlyingLtp : undefined,
         quoteSnapshot,
+        structureCandles,
+        sessionOpenTs,
       });
       if (!plan?.ok) {
         this._dynExitCadenceStats.evalNoPlan += 1;
@@ -6656,6 +6691,9 @@ class TradeManager {
           trailArmed: Boolean(plan?.meta?.trailArmed),
           pendingMove: plan?.meta?.pendingMove ?? null,
           trailStep: plan?.meta?.trailStep ?? null,
+          structureChosen: plan?.meta?.structureChosen ?? null,
+          structureStop: plan?.meta?.structureStop ?? null,
+          structureLevels: plan?.meta?.structureLevels ?? null,
           skipReason: plan?.meta?.skipReason || null,
           recoveryEpoch: this._recoveryEpoch,
           exitLoopInstanceId: this._exitLoopInstanceId,
