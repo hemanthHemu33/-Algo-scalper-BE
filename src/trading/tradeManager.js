@@ -6584,7 +6584,7 @@ class TradeManager {
         }
       }
 
-      const structureEnabled = Boolean(env.STRUCTURE_ANCHORS_ENABLED);
+      const structureEnabled = String(env.STRUCTURE_EXIT_ENABLED ?? "false") === "true";
       if (
         structureEnabled &&
         String(env.STRUCTURE_SOURCE || "TRADE").toUpperCase() === "UNDERLYING" &&
