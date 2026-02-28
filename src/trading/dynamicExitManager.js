@@ -659,7 +659,6 @@ function applyMinGreenExitRules({
   const profitLockSteps = parseProfitLockLadder(env.PROFIT_LOCK_LADDER, env);
   const profitLockMinInr = Number(env.PROFIT_LOCK_MIN_INR ?? 0);
   const profitLockCostMult = Number(env.PROFIT_LOCK_COST_MULT ?? 1.0);
-  let profitLockFloorPrice = null;
   const bestProfitLockStep = profitLockSteps
     .filter((step) => Number.isFinite(mfeR) && mfeR >= step.stepR)
     .pop();
@@ -1116,7 +1115,6 @@ function applyMinGreenExitRules({
       profitLockStepR: bestProfitLockStep?.stepR ?? null,
       keepR: bestProfitLockStep?.keepR ?? null,
       lockInr: Number(tradePatch?.profitLockInr ?? trade?.profitLockInr ?? 0) || null,
-      lockFloorPrice: Number.isFinite(profitLockFloorPrice) ? profitLockFloorPrice : null,
       profitLockMinInr,
       atrPts: trailAtrPts,
       K: Number.isFinite(trailK) ? trailK : null,
@@ -1126,13 +1124,6 @@ function applyMinGreenExitRules({
           ? trailSlComputed
           : Number(tradePatch?.trailSl ?? trade?.trailSl ?? 0) || null,
       trailAtrSourceUsed,
-      structureEnabled,
-      structureSource: String(env.STRUCTURE_SOURCE || "TRADE").toUpperCase(),
-      structureLevels: structureLevelsMeta,
-      structureStop,
-      structureChosen,
-      structureCandidatesCount,
-      structureSkipReason,
       trailTightenR,
       trailGapPostBePctTight,
       pendingMove: nextPendingMove,
