@@ -6,7 +6,9 @@ describe("evaluateReentryOverride", () => {
     REENTRY_AFTER_SL_WINDOW_SEC: 180,
     REENTRY_AFTER_SL_MAX_TRIES: 1,
     REENTRY_AFTER_SL_MIN_CONF: 85,
+    REENTRY_AFTER_SL_LATE_MIN_CONF: 80,
     REENTRY_AFTER_SL_R_MULT: 0.5,
+    REENTRY_AFTER_SL_ALLOW_DURING_NO_TRADE_WINDOWS: true,
     REENTRY_AFTER_SL_ALLOWED_STRATEGIES:
       "breakout,vwap_reclaim,volume_spike,bollinger_squeeze,ema_pullback",
     LATE_ENTRY_OVERRIDE_ENABLED: true,
@@ -144,4 +146,37 @@ describe("evaluateReentryOverride", () => {
     });
     expect(denyOut.allow).toBe(false);
   });
+
+
+  test("allows no-trade-window override when explicitly enabled", () => {
+    const out = evaluateReentryOverride({
+      env: baseEnv,
+      nowMs: 1_000_000,
+      tz: "Asia/Kolkata",
+      blockedReason: "no_trade_window",
+      signal: { confidence: 90, strategyId: "breakout" },
+      riskKey: "NIFTY:breakout",
+      stopout: { ts: 1_000_000 - 10_000, attempts: 0 },
+      timeToFlattenSec: 1200,
+    });
+
+    expect(out.allow).toBe(true);
+    expect(out.reason).toBe("reentry_allowed");
+  });
+
+  test("uses dedicated reentry late min confidence when set", () => {
+    const out = evaluateReentryOverride({
+      env: { ...baseEnv, LATE_ENTRY_MIN_CONF: 90, REENTRY_AFTER_SL_LATE_MIN_CONF: 80 },
+      nowMs: 1_000_000,
+      tz: "Asia/Kolkata",
+      blockedReason: "after_entry_cutoff",
+      signal: { confidence: 86, strategyId: "breakout" },
+      riskKey: "NIFTY:breakout",
+      stopout: { ts: 1_000_000 - 10_000, attempts: 0 },
+      timeToFlattenSec: 900,
+    });
+
+    expect(out.allow).toBe(true);
+  });
+
 });
