@@ -62,6 +62,58 @@ describe("evaluateReentryOverride", () => {
     expect(out.allow).toBe(false);
   });
 
+
+  test("allows fresh late-entry override with strict gates and reduced risk", () => {
+    const out = evaluateReentryOverride({
+      env: {
+        ...baseEnv,
+        LATE_ENTRY_FRESH_OVERRIDE_ENABLED: true,
+        LATE_ENTRY_FRESH_MIN_CONF: 93,
+        LATE_ENTRY_FRESH_MAX_SPREAD_BPS: 18,
+        LATE_ENTRY_FRESH_MAX_EXPECTED_SLIPPAGE_PTS: 0.8,
+        LATE_ENTRY_FRESH_R_MULT: 0.3,
+      },
+      nowMs: 1_000_000,
+      tz: "Asia/Kolkata",
+      blockedReason: "after_entry_cutoff",
+      signal: { confidence: 95, strategyId: "breakout" },
+      riskKey: "NIFTY:breakout",
+      stopout: null,
+      timeToFlattenSec: 900,
+      spreadBps: 12,
+      expectedSlippagePts: 0.5,
+    });
+
+    expect(out.allow).toBe(true);
+    expect(out.riskMult).toBe(0.3);
+    expect(out.reason).toBe("fresh_late_entry_allowed");
+    expect(out.canTradeCtx).toEqual({
+      ignoreCooldown: true,
+      allowAfterEntryCutoffUntil: "15:10",
+    });
+  });
+
+  test("denies fresh late-entry override when spread is too wide", () => {
+    const out = evaluateReentryOverride({
+      env: {
+        ...baseEnv,
+        LATE_ENTRY_FRESH_OVERRIDE_ENABLED: true,
+        LATE_ENTRY_FRESH_MAX_SPREAD_BPS: 18,
+      },
+      nowMs: 1_000_000,
+      tz: "Asia/Kolkata",
+      blockedReason: "after_entry_cutoff",
+      signal: { confidence: 95, strategyId: "breakout" },
+      riskKey: "NIFTY:breakout",
+      stopout: null,
+      timeToFlattenSec: 900,
+      spreadBps: 24,
+      expectedSlippagePts: 0.2,
+    });
+
+    expect(out.allow).toBe(false);
+    expect(out.reason).toBe("fresh_late_entry_spread_too_wide");
+  });
   test("after cutoff requires late-entry constraints", () => {
     const allowOut = evaluateReentryOverride({
       env: baseEnv,
