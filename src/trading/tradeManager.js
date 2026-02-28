@@ -8948,6 +8948,12 @@ class TradeManager {
         ? Math.max(0, flattenToday.diff(nowDt, "seconds").seconds)
         : Infinity;
       const stopout = this._recentStopouts.get(riskKey) || null;
+      const signalSpreadBps = Number(
+        s?.spread_bps ??
+          s?.spreadBps ??
+          s?.option_meta?.spreadBps ??
+          s?.option_meta?.bps,
+      );
       const evalResult = evaluateReentryOverride({
         env,
         nowMs: Date.now(),
@@ -8957,6 +8963,8 @@ class TradeManager {
         riskKey,
         stopout,
         timeToFlattenSec,
+        spreadBps: signalSpreadBps,
+        expectedSlippagePts: Number(env.EXPECTED_SLIPPAGE_POINTS ?? 0),
       });
 
       if (evalResult.allow) {
@@ -8975,7 +8983,9 @@ class TradeManager {
           s = {
             ...s,
             reentry_meta: {
-              afterSL: true,
+              afterSL: Boolean(stopout),
+              freshLateEntry:
+                String(evalResult.reason || "") === "fresh_late_entry_allowed",
               riskMult: reentry.riskMult,
               blockedReason: originalReason,
             },

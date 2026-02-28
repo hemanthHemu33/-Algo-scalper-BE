@@ -689,6 +689,11 @@ const schema = z.object({
   LATE_ENTRY_ALLOW_UNTIL: z.string().default("15:10"),
   LATE_ENTRY_MIN_CONF: z.coerce.number().default(85),
   LATE_ENTRY_MIN_TIME_TO_FLATTEN_SEC: z.coerce.number().default(600),
+  LATE_ENTRY_FRESH_OVERRIDE_ENABLED: boolFromEnv.default(false),
+  LATE_ENTRY_FRESH_MIN_CONF: z.coerce.number().default(93),
+  LATE_ENTRY_FRESH_MAX_SPREAD_BPS: z.coerce.number().default(18),
+  LATE_ENTRY_FRESH_MAX_EXPECTED_SLIPPAGE_PTS: z.coerce.number().default(0.8),
+  LATE_ENTRY_FRESH_R_MULT: z.coerce.number().default(0.3),
   FORCE_FLATTEN_AT: z.string().default("15:20"), // HH:mm in CANDLE_TZ
   EOD_MIS_TO_NRML_ENABLED: boolFromEnv.default(true),
   EOD_MIS_TO_NRML_AT: z.string().default("15:18"), // HH:mm in CANDLE_TZ (must be < FORCE_FLATTEN_AT)
