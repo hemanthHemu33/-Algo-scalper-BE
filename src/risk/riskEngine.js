@@ -115,7 +115,7 @@ class RiskEngine {
     return { token: key, seconds: sec, reason: reason || null };
   }
 
-  canTrade(token) {
+  canTrade(token, ctx = {}) {
     token = this._keyOf(token);
 
     if (isHalted()) return { ok: false, reason: "halted" };
@@ -157,7 +157,26 @@ class RiskEngine {
 
     // Entry cutoff (use override from special session if provided)
     if (cutoffToday && cutoffToday.isValid && now >= cutoffToday) {
-      return { ok: false, reason: "after_entry_cutoff" };
+      const allowAfterCutoffUntil =
+        typeof ctx?.allowAfterEntryCutoffUntil === "string"
+          ? ctx.allowAfterEntryCutoffUntil.trim()
+          : "";
+      if (!allowAfterCutoffUntil) {
+        return { ok: false, reason: "after_entry_cutoff" };
+      }
+      let allowUntil = DateTime.fromFormat(allowAfterCutoffUntil, "HH:mm", {
+        zone: tz,
+      });
+      if (allowUntil.isValid) {
+        allowUntil = allowUntil.set({
+          year: now.year,
+          month: now.month,
+          day: now.day,
+        });
+      }
+      if (!allowUntil.isValid || now >= allowUntil) {
+        return { ok: false, reason: "after_entry_cutoff" };
+      }
     }
 
     if (this.consecutiveFailures >= Number(env.MAX_CONSECUTIVE_FAILURES ?? 3)) {
@@ -180,8 +199,10 @@ class RiskEngine {
       return { ok: false, reason: "max_open_positions" };
     if (this.openPositions.has(token))
       return { ok: false, reason: "already_in_position" };
-    const until = this.cooldownUntil.get(token) || 0;
-    if (this.clock.nowMs() < until) return { ok: false, reason: "cooldown" };
+    if (!ctx?.ignoreCooldown) {
+      const until = this.cooldownUntil.get(token) || 0;
+      if (this.clock.nowMs() < until) return { ok: false, reason: "cooldown" };
+    }
     return { ok: true };
   }
 

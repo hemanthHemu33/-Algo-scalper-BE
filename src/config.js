@@ -660,6 +660,16 @@ const schema = z.object({
   SYMBOL_COOLDOWN_AFTER_TIME_STOP_SEC: z.coerce.number().default(180),
   SYMBOL_COOLDOWN_AFTER_PROFIT_SEC: z.coerce.number().default(60),
   SYMBOL_COOLDOWN_DEFAULT_SEC: z.coerce.number().default(180),
+  REENTRY_AFTER_SL_ENABLED: boolFromEnv.default(true),
+  REENTRY_AFTER_SL_WINDOW_SEC: z.coerce.number().default(180),
+  REENTRY_AFTER_SL_MAX_TRIES: z.coerce.number().default(1),
+  REENTRY_AFTER_SL_MIN_CONF: z.coerce.number().default(85),
+  REENTRY_AFTER_SL_R_MULT: z.coerce.number().default(0.5),
+  REENTRY_AFTER_SL_ALLOWED_STRATEGIES: z
+    .string()
+    .default(
+      "breakout,vwap_reclaim,volume_spike,bollinger_squeeze,ema_pullback",
+    ),
   DAILY_MAX_LOSS_INR: z.coerce.number().default(1350),
   AUTO_EXIT_ON_DAILY_LOSS: z.string().default("true"),
   RISK_MAX_DRAWDOWN_INR: z.coerce.number().default(2700),
@@ -675,6 +685,10 @@ const schema = z.object({
   // Trading window (MIS safe)
   AUTO_FIX_TIME_WINDOWS: z.string().default("false"),
   STOP_NEW_ENTRIES_AFTER: z.string().default("15:00"), // HH:mm in CANDLE_TZ
+  LATE_ENTRY_OVERRIDE_ENABLED: boolFromEnv.default(true),
+  LATE_ENTRY_ALLOW_UNTIL: z.string().default("15:10"),
+  LATE_ENTRY_MIN_CONF: z.coerce.number().default(85),
+  LATE_ENTRY_MIN_TIME_TO_FLATTEN_SEC: z.coerce.number().default(600),
   FORCE_FLATTEN_AT: z.string().default("15:20"), // HH:mm in CANDLE_TZ
   EOD_MIS_TO_NRML_ENABLED: boolFromEnv.default(true),
   EOD_MIS_TO_NRML_AT: z.string().default("15:18"), // HH:mm in CANDLE_TZ (must be < FORCE_FLATTEN_AT)

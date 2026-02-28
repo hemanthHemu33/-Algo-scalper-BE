@@ -65,6 +65,7 @@ const { equityService } = require("../account/equityService");
 const { buildPositionsSnapshot } = require("./positionService");
 const { getRiskLimits } = require("../risk/riskLimits");
 const { RiskBudget } = require("../risk/riskBudget");
+const { evaluateReentryOverride } = require("./reentryPolicy");
 const {
   ensureTradeIndexes,
   insertTrade,
@@ -289,6 +290,7 @@ class TradeManager {
     this.lastTickAtByToken = new Map(); // token -> ts
     this.activeTradeId = null; // single-stock mode
     this.recoveredPosition = null; // set when positions exist but trade state missing
+    this._recentStopouts = new Map(); // riskKey -> { ts, attempts, side, tradeId }
 
     // OCO race safety: remember the most recently closed trade for a short window
     // so we can detect and clean up late exit fills (double-fill) and leftover exit orders.
@@ -8913,7 +8915,99 @@ class TradeManager {
       logger.warn({ token, dailyState }, "[trade] blocked (daily paused)");
       return;
     }
-    const check = this.risk.canTrade(riskKey);
+
+    const stopoutTtlMs =
+      Math.max(1, Number(env.REENTRY_AFTER_SL_WINDOW_SEC ?? 180)) * 2 * 1000;
+    const stopoutNowMs = Date.now();
+    for (const [key, stopoutRec] of this._recentStopouts.entries()) {
+      const ts = Number(stopoutRec?.ts ?? 0);
+      if (!Number.isFinite(ts) || stopoutNowMs - ts > stopoutTtlMs) {
+        this._recentStopouts.delete(key);
+      }
+    }
+
+    let check = this.risk.canTrade(riskKey);
+    let reentry = { allowed: false, riskMult: 1.0, reason: null, meta: null };
+    if (!check.ok && ["cooldown", "after_entry_cutoff"].includes(check.reason)) {
+      const originalReason = check.reason;
+      const tz = env.CANDLE_TZ || "Asia/Kolkata";
+      const nowDt = DateTime.fromMillis(Date.now()).setZone(tz);
+      const flattenTime = DateTime.fromFormat(
+        String(env.FORCE_FLATTEN_AT || ""),
+        "HH:mm",
+        { zone: tz },
+      );
+      const flattenToday = flattenTime.isValid
+        ? flattenTime.set({
+            year: nowDt.year,
+            month: nowDt.month,
+            day: nowDt.day,
+          })
+        : null;
+      const timeToFlattenSec = flattenToday?.isValid
+        ? Math.max(0, flattenToday.diff(nowDt, "seconds").seconds)
+        : Infinity;
+      const stopout = this._recentStopouts.get(riskKey) || null;
+      const evalResult = evaluateReentryOverride({
+        env,
+        nowMs: Date.now(),
+        tz,
+        blockedReason: originalReason,
+        signal: s,
+        riskKey,
+        stopout,
+        timeToFlattenSec,
+      });
+
+      if (evalResult.allow) {
+        check = this.risk.canTrade(riskKey, evalResult.canTradeCtx || {});
+        if (check.ok) {
+          reentry = {
+            allowed: true,
+            riskMult: Number(evalResult.riskMult ?? 1),
+            reason: evalResult.reason,
+            meta: evalResult.meta || null,
+          };
+          if (stopout) {
+            stopout.attempts = Number(stopout.attempts ?? 0) + 1;
+            this._recentStopouts.set(riskKey, stopout);
+          }
+          s = {
+            ...s,
+            reentry_meta: {
+              afterSL: true,
+              riskMult: reentry.riskMult,
+              blockedReason: originalReason,
+            },
+          };
+          logger.warn(
+            {
+              riskKey,
+              originalReason,
+              ctx: evalResult.canTradeCtx || null,
+              meta: evalResult.meta || null,
+            },
+            "[reentry] override allowed",
+          );
+        } else {
+          logger.info(
+            { riskKey, originalReason: check.reason },
+            "[reentry] override attempted but still blocked",
+          );
+        }
+      } else {
+        logger.info(
+          {
+            riskKey,
+            blockedReason: originalReason,
+            reason: evalResult.reason,
+            meta: evalResult.meta || null,
+          },
+          "[reentry] override denied",
+        );
+      }
+    }
+
     if (!check.ok) {
       logger.info({ token, reason: check.reason }, "[trade] blocked");
       return;
@@ -9387,7 +9481,13 @@ class TradeManager {
           atrPct: Number(reg?.meta?.atrPct ?? reg?.meta?.atr_pct ?? NaN),
         })
       : Number(env.RISK_PER_TRADE_INR ?? 0);
-    const _riskInrOverride = Number(_baseRiskInr) * _openMult;
+    const reentryMult = s.reentry_meta?.afterSL
+      ? Number(s.reentry_meta.riskMult ?? 1)
+      : 1;
+    const _baseRiskInrAdj = Number(_baseRiskInr) * (
+      Number.isFinite(reentryMult) ? reentryMult : 1
+    );
+    const _riskInrOverride = Number(_baseRiskInrAdj) * _openMult;
     const _sessionRiskInr = Number(this.riskBudget?.getSessionRInr?.() ?? 0);
     const _tradeRiskR =
       Number.isFinite(_sessionRiskInr) && _sessionRiskInr > 0
@@ -9400,6 +9500,7 @@ class TradeManager {
         tradeRiskR: _tradeRiskR,
         R_trade_inr: _riskInrOverride,
         openMult: _openMult,
+        reentry: s.reentry_meta || null,
       },
       "[risk] computed dynamic risk budget",
     );
@@ -13529,12 +13630,33 @@ class TradeManager {
       ).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
     }
 
-    this.risk.markTradeClosed(tradeWithPnl?.riskKey || t?.riskKey || String(instrument_token), {
-      status: tradeWithPnl?.status || t?.status,
-      closeReason: tradeWithPnl?.closeReason || t?.closeReason,
-      exitReason: tradeWithPnl?.exitReason || t?.exitReason,
+    const riskKey = tradeWithPnl?.riskKey || t?.riskKey || String(instrument_token);
+    const status = tradeWithPnl?.status || t?.status;
+    const closeReason = tradeWithPnl?.closeReason || t?.closeReason;
+    const exitReason = tradeWithPnl?.exitReason || t?.exitReason;
+
+    this.risk.markTradeClosed(riskKey, {
+      status,
+      closeReason,
+      exitReason,
       pnl,
     });
+
+    const closeReasonUpper = String(closeReason || "").toUpperCase();
+    const exitReasonUpper = String(exitReason || "").toUpperCase();
+    const isSL =
+      String(status || "").toUpperCase() === STATUS.EXITED_SL ||
+      closeReasonUpper.includes("SL") ||
+      exitReasonUpper.includes("SL");
+    if (isSL && riskKey) {
+      this._recentStopouts.set(String(riskKey), {
+        ts: Date.now(),
+        attempts: 0,
+        side: String(tradeWithPnl?.side || t?.side || "").toUpperCase() || null,
+        tradeId,
+      });
+      logger.info({ riskKey, tradeId }, "[reentry] stopout recorded");
+    }
   }
 
   async setKillSwitch(enabled, reason) {
