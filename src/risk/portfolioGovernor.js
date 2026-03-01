@@ -3,6 +3,9 @@ const { env } = require("../config");
 const { logger: defaultLogger } = require("../logger");
 const { getSessionForDateTime } = require("../market/marketCalendar");
 
+// Keep governor state in its own collection to avoid collisions with legacy risk_state unique indexes.
+const PORTFOLIO_GOVERNOR_COLLECTION = "portfolio_governor_state";
+
 function toNum(v, fallback = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
@@ -31,6 +34,7 @@ class PortfolioGovernor {
     envCfg = env,
     logger = defaultLogger,
     collection,
+    legacyCollection,
     nowMs = () => Date.now(),
     sessionResolver,
     baseRInrResolver,
@@ -38,6 +42,7 @@ class PortfolioGovernor {
     this.env = envCfg;
     this.logger = logger;
     this.collection = collection;
+    this.legacyCollection = legacyCollection;
     this.nowMs = nowMs;
     this.sessionResolver =
       sessionResolver ||
@@ -78,9 +83,7 @@ class PortfolioGovernor {
     const date = this._sessionDate();
     if (this.state && this.state.date === date) return this.state;
 
-    const row = this.collection
-      ? await this.collection.findOne({ kind: "portfolio_governor", date })
-      : null;
+    const row = this.collection ? await this.collection.findOne({ date }) : null;
 
     if (row) {
       this.state = {
@@ -89,10 +92,36 @@ class PortfolioGovernor {
         date,
       };
       this._normalizeState();
+      this.logger.info(
+        { date, source: PORTFOLIO_GOVERNOR_COLLECTION },
+        "[portfolio_governor] loaded persisted state",
+      );
       return this.state;
     }
 
+    if (this.legacyCollection) {
+      const legacy = await this.legacyCollection.findOne({ kind: "portfolio_governor", date });
+      if (legacy) {
+        this.state = {
+          ...mkState(date),
+          ...legacy,
+          date,
+        };
+        this._normalizeState();
+        this.logger.info(
+          { date, source: "risk_state", imported: true },
+          "[portfolio_governor] imported legacy state",
+        );
+        await this._persist();
+        return this.state;
+      }
+    }
+
     this.state = mkState(date);
+    this.logger.info(
+      { date, source: "fresh" },
+      "[portfolio_governor] initialized new state",
+    );
     await this._persist();
     return this.state;
   }
@@ -114,6 +143,7 @@ class PortfolioGovernor {
     s.orderErrorCount = Math.max(0, Math.floor(toNum(s.orderErrorCount, 0)));
     s.orderErrBreakerUntilTs = Math.max(0, toNum(s.orderErrBreakerUntilTs, 0));
     s.openRiskInrSnapshot = Math.max(0, toNum(s.openRiskInrSnapshot, s.openRiskInr));
+    delete s.kind;
     this.state = s;
   }
 
@@ -315,18 +345,35 @@ class PortfolioGovernor {
     if (!this.collection || !this.state) return;
     this._normalizeState();
     await this.collection.updateOne(
-      { kind: "portfolio_governor", date: this.state.date },
+      { date: this.state.date },
       {
         $set: {
           ...this.state,
-          kind: "portfolio_governor",
           lastUpdated: new Date(),
         },
         $setOnInsert: { createdAt: new Date() },
       },
       { upsert: true },
     );
+    this.logger.debug?.(
+      {
+        date: this.state.date,
+        realizedPnlInr: this.state.realizedPnlInr,
+        openRiskInr: this.state.openRiskInr,
+      },
+      "[portfolio_governor] state persisted",
+    );
   }
 }
 
-module.exports = { PortfolioGovernor };
+async function ensurePortfolioGovernorIndexes(db) {
+  await db
+    .collection(PORTFOLIO_GOVERNOR_COLLECTION)
+    .createIndex({ date: 1 }, { unique: true, name: "uniq_date" });
+}
+
+module.exports = {
+  PORTFOLIO_GOVERNOR_COLLECTION,
+  PortfolioGovernor,
+  ensurePortfolioGovernorIndexes,
+};

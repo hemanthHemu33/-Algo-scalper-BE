@@ -74,7 +74,11 @@ const { equityService } = require("../account/equityService");
 const { buildPositionsSnapshot } = require("./positionService");
 const { getRiskLimits } = require("../risk/riskLimits");
 const { RiskBudget } = require("../risk/riskBudget");
-const { PortfolioGovernor } = require("../risk/portfolioGovernor");
+const {
+  PortfolioGovernor,
+  PORTFOLIO_GOVERNOR_COLLECTION,
+  ensurePortfolioGovernorIndexes,
+} = require("../risk/portfolioGovernor");
 const { evaluateReentryOverride } = require("./reentryPolicy");
 const {
   ensureTradeIndexes,
@@ -934,6 +938,7 @@ class TradeManager {
     if (this._initialized) return;
     await ensureTradeIndexes();
     await ensureExecutionMetricsIndexes();
+    await ensurePortfolioGovernorIndexes(getDb());
     // Patch-6: load persisted cost calibration multipliers (if enabled)
     try {
       await costCalibrator.start();
@@ -955,7 +960,8 @@ class TradeManager {
     }
     await this.refreshRiskLimits();
     await this._hydrateRiskFromDb();
-    this.portfolioGovernor.collection = getDb().collection("risk_state");
+    this.portfolioGovernor.collection = getDb().collection(PORTFOLIO_GOVERNOR_COLLECTION);
+    this.portfolioGovernor.legacyCollection = getDb().collection("risk_state");
     await this.portfolioGovernor.init({
       openTrades: await getActiveTrades(),
     });
@@ -6708,7 +6714,7 @@ class TradeManager {
         }
       }
 
-      const structureEnabled = String(env.STRUCTURE_EXIT_ENABLED ?? "false") === "true";
+      const structureEnabled = String(env.STRUCTURE_ANCHORS_ENABLED ?? env.STRUCTURE_EXIT_ENABLED ?? "false") === "true";
       if (
         structureEnabled &&
         String(env.STRUCTURE_SOURCE || "TRADE").toUpperCase() === "UNDERLYING" &&
