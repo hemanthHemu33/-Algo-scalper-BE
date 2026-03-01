@@ -19,6 +19,9 @@ const { getEffectivePrice } = require("../market/effectivePrice");
 const { computeStructureLevels } = require("./structureLevels");
 const { applyLiquidityBuffer } = require("./liquidityBuffer");
 const { computeVolScaler, applyScalerToRThreshold } = require("./volScaler");
+const { computeStopAnchor } = require("./stopAnchors");
+
+const levelsCache = new Map();
 
 function clamp(n, lo, hi) {
   if (!Number.isFinite(n)) return n;
@@ -246,6 +249,35 @@ function resolveAnchorPrice(levels, anchorKey) {
   const px = Number(map[String(anchorKey || "").toUpperCase()]);
   return Number.isFinite(px) ? px : null;
 }
+
+function getStructureLevelsCached({ env, trade, now, candles, underlyingLtp, sessionOpenTs }) {
+  const ttlMs = Math.max(1, Number(env.LEVELS_CACHE_TTL_SEC ?? 30)) * 1000;
+  const dayKey = new Date(now).toISOString().slice(0, 10);
+  const symbolKey = String(
+    trade?.underlying_symbol ||
+      trade?.signal?.underlyingSymbol ||
+      trade?.instrument?.name ||
+      trade?.instrument?.tradingsymbol ||
+      trade?.underlying_token ||
+      "UNKNOWN",
+  );
+  const cacheKey = `${symbolKey}:${dayKey}`;
+  const hit = levelsCache.get(cacheKey);
+  if (hit && now - hit.ts <= ttlMs) return hit.levels;
+
+  const levels = computeStructureLevels({
+    env,
+    tz: env.CANDLE_TZ || "Asia/Kolkata",
+    nowMs: now,
+    underlyingToken: trade?.underlying_token,
+    underlyingCandles: candles,
+    underlyingTicksOrLtpSeries: { ltp: underlyingLtp },
+    breakoutLevel: trade?.signal?.breakoutLevel ?? trade?.planMeta?.breakoutLevel,
+    sessionOpenTs,
+  });
+  levelsCache.set(cacheKey, { ts: now, levels });
+  return levels;
+}
 function detectRegimeTag(trade) {
   return String(
     trade?.marketContextAtEntry?.regimeTag ||
@@ -423,7 +455,7 @@ function applyMinGreenExitRules({
       ? (volAtrPts / volRefLtp) * 10000
       : null;
   const volScalerEnabled = String(env.VOL_SCALER_ENABLED ?? "true") === "true";
-  const volScaler = volScalerEnabled ? computeVolScaler({ env, atrBps }) : 1;
+  const volScaler = volScalerEnabled ? computeVolScaler({ env, atrPts: volAtrPts, atrBps }) : 1;
   const scaledMinGreenR = clamp(
     applyScalerToRThreshold(baseMinGreenR, volScaler, String(env.VOL_SCALE_MIN_GREEN_R ?? "true") === "true"),
     0.1,
@@ -962,7 +994,7 @@ function applyMinGreenExitRules({
   const curSlRounded = roundToTick(curSL, tick, side === "BUY" ? "down" : "up");
   let desiredStopLoss = roundToTick(newSL, tick, side === "BUY" ? "down" : "up");
 
-  const structureEnabled = String(env.STRUCTURE_EXIT_ENABLED ?? env.STRUCTURE_ANCHORS_ENABLED ?? "false") === "true";
+  const structureEnabled = String(env.STRUCTURE_ANCHORS_ENABLED ?? env.STRUCTURE_EXIT_ENABLED ?? "false") === "true";
   let structureStop = null;
   let structureChosen = null;
   let structureLevelsMeta = null;
@@ -974,73 +1006,58 @@ function applyMinGreenExitRules({
   let structureBufferPts = null;
   let structureRoundGuardApplied = false;
   const strategyId = String(trade?.strategyId ?? trade?.strategy ?? trade?.signal?.strategyId ?? "").trim();
+  const minGreenGatePassed = !minGreenEnabled || meetsThreshold(pnlInr, minGreenInr, pnlStepInr);
   if (structureEnabled) {
-    const structureActivateAtR = Number(env.STRUCTURE_ACTIVATE_AT_R ?? 0.6);
-    const structureMaxTightenR = Number(env.STRUCTURE_MAX_TIGHTEN_R ?? 2.5);
-    const inRWindow = Number.isFinite(pnlRForRules) && pnlRForRules >= structureActivateAtR && pnlRForRules <= structureMaxTightenR;
-    const stageActive = beLockedNow || trailLockedNow || profitLockArmed;
-    if (!stageActive) {
-      structureSkipReason = "stage_not_active";
-    } else if (!inRWindow) {
-      structureSkipReason = "outside_structure_r_window";
+    const levelSourceCandles = Array.isArray(structureCandles) && structureCandles.length ? structureCandles : candles;
+    const levels = getStructureLevelsCached({
+      env,
+      trade,
+      now,
+      candles: levelSourceCandles,
+      underlyingLtp,
+      sessionOpenTs,
+    });
+    structureLevelsMeta = levels?.meta || null;
+
+    if (!minGreenGatePassed) {
+      structureSkipReason = "min_green_gate";
     } else {
-      const levelSourceCandles = Array.isArray(structureCandles) && structureCandles.length ? structureCandles : candles;
-      const tz = env.CANDLE_TZ || "Asia/Kolkata";
-      const levels = computeStructureLevels({
-        env,
-        tz,
-        nowMs: now,
-        underlyingToken: trade?.underlying_token,
-        underlyingCandles: levelSourceCandles,
-        underlyingTicksOrLtpSeries: { ltp: underlyingLtp },
-        breakoutLevel: trade?.signal?.breakoutLevel ?? trade?.planMeta?.breakoutLevel,
-        sessionOpenTs,
+      const anchor = computeStopAnchor({
+        strategyId,
+        side,
+        levels,
+        entryContext: { tickSize: tick, entry, beFloor, beProfitLockFloor },
+        nowContext: { env, ltp, atrPts: trailAtrPts ?? volAtrPts, tickSize: tick, nowTs: now },
       });
-      structureLevelsMeta = levels?.meta || null;
-      const anchorMap = parseAnchorMap(env.STOP_ANCHOR_MAP);
-      const rawAnchor = anchorMap.get(strategyId) || anchorMap.get(String(strategyId || "").toLowerCase()) || "SWING";
-      let anchorKey = normalizeAnchorToken(rawAnchor, side);
-      let anchorPrice = resolveAnchorPrice(levels, anchorKey);
-      if (!Number.isFinite(anchorPrice)) {
-        anchorKey = "VWAP";
-        anchorPrice = resolveAnchorPrice(levels, anchorKey);
-      }
-      structureCandidatesCount = anchorPrice != null ? 1 : 0;
-      if (!Number.isFinite(anchorPrice)) {
-        structureSkipReason = `anchor_unavailable:${anchorKey}`;
+      structureCandidatesCount = Number.isFinite(Number(anchor?.anchorPrice)) && anchor?.anchorPrice != null ? 1 : 0;
+      structureFloorBeforeBuffer = Number.isFinite(Number(anchor?.anchorPrice)) && anchor?.anchorPrice != null ? Number(anchor.anchorPrice) : null;
+      structureFloorAfterBuffer = Number.isFinite(Number(anchor?.recommendedSL)) && anchor?.recommendedSL != null ? Number(anchor.recommendedSL) : null;
+      structureBufferTicks = Number.isFinite(Number(anchor?.bufferTicks)) && anchor?.bufferTicks != null ? Number(anchor.bufferTicks) : null;
+      structureBufferPts = Number.isFinite(Number(anchor?.bufferPts)) && anchor?.bufferPts != null ? Number(anchor.bufferPts) : null;
+      structureRoundGuardApplied = Boolean(anchor?.roundGuardApplied);
+      structureChosen = anchor?.anchorType && !String(anchor.anchorType).endsWith("_UNAVAILABLE")
+        ? { anchorKey: anchor.anchorType, anchorPrice: anchor.anchorPrice, family: anchor.family }
+        : null;
+
+      if (Number.isFinite(structureFloorAfterBuffer)) {
+        structureStop = structureFloorAfterBuffer;
       } else {
-        structureFloorBeforeBuffer = Number(anchorPrice);
-        const buffered = applyLiquidityBuffer({
-          env,
-          side,
-          candidateSL: anchorPrice,
-          tickSize: tick,
-          atrPts: trailAtrPts ?? volAtrPts,
-          roundNumberStep: env.ROUND_NUMBER_STEP,
-          ltp,
-        });
-        structureFloorAfterBuffer = Number(buffered?.bufferedSL);
-        structureBufferTicks = Number(buffered?.bufferTicks ?? 0);
-        structureBufferPts = Number(buffered?.bufferPts ?? 0);
-        structureRoundGuardApplied = Boolean(buffered?.roundGuardApplied);
-        if (Number.isFinite(structureFloorAfterBuffer)) {
-          structureStop = structureFloorAfterBuffer;
-          structureChosen = { anchorKey, anchorPrice };
-          desiredStopLoss = roundToTick(
-            side === "BUY"
-              ? Math.max(desiredStopLoss, structureStop)
-              : Math.min(desiredStopLoss, structureStop),
-            tick,
-            side === "BUY" ? "down" : "up",
-          );
-          if (structureRoundGuardApplied) {
-            skipReasons.push("round_guard applied");
-          }
-          skipReasons.push(`structure_anchor=${anchorKey} applied`);
-        } else {
-          structureSkipReason = "buffered_structure_invalid";
-        }
+        structureSkipReason = "buffered_structure_invalid";
       }
+    }
+  }
+
+  if (Number.isFinite(structureStop)) {
+    const combineCandidates = [desiredStopLoss, beFloor, beProfitLockFloor, trailSlComputed, structureStop]
+      .map((v) => Number(v))
+      .filter((v) => Number.isFinite(v));
+    if (combineCandidates.length) {
+      desiredStopLoss = roundToTick(
+        side === "BUY" ? Math.max(...combineCandidates) : Math.min(...combineCandidates),
+        tick,
+        side === "BUY" ? "down" : "up",
+      );
+      skipReasons.push(`structure_anchor=${structureChosen?.anchorKey || "UNKNOWN"} applied`);
     }
   }
 
