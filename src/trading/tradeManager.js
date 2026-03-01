@@ -2195,10 +2195,16 @@ class TradeManager {
     const basePassiveMax = Number(env.ENTRY_PASSIVE_MAX_SPREAD_BPS ?? 8);
     const baseAggressiveMax = Number(env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS ?? 20);
     const passiveMax = segment === "OPT"
-      ? Number(env.ENTRY_MAX_SPREAD_BPS_OPT_PASSIVE ?? env.ENTRY_PASSIVE_MAX_SPREAD_BPS_OPT ?? 25)
+      ? Math.min(
+        Number(env.ENTRY_MAX_SPREAD_BPS_OPT_PASSIVE ?? 25),
+        Number(env.ENTRY_PASSIVE_MAX_SPREAD_BPS_OPT ?? 25),
+      )
       : basePassiveMax;
     const aggressiveMax = segment === "OPT"
-      ? Number(env.ENTRY_MAX_SPREAD_BPS_OPT_AGGR ?? env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS_OPT ?? 60)
+      ? Math.min(
+        Number(env.ENTRY_MAX_SPREAD_BPS_OPT_AGGR ?? 60),
+        Number(env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS_OPT ?? 60),
+      )
       : baseAggressiveMax;
     const marketFallbackMax = segment === "OPT"
       ? Number(env.ENTRY_MARKET_FALLBACK_MAX_SPREAD_BPS_OPT ?? aggressiveMax)
@@ -2251,6 +2257,9 @@ class TradeManager {
       };
       logDecision({ tradeId, token: instrument.instrument_token, tradingsymbol: instrument.tradingsymbol, side, segment, policy: "PASSIVE", order_type: "LIMIT", validity: passiveValidity, attempt: 1, bufferTicks: 0, tickSize, ltp: depth0?.ltp ?? null, bid: depth0?.bid ?? null, ask: depth0?.ask ?? null, spread_bps: spread0, chosenPrice, qty, reason: decision0.reason });
       const out = await this._safePlaceOrder(env.DEFAULT_ORDER_VARIETY, entryParams, { purpose: "ENTRY", tradeId });
+      if (!out?.orderId) {
+        return { ok: false, reason: "place_order_failed", spreadBps: spread0 };
+      }
       logResult({ tradeId, orderId: out.orderId, status: "placed", attempt: 1, fallbackUsed: false });
       return { ok: true, entryParams, orderId: out.orderId, orderType: "LIMIT", validity: passiveValidity, policy: "PASSIVE", spreadBps: spread0 };
     }
@@ -2293,6 +2302,9 @@ class TradeManager {
         logDecision({ tradeId, token: instrument.instrument_token, tradingsymbol: instrument.tradingsymbol, side, segment, policy: "AGGRESSIVE", order_type: "LIMIT", validity: aggressiveValidity, attempt, bufferTicks, tickSize, ltp: depth?.ltp ?? null, bid: depth.bid, ask: depth.ask, spread_bps: spreadBps, chosenPrice, qty, reason: attempt === 1 ? decision0.reason : "ioc_retry_unmatched" });
 
         const out = await this._safePlaceOrder(env.DEFAULT_ORDER_VARIETY, entryParams, { purpose: "ENTRY", tradeId });
+        if (!out?.orderId) {
+          return { ok: false, reason: "place_order_failed", spreadBps };
+        }
         const latest = await this._waitForIocOutcome(out.orderId);
         const status = String(latest?.status || "OPEN").toUpperCase();
         const filledQty = Number(latest?.order?.filled_quantity ?? 0);
@@ -2324,6 +2336,9 @@ class TradeManager {
         };
         logDecision({ tradeId, token: instrument.instrument_token, tradingsymbol: instrument.tradingsymbol, side, segment, policy: "AGGRESSIVE", order_type: "MARKET", validity: "DAY", attempt: maxAttempts + 1, bufferTicks: null, tickSize, ltp: depth0?.ltp ?? null, bid: depth0?.bid ?? null, ask: depth0?.ask ?? null, spread_bps: lastSpread, chosenPrice: null, qty, reason: "market_fallback_after_ioc_unmatched" });
         const out = await this._safePlaceOrder(env.DEFAULT_ORDER_VARIETY, entryParams, { purpose: "ENTRY", tradeId });
+        if (!out?.orderId) {
+          return { ok: false, reason: "place_order_failed", spreadBps: lastSpread };
+        }
         logResult({ tradeId, orderId: out.orderId, status: "placed", attempt: maxAttempts + 1, fallbackUsed: true });
         return { ok: true, entryParams, orderId: out.orderId, orderType: "MARKET", validity: "DAY", policy: "FALLBACK_MARKET", spreadBps: lastSpread };
       }
@@ -13627,11 +13642,6 @@ class TradeManager {
     await upsertDailyRisk(key, {
       realizedPnl: realized + pnl,
       lastTradeId: tradeId,
-    });
-    await this.portfolioGovernor.registerTradeClose({
-      tradeId,
-      pnlInr: pnl,
-      riskInr: Number(t.riskInr ?? 0),
     });
 
     try {
