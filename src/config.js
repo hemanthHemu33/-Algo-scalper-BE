@@ -590,6 +590,17 @@ const schema = z.object({
   DAILY_DD_THROTTLE_RISK_MULT: z.coerce.number().default(0.6),
   DAILY_PROFIT_LOCK_RISK_MULT: z.coerce.number().default(0.5),
 
+  // Portfolio/day risk governor (hard stops independent of strategy exits)
+  PORTFOLIO_GOVERNOR_ENABLED: boolFromEnv.default(true),
+  DAILY_MAX_LOSS_R: z.coerce.number().default(3.0),
+  MAX_LOSS_STREAK: z.coerce.number().default(3),
+  MAX_OPEN_RISK_R: z.coerce.number().default(1.5),
+  ORDER_ERR_BREAKER_ENABLED: boolFromEnv.default(true),
+  ORDER_ERR_BREAKER_MAX: z.coerce.number().default(5),
+  ORDER_ERR_BREAKER_WINDOW_SEC: z.coerce.number().default(600),
+  ORDER_ERR_BREAKER_COOLDOWN_SEC: z.coerce.number().default(900),
+  BASE_R_INR_FALLBACK: z.coerce.number().default(0),
+
   // Exit management (min-green, breakeven lock, trailing, time stop)
   R_EXIT_POLICY_ENABLED: boolFromEnv.default(true),
   MIN_GREEN_ENABLED: z.string().default("true"),
@@ -694,7 +705,7 @@ const schema = z.object({
   LOT_RISK_CAP_APPLY_IN_MARGIN_MODE: z.string().default("true"),
   // Tolerance to avoid micro blocks due to rounding (e.g., 0.02 = 2%)
   LOT_RISK_CAP_EPS_PCT: z.coerce.number().default(0.02),
-  MAX_TRADES_PER_DAY: z.coerce.number().default(5),
+  MAX_TRADES_PER_DAY: z.coerce.number().default(6),
   MAX_OPEN_POSITIONS: z.coerce.number().default(1),
   SYMBOL_COOLDOWN_SECONDS: z.coerce.number().default(180),
   SYMBOL_COOLDOWN_AFTER_SL_SEC: z.coerce.number().default(300),

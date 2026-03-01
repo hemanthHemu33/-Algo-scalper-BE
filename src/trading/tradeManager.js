@@ -65,6 +65,7 @@ const { equityService } = require("../account/equityService");
 const { buildPositionsSnapshot } = require("./positionService");
 const { getRiskLimits } = require("../risk/riskLimits");
 const { RiskBudget } = require("../risk/riskBudget");
+const { PortfolioGovernor } = require("../risk/portfolioGovernor");
 const { evaluateReentryOverride } = require("./reentryPolicy");
 const {
   ensureTradeIndexes,
@@ -317,6 +318,15 @@ class TradeManager {
     }
 
     this.riskBudget = new RiskBudget({ kite: this.kite });
+    this.portfolioGovernor = new PortfolioGovernor({
+      envCfg: env,
+      collection: null,
+      baseRInrResolver: () => {
+        const sessionRInr = Number(this.riskBudget?.getSessionRInr?.() ?? 0);
+        if (sessionRInr > 0) return sessionRInr;
+        return Number(env.BASE_R_INR_FALLBACK ?? 0);
+      },
+    });
 
     this.lastPriceByToken = new Map(); // token -> ltp
     this.lastQuoteByToken = new Map(); // token -> latest quote snapshot
@@ -916,6 +926,10 @@ class TradeManager {
     }
     await this.refreshRiskLimits();
     await this._hydrateRiskFromDb();
+    this.portfolioGovernor.collection = getDb().collection("risk_state");
+    await this.portfolioGovernor.init({
+      openTrades: await getActiveTrades(),
+    });
     await this._loadActiveTradeId();
     await this._hydrateLiveOrderSnapshotsFromDb();
     await this._hydrateOpenPositionFromActiveTrade();
@@ -4430,6 +4444,12 @@ class TradeManager {
           params: baseParams,
           tradeId,
           purpose,
+        });
+        await this.portfolioGovernor.recordOrderError({
+          tradeId,
+          purpose,
+          attempt,
+          message: msg,
         });
 
         // If retryable, attempt dedupe by tag before retrying
@@ -8979,6 +8999,15 @@ class TradeManager {
       return;
     }
 
+    const governorGate = await this.portfolioGovernor.canOpenNewTrade({});
+    if (!governorGate?.ok) {
+      logger.warn(
+        { token, reason: governorGate.reason, metrics: governorGate.metrics || null },
+        "[trade] blocked_by_portfolio_governor",
+      );
+      return "blocked_by_portfolio_governor";
+    }
+
     const stopoutTtlMs =
       Math.max(1, Number(env.REENTRY_AFTER_SL_WINDOW_SEC ?? 180)) * 2 * 1000;
     const stopoutNowMs = Date.now();
@@ -10537,6 +10566,10 @@ class TradeManager {
     });
     await linkOrder({ order_id: String(entryOrderId), tradeId, role: "ENTRY" });
     await this._replayOrphanUpdates(entryOrderId);
+    await this.portfolioGovernor.registerTradeOpen({
+      tradeId,
+      riskInr: Number(trade.riskInr ?? 0),
+    });
 
     this.activeTradeId = tradeId;
     this._activeTradeToken = token;
@@ -13463,6 +13496,11 @@ class TradeManager {
       realizedPnl: realized + pnl,
       lastTradeId: tradeId,
     });
+    await this.portfolioGovernor.registerTradeClose({
+      tradeId,
+      pnlInr: pnl,
+      riskInr: Number(t.riskInr ?? 0),
+    });
 
     try {
       this._updateStrategyLossStreak({ trade: t, pnl });
@@ -13716,6 +13754,12 @@ class TradeManager {
           ? (exit - entry) * qty
           : (entry - exit) * qty
         : null;
+
+    await this.portfolioGovernor.registerTradeClose({
+      tradeId,
+      pnlInr: pnl,
+      riskInr: Number(tradeWithPnl?.riskInr ?? t?.riskInr ?? 0),
+    });
 
     if (
       tradeWithPnl &&

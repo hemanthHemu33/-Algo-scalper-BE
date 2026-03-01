@@ -31,6 +31,9 @@ async function ensureTradeIndexes() {
     .createIndex({ tradeId: 1 }, { unique: true });
   await db.collection(LIVE_ORDER_SNAPSHOTS).createIndex({ updatedAt: -1 });
   await db.collection(RISK_STATE).createIndex({ date: 1 }, { unique: true });
+  await db
+    .collection(RISK_STATE)
+    .createIndex({ kind: 1, date: 1 }, { unique: true, sparse: true });
 
   // Cost calibration (one doc per segmentKey)
   await db
