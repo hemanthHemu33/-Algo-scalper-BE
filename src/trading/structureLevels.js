@@ -1,8 +1,4 @@
 const { DateTime } = require("luxon");
-const {
-  getSessionForDateTime,
-  buildBoundsForToday,
-} = require("../market/marketCalendar");
 
 function toNum(v) {
   const n = Number(v);
@@ -21,6 +17,7 @@ function candleTs(c) {
 }
 
 function hiLo(rows) {
+  if (!Array.isArray(rows) || !rows.length) return { high: null, low: null };
   const highs = rows.map((r) => toNum(r.high)).filter(Number.isFinite);
   const lows = rows.map((r) => toNum(r.low)).filter(Number.isFinite);
   if (!highs.length || !lows.length) return { high: null, low: null };
@@ -30,7 +27,7 @@ function hiLo(rows) {
 function computeVwap(rows) {
   let pv = 0;
   let volSum = 0;
-  for (const c of rows) {
+  for (const c of rows || []) {
     const h = toNum(c.high);
     const l = toNum(c.low);
     const cl = toNum(c.close);
@@ -43,62 +40,51 @@ function computeVwap(rows) {
   return volSum > 0 ? pv / volSum : null;
 }
 
-function computeSwingLevels(rows, look = 2) {
-  if (!Array.isArray(rows) || rows.length < look * 2 + 3) return { swingHL: null, swingLH: null };
-  const pivotLows = [];
-  const pivotHighs = [];
-  for (let i = look; i < rows.length - look; i += 1) {
-    const curH = toNum(rows[i].high);
-    const curL = toNum(rows[i].low);
-    if (!Number.isFinite(curH) || !Number.isFinite(curL)) continue;
-    let lowPivot = true;
-    let highPivot = true;
-    for (let k = i - look; k <= i + look; k += 1) {
-      if (k === i) continue;
-      const h = toNum(rows[k].high);
-      const l = toNum(rows[k].low);
-      if (Number.isFinite(l) && curL >= l) lowPivot = false;
-      if (Number.isFinite(h) && curH <= h) highPivot = false;
-      if (!lowPivot && !highPivot) break;
+function computeLastSwings(rows, lookback) {
+  const out = { lastSwingHigh: null, lastSwingLow: null };
+  const n = Math.max(2, Number(lookback) || 20);
+  if (!Array.isArray(rows) || rows.length < n + 2) return out;
+  const slice = rows.slice(-Math.max(n + 2, 10));
+  for (let i = slice.length - 2; i >= 1; i -= 1) {
+    const prev = slice[i - 1];
+    const cur = slice[i];
+    const next = slice[i + 1];
+    const ch = toNum(cur.high);
+    const ph = toNum(prev.high);
+    const nh = toNum(next.high);
+    if (out.lastSwingHigh == null && [ch, ph, nh].every(Number.isFinite) && ch > ph && ch > nh) {
+      out.lastSwingHigh = ch;
     }
-    if (lowPivot) pivotLows.push(curL);
-    if (highPivot) pivotHighs.push(curH);
-  }
-
-  let swingHL = null;
-  for (let i = pivotLows.length - 1; i > 0; i -= 1) {
-    if (pivotLows[i] > pivotLows[i - 1]) {
-      swingHL = pivotLows[i];
-      break;
+    const cl = toNum(cur.low);
+    const pl = toNum(prev.low);
+    const nl = toNum(next.low);
+    if (out.lastSwingLow == null && [cl, pl, nl].every(Number.isFinite) && cl < pl && cl < nl) {
+      out.lastSwingLow = cl;
     }
+    if (out.lastSwingHigh != null && out.lastSwingLow != null) break;
   }
-  let swingLH = null;
-  for (let i = pivotHighs.length - 1; i > 0; i -= 1) {
-    if (pivotHighs[i] < pivotHighs[i - 1]) {
-      swingLH = pivotHighs[i];
-      break;
-    }
-  }
-  return { swingHL, swingLH };
+  return out;
 }
 
 function computeStructureLevels({
   env = {},
   tz = "Asia/Kolkata",
   nowMs,
-  underlyingToken,
   underlyingCandles,
-  underlyingTicksOrLtpSeries,
-  breakoutLevel,
-  // backwards compatibility
+  premiumCandles,
   candles,
-  nowTs,
   sessionOpenTs,
   orbMinutes,
+  breakoutLevel,
+  underlyingToken,
 }) {
-  const sourceCandles = Array.isArray(underlyingCandles) ? underlyingCandles : candles;
-  const limit = Math.max(30, Number(env.STRUCTURE_CANDLE_LIMIT ?? 1200));
-  const parsed = (Array.isArray(sourceCandles) ? sourceCandles.slice(-limit) : [])
+  const source = Array.isArray(underlyingCandles) && underlyingCandles.length
+    ? underlyingCandles
+    : Array.isArray(candles) && candles.length
+      ? candles
+      : premiumCandles;
+
+  const parsed = (Array.isArray(source) ? source : [])
     .map((c) => ({ ...c, _ts: candleTs(c) }))
     .filter((c) => Number.isFinite(c._ts))
     .sort((a, b) => a._ts - b._ts);
@@ -114,46 +100,41 @@ function computeStructureLevels({
       orbHigh: null,
       orbLow: null,
       vwap: null,
+      lastSwingHigh: null,
+      lastSwingLow: null,
       swingHL: null,
       swingLH: null,
       breakoutLevel: Number.isFinite(Number(breakoutLevel)) ? Number(breakoutLevel) : null,
-      meta: { ok: false, reason: "no_candles", usedBars: 0, underlyingToken: underlyingToken ?? null },
+      meta: { ok: false, reason: "no_candles", underlyingToken: underlyingToken ?? null },
     };
   }
 
-  const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Number.isFinite(Number(nowTs)) ? Number(nowTs) : parsed[parsed.length - 1]._ts;
+  const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : parsed[parsed.length - 1]._ts;
   const nowDt = DateTime.fromMillis(now, { zone: tz });
   const sessionOpen = Number.isFinite(Number(sessionOpenTs))
     ? Number(sessionOpenTs)
     : nowDt.startOf("day").plus({ hours: 9, minutes: 15 }).toMillis();
   const orbM = Math.max(1, Number(orbMinutes ?? env.ORB_MINUTES ?? 15));
 
-  const nowDayKey = nowDt.toFormat("yyyy-LL-dd");
   const dayBuckets = new Map();
   for (const c of parsed) {
     const key = DateTime.fromMillis(c._ts, { zone: tz }).toFormat("yyyy-LL-dd");
     if (!dayBuckets.has(key)) dayBuckets.set(key, []);
     dayBuckets.get(key).push(c);
   }
-  const orderedDayKeys = Array.from(dayBuckets.keys()).sort();
-  const prevDayKey = orderedDayKeys.filter((k) => k < nowDayKey).pop() || null;
+  const dayKeys = Array.from(dayBuckets.keys()).sort();
+  const nowDayKey = nowDt.toFormat("yyyy-LL-dd");
+  const prevDayKey = dayKeys.filter((k) => k < nowDayKey).pop() || null;
 
-  const dayRows = parsed.filter((c) => c._ts >= sessionOpen && c._ts <= now);
+  const todayRows = parsed.filter((c) => c._ts >= sessionOpen && c._ts <= now);
   const prevDayRows = prevDayKey ? dayBuckets.get(prevDayKey) || [] : [];
-  const weekRows = parsed.filter((c) => {
-    const dt = DateTime.fromMillis(c._ts, { zone: tz });
-    return dt.weekYear === nowDt.weekYear && dt.weekNumber === nowDt.weekNumber && c._ts <= now;
-  });
-  const recentSessionRows = orderedDayKeys.slice(-5).flatMap((key) => dayBuckets.get(key) || []);
-  const effectiveWeekRows = weekRows.length ? weekRows : recentSessionRows;
+  const weekRows = dayKeys.slice(-5).flatMap((k) => dayBuckets.get(k) || []);
+  const orbRows = todayRows.filter((c) => c._ts <= sessionOpen + orbM * 60 * 1000);
 
-  const day = hiLo(dayRows);
+  const day = hiLo(todayRows);
   const prev = hiLo(prevDayRows);
-  const week = hiLo(effectiveWeekRows);
-  const orbRows = dayRows.filter((c) => c._ts <= sessionOpen + orbM * 60 * 1000);
-  const orb = hiLo(orbRows);
-  const vwap = computeVwap(dayRows);
-  const swings = computeSwingLevels(dayRows.length ? dayRows : parsed, 2);
+  const week = hiLo(weekRows);
+  const swings = computeLastSwings(todayRows.length ? todayRows : parsed, Number(env.SWING_LOOKBACK ?? 20));
 
   return {
     dayHigh: day.high,
@@ -162,24 +143,20 @@ function computeStructureLevels({
     prevDayLow: prev.low,
     weekHigh: week.high,
     weekLow: week.low,
-    orbHigh: orb.high,
-    orbLow: orb.low,
-    vwap,
-    swingHL: swings.swingHL,
-    swingLH: swings.swingLH,
-    breakoutLevel: Number.isFinite(Number(breakoutLevel))
-      ? Number(breakoutLevel)
-      : Number.isFinite(Number(underlyingTicksOrLtpSeries?.breakoutLevel))
-        ? Number(underlyingTicksOrLtpSeries.breakoutLevel)
-        : null,
+    orbHigh: hiLo(orbRows).high,
+    orbLow: hiLo(orbRows).low,
+    vwap: String(env.VWAP_ENABLED ?? "true") === "true" ? computeVwap(todayRows) : null,
+    lastSwingHigh: swings.lastSwingHigh,
+    lastSwingLow: swings.lastSwingLow,
+    // Backwards compatibility for existing anchor resolution
+    swingHL: swings.lastSwingLow,
+    swingLH: swings.lastSwingHigh,
+    breakoutLevel: Number.isFinite(Number(breakoutLevel)) ? Number(breakoutLevel) : null,
     meta: {
       ok: true,
+      dayKey: nowDayKey,
+      prevDayKey,
       usedBars: parsed.length,
-      dayBars: dayRows.length,
-      prevDayBars: prevDayRows.length,
-      weekBars: effectiveWeekRows.length,
-      sessionOpenTs: sessionOpen,
-      orbMinutes: orbM,
       underlyingToken: underlyingToken ?? null,
     },
   };

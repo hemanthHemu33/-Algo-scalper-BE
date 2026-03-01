@@ -12,12 +12,11 @@ function applyLiquidityBuffer({ env = {}, side, candidateSL, tickSize, atrPts, r
     return { bufferedSL: null, bufferTicks: 0, bufferPts: 0, roundGuardApplied: false };
   }
 
-  const mode = String(env.LIQUIDITY_BUFFER_MODE || "ATR").toUpperCase();
-  const minTicks = Math.max(0, Number(env.LIQUIDITY_BUFFER_MIN_TICKS ?? 4));
-  const maxTicks = Math.max(minTicks, Number(env.LIQUIDITY_BUFFER_MAX_TICKS ?? 20));
-  const atrMult = Math.max(0, Number(env.LIQUIDITY_BUFFER_ATR_MULT ?? 0.1));
+  const minTicks = Math.max(0, Number(env.LIQ_BUFFER_MIN_TICKS ?? env.LIQUIDITY_BUFFER_MIN_TICKS ?? 4));
+  const maxTicks = Math.max(minTicks, Number(env.LIQ_BUFFER_MAX_TICKS ?? env.LIQUIDITY_BUFFER_MAX_TICKS ?? 30));
+  const atrMult = Math.max(0, Number(env.LIQ_BUFFER_ATR_PCT ?? env.LIQUIDITY_BUFFER_ATR_MULT ?? 0.1));
 
-  const baseTicksRaw = mode === "ATR" && Number.isFinite(atrPts) && Number(atrPts) > 0
+  const baseTicksRaw = Number.isFinite(atrPts) && Number(atrPts) > 0
     ? Math.ceil((Number(atrPts) * atrMult) / tick)
     : minTicks;
   const bufferTicks = clamp(baseTicksRaw, minTicks, maxTicks);
@@ -26,14 +25,15 @@ function applyLiquidityBuffer({ env = {}, side, candidateSL, tickSize, atrPts, r
   let bufferedSL = dir === "SELL" ? sl + bufferPts : sl - bufferPts;
   let roundGuardApplied = false;
 
-  const roundGuardEnabled = String(env.ROUND_NUMBER_GUARD_ENABLED ?? "true") === "true";
-  const step = Number(roundNumberStep ?? env.ROUND_NUMBER_STEP ?? 50);
-  const roundTicks = Math.max(0, Number(env.ROUND_NUMBER_BUFFER_TICKS ?? 4));
-  if (roundGuardEnabled && Number.isFinite(step) && step > 0 && roundTicks > 0) {
-    const nearestRound = Math.round(sl / step) * step;
-    const nearRound = Math.abs(sl - nearestRound) <= roundTicks * tick;
-    if (nearRound) {
-      const shift = roundTicks * tick;
+  const roundGuardEnabled = String(env.AVOID_ROUND_LEVELS ?? env.ROUND_NUMBER_GUARD_ENABLED ?? "true") === "true";
+  const step = Number(roundNumberStep ?? env.ROUND_LEVEL_STEP ?? env.ROUND_NUMBER_STEP ?? 50);
+  const shiftTicks = Math.max(1, Number(env.ROUND_NUMBER_BUFFER_TICKS ?? minTicks));
+  if (roundGuardEnabled && Number.isFinite(step) && step > 0) {
+    const remainder = ((bufferedSL % step) + step) % step;
+    const nearZero = Math.abs(remainder) <= tick / 2;
+    const nearHalf = Math.abs(remainder - step / 2) <= tick / 2;
+    if (nearZero || nearHalf) {
+      const shift = shiftTicks * tick;
       bufferedSL = dir === "SELL" ? bufferedSL + shift : bufferedSL - shift;
       roundGuardApplied = true;
     }

@@ -3,15 +3,25 @@ function clamp(n, lo, hi) {
   return Math.min(Math.max(n, lo), hi);
 }
 
-function computeVolScaler({ env = {}, atrBps }) {
+function computeVolScaler({ env = {}, atrPts, atrBps }) {
   const min = Number(env.VOL_SCALER_MIN ?? 0.8);
   const max = Number(env.VOL_SCALER_MAX ?? 1.3);
-  const target = Number(env.VOL_TARGET_BPS ?? 65);
-  const eps = 1e-6;
-  if (!(Number.isFinite(atrBps) && atrBps > 0) || !(Number.isFinite(target) && target > 0)) {
+  const targetPts = Number(env.VOL_ATR_TARGET_PTS ?? 18);
+  const targetBps = Number(env.VOL_TARGET_BPS ?? env.RISK_VOL_TARGET_BPS ?? 65);
+
+  const sourceAtr = Number.isFinite(Number(atrPts)) && Number(atrPts) > 0
+    ? Number(atrPts)
+    : Number.isFinite(Number(atrBps)) && Number(atrBps) > 0
+      ? Number(atrBps)
+      : null;
+  const sourceTarget = Number.isFinite(Number(atrPts)) && Number(atrPts) > 0
+    ? targetPts
+    : targetBps;
+
+  if (!(Number.isFinite(sourceAtr) && sourceAtr > 0 && Number.isFinite(sourceTarget) && sourceTarget > 0)) {
     return clamp(1, min, max);
   }
-  const scaler = target / Math.max(Number(atrBps), eps);
+  const scaler = sourceAtr / sourceTarget;
   return clamp(scaler, min, max);
 }
 
