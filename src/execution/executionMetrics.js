@@ -52,18 +52,19 @@ async function upsertAndRecompute({ dateKey, symbol, inc = {}, set = {}, push = 
   if (Object.keys(inc).length) update.$inc = inc;
   if (Object.keys(push).length) update.$push = push;
 
-  const result = await db.collection(COLLECTION).findOneAndUpdate(
+  const res = await db.collection(COLLECTION).findOneAndUpdate(
     { date, symbol: sym },
     update,
     { upsert: true, returnDocument: "after" },
   );
 
-  const computed = computeRates(result || {});
+  const doc = res?.value || (await db.collection(COLLECTION).findOne({ date, symbol: sym })) || {};
+  const computed = computeRates(doc);
   await db.collection(COLLECTION).updateOne(
     { date, symbol: sym },
     { $set: { ...computed, updatedAt: now } },
   );
-  return { ...(result || {}), ...computed };
+  return { ...doc, ...computed };
 }
 
 async function recordEntryFill({ dateKey, symbol, slipPts = 0, spreadBpsAtEntry = null }) {

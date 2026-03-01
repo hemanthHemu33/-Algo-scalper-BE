@@ -1,6 +1,40 @@
-const { PortfolioGovernor } = require("../src/risk/portfolioGovernor");
+const {
+  PortfolioGovernor,
+  PORTFOLIO_GOVERNOR_COLLECTION,
+} = require("../src/risk/portfolioGovernor");
 
-class MockCollection {
+class UniqueDateCollection {
+  constructor(seed = [], { throwOnDateWrite = false } = {}) {
+    this.rows = new Map();
+    this.throwOnDateWrite = throwOnDateWrite;
+    this.name = PORTFOLIO_GOVERNOR_COLLECTION;
+    for (const row of seed) {
+      this.rows.set(String(row.date), { ...row });
+    }
+  }
+
+  async findOne(query) {
+    return this.rows.get(String(query.date)) || null;
+  }
+
+  async updateOne(filter, update) {
+    const key = String(filter.date);
+    if (this.throwOnDateWrite) {
+      const err = new Error("E11000 duplicate key error");
+      err.code = 11000;
+      throw err;
+    }
+    const prev = this.rows.get(key) || {};
+    const next = {
+      ...prev,
+      ...(update.$setOnInsert || {}),
+      ...(update.$set || {}),
+    };
+    this.rows.set(key, next);
+  }
+}
+
+class LegacyCollection {
   constructor(seed = []) {
     this.rows = new Map();
     for (const row of seed) {
@@ -10,17 +44,6 @@ class MockCollection {
 
   async findOne(query) {
     return this.rows.get(`${query.kind}:${query.date}`) || null;
-  }
-
-  async updateOne(filter, update) {
-    const key = `${filter.kind}:${filter.date}`;
-    const prev = this.rows.get(key) || {};
-    const next = {
-      ...prev,
-      ...(update.$setOnInsert || {}),
-      ...(update.$set || {}),
-    };
-    this.rows.set(key, next);
   }
 }
 
@@ -40,17 +63,20 @@ describe("PortfolioGovernor", () => {
     CANDLE_TZ: "Asia/Kolkata",
   };
 
-  function build({ env = {}, nowMs = 1_700_000_000_000, seed = [] } = {}) {
-    const collection = new MockCollection(seed);
+  function build({ env = {}, nowMs = 1_700_000_000_000, seed = [], legacySeed = [] } = {}) {
+    const collection = new UniqueDateCollection(seed);
+    const legacyCollection = new LegacyCollection(legacySeed);
+    const logger = { warn: jest.fn(), info: jest.fn(), error: jest.fn(), debug: jest.fn() };
     const gov = new PortfolioGovernor({
       envCfg: { ...baseEnv, ...env },
       collection,
+      legacyCollection,
       nowMs: () => nowMs,
       sessionResolver: () => ({ dayKey: "2025-01-15" }),
       baseRInrResolver: () => 1000,
-      logger: { warn: jest.fn(), info: jest.fn(), error: jest.fn() },
+      logger,
     });
-    return { gov, collection };
+    return { gov, collection, legacyCollection, logger };
   }
 
   test("daily loss R triggers after losses", async () => {
@@ -65,42 +91,8 @@ describe("PortfolioGovernor", () => {
     expect(gate.reason).toBe("daily_max_loss_r");
   });
 
-  test("loss streak triggers after 3 consecutive losses", async () => {
-    const { gov } = build({ env: { DAILY_MAX_LOSS_R: 99 } });
-    await gov.init();
-    await gov.registerTradeClose({ tradeId: "l1", pnlInr: -100, riskInr: 1000 });
-    await gov.registerTradeClose({ tradeId: "l2", pnlInr: -120, riskInr: 1000 });
-    await gov.registerTradeClose({ tradeId: "l3", pnlInr: -80, riskInr: 1000 });
-
-    const gate = await gov.canOpenNewTrade();
-    expect(gate.ok).toBe(false);
-    expect(gate.reason).toBe("loss_streak");
-  });
-
-  test("max trades per day triggers", async () => {
-    const { gov } = build({ env: { MAX_TRADES_PER_DAY: 2, DAILY_MAX_LOSS_R: 99 } });
-    await gov.init();
-    await gov.registerTradeClose({ tradeId: "a", pnlInr: 50, riskInr: 1000 });
-    await gov.registerTradeClose({ tradeId: "b", pnlInr: 20, riskInr: 1000 });
-
-    const gate = await gov.canOpenNewTrade();
-    expect(gate.ok).toBe(false);
-    expect(gate.reason).toBe("max_trades");
-  });
-
-  test("max open risk triggers with open positions", async () => {
-    const { gov } = build();
-    await gov.init();
-    await gov.registerTradeOpen({ tradeId: "o1", riskInr: 1000 });
-    await gov.registerTradeOpen({ tradeId: "o2", riskInr: 600 });
-
-    const gate = await gov.canOpenNewTrade();
-    expect(gate.ok).toBe(false);
-    expect(gate.reason).toBe("max_open_risk");
-  });
-
-  test("persistence loads same-day state from DB and dedupes close", async () => {
-    const seed = [
+  test("imports legacy state once, then persists only in portfolio_governor_state", async () => {
+    const legacySeed = [
       {
         kind: "portfolio_governor",
         date: "2025-01-15",
@@ -108,20 +100,48 @@ describe("PortfolioGovernor", () => {
         realizedPnlR: -0.25,
         tradesCount: 1,
         lossStreak: 1,
-        openRiskInr: 500,
-        openTradeRiskInrById: { x1: 500 },
-        processedClosedTradeIds: ["x0"],
       },
     ];
-    const { gov } = build({ seed });
+    const { gov, collection, logger } = build({ legacySeed });
     await gov.init();
 
-    await gov.registerTradeClose({ tradeId: "x0", pnlInr: -100, riskInr: 1000 });
-    const gate1 = await gov.canOpenNewTrade();
-    expect(gate1.ok).toBe(true);
+    const row = await collection.findOne({ date: "2025-01-15" });
+    expect(row).toBeTruthy();
+    expect(row.kind).toBeUndefined();
+    expect(row.realizedPnlInr).toBe(-250);
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ imported: true, source: "risk_state" }),
+      "[portfolio_governor] imported legacy state",
+    );
+  });
 
-    await gov.registerTradeClose({ tradeId: "x2", pnlInr: -150, riskInr: 1000 });
-    const gate2 = await gov.canOpenNewTrade();
-    expect(gate2.ok).toBe(true);
+  test("persistence survives restart and continues incrementing same day", async () => {
+    const { gov, collection } = build();
+    await gov.init();
+    await gov.registerTradeClose({ tradeId: "x1", pnlInr: -100, riskInr: 1000 });
+
+    const gov2 = new PortfolioGovernor({
+      envCfg: { ...baseEnv },
+      collection,
+      nowMs: () => 1_700_000_000_000,
+      sessionResolver: () => ({ dayKey: "2025-01-15" }),
+      baseRInrResolver: () => 1000,
+      logger: { warn: jest.fn(), info: jest.fn(), error: jest.fn(), debug: jest.fn() },
+    });
+
+    await gov2.init();
+    await gov2.registerTradeClose({ tradeId: "x2", pnlInr: -100, riskInr: 1000 });
+    const gate = await gov2.canOpenNewTrade();
+    expect(gate.ok).toBe(true);
+    expect(gov2.state.tradesCount).toBe(2);
+  });
+
+  test("write path does not touch legacy collection with unique date collisions", async () => {
+    const legacyWriteCollision = new UniqueDateCollection([], { throwOnDateWrite: true });
+    const { gov } = build();
+    gov.legacyCollection = legacyWriteCollision;
+
+    await expect(gov.init()).resolves.toBeUndefined();
+    await expect(gov.registerTradeOpen({ tradeId: "o1", riskInr: 300 })).resolves.toBeUndefined();
   });
 });

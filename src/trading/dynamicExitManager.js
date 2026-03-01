@@ -176,8 +176,8 @@ function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
 
   const raw =
     side === "BUY"
-      ? entry + mult * costPerShare
-      : entry - mult * costPerShare;
+      ? entry + costPerShare
+      : entry - costPerShare;
 
   const be = roundToTick(raw, tick, side === "BUY" ? "up" : "down");
   return {
@@ -192,6 +192,7 @@ function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
       spreadBps,
       mult,
       costMeta: meta || null,
+      debug: `cost=${Math.max(0, Number(estCostInr) || 0)},slip=${entrySlipInr},spread=${Math.max(0, spreadCostInr)}`,
     },
   };
 }
