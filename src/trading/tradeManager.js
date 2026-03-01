@@ -61,6 +61,15 @@ const {
   computeChaseBps,
 } = require("./execution/entryMicrostructure");
 const { optimizer } = require("../optimizer/adaptiveOptimizer");
+const {
+  ensureExecutionMetricsIndexes,
+  recordEntryFill,
+  recordExitFill,
+  recordSpreadReject,
+  recordOrderModifyResult,
+  getExecutionMetrics,
+  evaluateExecutionBreaker,
+} = require("../execution/executionMetrics");
 const { equityService } = require("../account/equityService");
 const { buildPositionsSnapshot } = require("./positionService");
 const { getRiskLimits } = require("../risk/riskLimits");
@@ -133,7 +142,7 @@ function dayRange() {
   return { start: start.toJSDate(), end: end.toJSDate() };
 }
 
-function computeEntryMinGreen({ costBasedMinGreenInr, riskInr, qty, envCfg = env }) {
+function computeEntryMinGreen({ costBasedMinGreenInr, riskInr, qty, entrySlipInr = 0, envCfg = env }) {
   const minGreenEnabled = String(envCfg.MIN_GREEN_ENABLED || "true") === "true";
   const costMult = Number(envCfg.MIN_GREEN_COST_MULT ?? 1.0);
   const minFloorInr = Number(envCfg.MIN_GREEN_MIN_INR ?? 0);
@@ -142,12 +151,20 @@ function computeEntryMinGreen({ costBasedMinGreenInr, riskInr, qty, envCfg = env
     ? Number(costBasedMinGreenInr)
     : 0;
   const safeRiskInr = Number(riskInr ?? 0);
+  const safeSlipInr = Math.abs(Number(entrySlipInr ?? 0));
+  const slipMult = Math.max(0, Number(envCfg.MIN_GREEN_SLIP_MULT ?? 1.0));
+  const slipAwareFloor = safeSlipInr * slipMult;
   const rBasedMinGreenInr =
     minGreenEnabled && Number.isFinite(safeRiskInr) && safeRiskInr > 0
       ? Math.max(0, minGreenR) * safeRiskInr
       : 0;
   const finalMinGreenInr = minGreenEnabled
-    ? Math.max(safeCost * Math.max(0, costMult), rBasedMinGreenInr, Math.max(0, minFloorInr))
+    ? Math.max(
+        safeCost * Math.max(0, costMult),
+        rBasedMinGreenInr,
+        Math.max(0, minFloorInr),
+        slipAwareFloor,
+      )
     : 0;
   const safeQty = Number(qty ?? 0);
   return {
@@ -155,6 +172,7 @@ function computeEntryMinGreen({ costBasedMinGreenInr, riskInr, qty, envCfg = env
     minGreenPts: safeQty > 0 ? finalMinGreenInr / safeQty : 0,
     minGreenR,
     rBasedMinGreenInr,
+    slipAwareFloor,
   };
 }
 
@@ -305,6 +323,15 @@ function worseSlippageInr({ side, expected, actual, qty, leg }) {
   else diff = isExit ? act - exp : exp - act;
 
   return diff > 0 ? diff * q : 0;
+}
+
+function computeEntrySlippagePts({ side, expectedEntryPrice, actualFill }) {
+  const expected = Number(expectedEntryPrice);
+  const actual = Number(actualFill);
+  if (!(expected > 0) || !(actual > 0)) return null;
+  const s = String(side || "BUY").toUpperCase();
+  if (s === "SELL") return expected - actual;
+  return actual - expected;
 }
 
 class TradeManager {
@@ -477,6 +504,7 @@ class TradeManager {
 
     // Execution quality feedback loop
     this._slippageCooldownUntil = 0;
+    this._executionBreakerCooldownUntil = 0;
     this._slippageStats = {
       entryBps: [],
       exitInr: [],
@@ -905,6 +933,7 @@ class TradeManager {
   async init() {
     if (this._initialized) return;
     await ensureTradeIndexes();
+    await ensureExecutionMetricsIndexes();
     // Patch-6: load persisted cost calibration multipliers (if enabled)
     try {
       await costCalibrator.start();
@@ -2165,8 +2194,12 @@ class TradeManager {
     const aggressiveValidity = String(env.ENTRY_AGGRESSIVE_VALIDITY || "IOC").toUpperCase();
     const basePassiveMax = Number(env.ENTRY_PASSIVE_MAX_SPREAD_BPS ?? 8);
     const baseAggressiveMax = Number(env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS ?? 20);
-    const passiveMax = segment === "OPT" ? Number(env.ENTRY_PASSIVE_MAX_SPREAD_BPS_OPT ?? 25) : basePassiveMax;
-    const aggressiveMax = segment === "OPT" ? Number(env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS_OPT ?? 60) : baseAggressiveMax;
+    const passiveMax = segment === "OPT"
+      ? Number(env.ENTRY_MAX_SPREAD_BPS_OPT_PASSIVE ?? env.ENTRY_PASSIVE_MAX_SPREAD_BPS_OPT ?? 25)
+      : basePassiveMax;
+    const aggressiveMax = segment === "OPT"
+      ? Number(env.ENTRY_MAX_SPREAD_BPS_OPT_AGGR ?? env.ENTRY_AGGRESSIVE_MAX_SPREAD_BPS_OPT ?? 60)
+      : baseAggressiveMax;
     const marketFallbackMax = segment === "OPT"
       ? Number(env.ENTRY_MARKET_FALLBACK_MAX_SPREAD_BPS_OPT ?? aggressiveMax)
       : aggressiveMax;
@@ -2180,8 +2213,20 @@ class TradeManager {
       hasDepth: !!depth0?.hasDepth,
     });
 
+    if (segment === "OPT") {
+      const premium = Number(depth0?.ltp ?? expectedEntryPrice ?? 0);
+      const minPremium = Number(env.ENTRY_MIN_PREMIUM ?? 30);
+      if (Number.isFinite(minPremium) && minPremium > 0 && premium > 0 && premium < minPremium) {
+        return { ok: false, reason: "premium_too_low", spreadBps: spread0, premium };
+      }
+    }
+
     if (decision0.policy === "ABORT" && decision0.reason === "spread_too_wide") {
       return { ok: false, reason: "spread_too_wide", spreadBps: spread0 };
+    }
+
+    if (decision0.policy === "AGGRESSIVE" && !depth0?.hasDepth) {
+      return { ok: false, reason: "no_depth_for_ioc", spreadBps: spread0 };
     }
 
     const placeParamsBase = {
@@ -4308,6 +4353,33 @@ class TradeManager {
     }
   }
 
+  _executionMetricSymbol(tradeOrInstrument) {
+    return String(
+      tradeOrInstrument?.instrument?.tradingsymbol ||
+        tradeOrInstrument?.tradingsymbol ||
+        tradeOrInstrument?.instrument_token ||
+        "ALL",
+    ).toUpperCase();
+  }
+
+  async _checkExecutionBreaker(symbol) {
+    if (String(env.EXECUTION_BREAKER_ENABLED ?? "true") !== "true") {
+      return { ok: true, reason: "DISABLED" };
+    }
+    const now = Date.now();
+    if (this._executionBreakerCooldownUntil && now < this._executionBreakerCooldownUntil) {
+      return { ok: false, reason: "COOLDOWN", until: this._executionBreakerCooldownUntil };
+    }
+    const metrics = await getExecutionMetrics({ dateKey: todayKey(), symbol });
+    if (!metrics) return { ok: true, reason: "NO_DATA" };
+    const state = evaluateExecutionBreaker({ metrics, env });
+    if (!state?.tripped) return { ok: true, reason: "OK", state };
+    const cooldownSec = Math.max(1, Number(env.EXEC_BREAKER_COOLDOWN_SEC ?? 900));
+    this._executionBreakerCooldownUntil = now + cooldownSec * 1000;
+    logger.error({ symbol, state, cooldownSec }, "[guard] execution breaker tripped");
+    return { ok: false, reason: state.reason, until: this._executionBreakerCooldownUntil, state };
+  }
+
   _isStrategyThrottled(strategyId) {
     if (!strategyId) return false;
     const until = this._strategyCooldownUntil.get(String(strategyId)) || 0;
@@ -4776,6 +4848,14 @@ class TradeManager {
         { tradeId, purpose: label || purpose, orderId: oid, patch: nextPatch },
         "[orders] modified",
       );
+      if (tradeId) {
+        const tradeForMetric = await getTrade(tradeId);
+        await recordOrderModifyResult({
+          dateKey: todayKey(),
+          symbol: this._executionMetricSymbol(tradeForMetric || {}),
+          success: true,
+        });
+      }
       return resp;
     };
 
@@ -4868,6 +4948,14 @@ class TradeManager {
         { tradeId, purpose, orderId: oid, e: e.message },
         "[orders] modify failed",
       );
+      if (tradeId) {
+        const tradeForMetric = await getTrade(tradeId);
+        await recordOrderModifyResult({
+          dateKey: todayKey(),
+          symbol: this._executionMetricSymbol(tradeForMetric || {}),
+          success: false,
+        });
+      }
       throw e;
     }
   }
@@ -9144,6 +9232,14 @@ class TradeManager {
       return;
     }
 
+    const executionBreaker = await this._checkExecutionBreaker(
+      this._executionMetricSymbol(instrument),
+    );
+    if (!executionBreaker.ok) {
+      logger.warn({ token, executionBreaker }, "[trade] blocked (execution breaker)");
+      return;
+    }
+
     if (this._isStrategyThrottled(s.strategyId)) {
       const until = this._strategyCooldownUntil.get(String(s.strategyId));
       logger.warn(
@@ -10307,6 +10403,7 @@ class TradeManager {
       costBasedMinGreenInr: minGreen.minGreenInr,
       riskInr: tradeRiskInr,
       qty,
+      entrySlipInr: 0,
       envCfg: env,
     });
 
@@ -10428,9 +10525,16 @@ class TradeManager {
         });
 
         if (!microResult?.ok) {
+          const rejectReason = String(microResult?.reason || "entry_policy_abort");
+          if (rejectReason.includes("spread")) {
+            await recordSpreadReject({
+              dateKey: todayKey(),
+              symbol: this._executionMetricSymbol(instrument),
+            });
+          }
           await updateTrade(tradeId, {
             status: STATUS.ENTRY_CANCELLED,
-            closeReason: `ENTRY_ABORTED | ${microResult?.reason || "entry_policy_abort"}`,
+            closeReason: `ENTRY_ABORTED | ${rejectReason}`,
           });
           await this._finalizeClosed(tradeId, token);
           return;
@@ -10870,9 +10974,16 @@ class TradeManager {
             trade.candle?.close ??
             0,
         );
-        const slipBps =
-          expected > 0 ? ((avg - expected) / expected) * 10000 : null;
-        const slipInr = worseSlippageInr({
+        const slipPts = computeEntrySlippagePts({
+          side: trade.side,
+          expectedEntryPrice: expected,
+          actualFill: avg,
+        });
+        const slipBps = expected > 0 && Number.isFinite(Number(slipPts))
+          ? (Number(slipPts) / expected) * 10000
+          : null;
+        const slipInr = Number.isFinite(Number(slipPts)) ? Number(slipPts) * Math.max(0, filledQty) : null;
+        const slipInrWorse = worseSlippageInr({
           side: trade.side,
           expected,
           actual: avg,
@@ -10930,7 +11041,9 @@ class TradeManager {
           entryPrice: avg,
           qty: filledQty,
           entrySlippageBps: slipBps,
-          entrySlippageInrWorse: slipInr,
+          entrySlippageInrWorse: slipInrWorse,
+          entrySlipPts: slipPts,
+          entrySlipInr: slipInr,
           entryFilledAt: new Date(),
           entryAt: new Date(),
           entryFinalized: true,
@@ -10939,6 +11052,13 @@ class TradeManager {
             filledQty,
             slipBps,
           }),
+        });
+
+        await recordEntryFill({
+          dateKey: todayKey(),
+          symbol: this._executionMetricSymbol(trade),
+          slipPts: Number(slipPts ?? 0),
+          spreadBpsAtEntry: Number(trade?.quoteAtEntry?.bps ?? NaN),
         });
 
         // Slippage guard (primarily for MARKET entries). Options are noisier; thresholds are segment-aware.
@@ -11053,6 +11173,7 @@ class TradeManager {
           costBasedMinGreenInr: minGreen.minGreenInr,
           riskInr: riskStop.riskInr,
           qty: filledQty,
+          entrySlipInr: slipInr,
           envCfg: env,
         });
 
@@ -11189,6 +11310,7 @@ class TradeManager {
           costBasedMinGreenInr: minGreen.minGreenInr,
           riskInr: riskStop.riskInr,
           qty: filledNow,
+          entrySlipInr: Number(trade?.entrySlipInr ?? 0),
           envCfg: env,
         });
 
@@ -13298,6 +13420,11 @@ class TradeManager {
       ),
       exitOrderRole: "TARGET",
     });
+    await recordExitFill({
+      dateKey: todayKey(),
+      symbol: this._executionMetricSymbol(trade),
+      slipPts: Number(exitSlippageInrWorse ?? 0) / Math.max(1, Number(trade?.qty ?? 1)),
+    });
     alert("info", "🏁 TARGET HIT", { tradeId, exitPrice }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
     this.risk.resetFailures();
     await this._bookRealizedPnl(tradeId);
@@ -13390,6 +13517,11 @@ class TradeManager {
         slOrder?.order_id || slOrder?.orderId || trade?.slOrderId || "",
       ),
       exitOrderRole: "SL",
+    });
+    await recordExitFill({
+      dateKey: todayKey(),
+      symbol: this._executionMetricSymbol(trade),
+      slipPts: Number(exitSlippageInrWorse ?? 0) / Math.max(1, Number(trade?.qty ?? 1)),
     });
     alert("warn", "🛑 SL HIT", { tradeId, exitPrice }).catch((err) => { reportFault({ code: "TRADING_TRADEMANAGER_ASYNC", err, message: "[src/trading/tradeManager.js] async task failed" }); });
     this.risk.resetFailures();
@@ -14137,4 +14269,4 @@ function percentileRank(hist, x) {
   return (less / vals.length) * 100;
 }
 
-module.exports = { TradeManager, STATUS, computeEntryMinGreen };
+module.exports = { TradeManager, STATUS, computeEntryMinGreen, computeEntrySlippagePts };

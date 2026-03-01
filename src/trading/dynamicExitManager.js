@@ -142,6 +142,8 @@ function computeTargetFromRisk({ side, entry, risk, rr, tick }) {
 function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
   const qty = Number(trade.qty ?? trade.initialQty ?? 0);
   const mult = Number(env.DYN_BE_COST_MULT ?? 1.0);
+  const slipMult = Number(env.BE_SLIP_MULT ?? 1.0);
+  const spreadMult = Number(env.BE_SPREAD_MULT ?? 0.5);
   const spreadBps = Number(trade?.quoteAtEntry?.bps ?? 0);
 
   // Fallback: breakeven defaults to entry when qty/entry is unavailable.
@@ -161,8 +163,16 @@ function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
     instrument: trade?.instrument || null,
   });
 
-  const costPerShare =
-    Number.isFinite(estCostInr) && estCostInr > 0 ? estCostInr / qty : 0;
+  const spreadCostInr =
+    Number(meta?.turnover) > 0 && Number(meta?.spreadBps) > 0
+      ? (Number(meta.turnover) * Number(meta.spreadBps)) / 10000
+      : 0;
+  const entrySlipInr = Math.abs(Number(trade?.entrySlipInr ?? trade?.entrySlippageInrWorse ?? 0));
+  const beOffsetInr =
+    Math.max(0, mult) * Math.max(0, Number(estCostInr) || 0) +
+    Math.max(0, slipMult) * entrySlipInr +
+    Math.max(0, spreadMult) * Math.max(0, spreadCostInr);
+  const costPerShare = qty > 0 ? beOffsetInr / qty : 0;
 
   const raw =
     side === "BUY"
@@ -175,6 +185,9 @@ function estimateTrueBreakeven({ trade, entry, side, tick, env }) {
     meta: {
       qty,
       estCostInr,
+      beOffsetInr,
+      entrySlipInr,
+      spreadCostInr,
       costPerShare,
       spreadBps,
       mult,

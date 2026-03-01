@@ -61,6 +61,25 @@ function computeChaseBps({ basePrice, chosenPrice, side }) {
 }
 
 
+function validateEntrySpreadDepthPremium({
+  spreadBps,
+  hasDepth,
+  willUseIoc = false,
+  premium,
+  minPremium = 0,
+  maxSpreadBps,
+}) {
+  if (!Number.isFinite(Number(spreadBps))) return { ok: false, reason: "spread_unavailable" };
+  if (Number.isFinite(Number(maxSpreadBps)) && Number(spreadBps) > Number(maxSpreadBps)) {
+    return { ok: false, reason: "spread_too_wide" };
+  }
+  if (willUseIoc && !hasDepth) return { ok: false, reason: "no_depth_for_ioc" };
+  if (Number.isFinite(Number(minPremium)) && Number(minPremium) > 0 && Number.isFinite(Number(premium)) && Number(premium) < Number(minPremium)) {
+    return { ok: false, reason: "premium_too_low" };
+  }
+  return { ok: true };
+}
+
 function shouldUseMarketFallback({ enabled, spreadBps, maxSpreadBps }) {
   if (!enabled) return false;
   const spread = Number(spreadBps);
@@ -80,6 +99,7 @@ module.exports = {
   computePassiveLimitPrice,
   computeAggressiveIocPrice,
   computeChaseBps,
+  validateEntrySpreadDepthPremium,
   shouldUseMarketFallback,
   nextBufferTicks,
 };
