@@ -6,6 +6,7 @@ const {
 class UniqueDateCollection {
   constructor(seed = [], { throwOnDateWrite = false } = {}) {
     this.rows = new Map();
+    this.updateCalls = [];
     this.throwOnDateWrite = throwOnDateWrite;
     this.name = PORTFOLIO_GOVERNOR_COLLECTION;
     for (const row of seed) {
@@ -18,11 +19,15 @@ class UniqueDateCollection {
   }
 
   async updateOne(filter, update) {
+    this.updateCalls.push({ filter, update });
     const key = String(filter.date);
     if (this.throwOnDateWrite) {
       const err = new Error("E11000 duplicate key error");
       err.code = 11000;
       throw err;
+    }
+    if (update?.$set?.createdAt && update?.$setOnInsert?.createdAt) {
+      throw new Error("Updating the path 'createdAt' would create a conflict at 'createdAt'");
     }
     const prev = this.rows.get(key) || {};
     const next = {
@@ -144,6 +149,31 @@ describe("PortfolioGovernor", () => {
     await expect(gov.init()).resolves.toBeUndefined();
     await expect(gov.registerTradeOpen({ tradeId: "o1", riskInr: 300 })).resolves.toBeUndefined();
   });
+
+  test("persist strips createdAt and _id from $set after loading existing row", async () => {
+    const seed = [
+      {
+        _id: "mongo-id-1",
+        date: "2025-01-15",
+        createdAt: new Date("2025-01-15T09:00:00.000Z"),
+        realizedPnlInr: 10,
+      },
+    ];
+    const { gov, collection } = build({ seed });
+
+    await expect(gov.init()).resolves.toBeUndefined();
+    await expect(gov.canOpenNewTrade()).resolves.toEqual({ ok: true });
+
+    const row = await collection.findOne({ date: "2025-01-15" });
+    expect(row).toBeTruthy();
+    expect(row.createdAt).toBeDefined();
+
+    const lastCall = collection.updateCalls.at(-1);
+    expect(lastCall).toBeTruthy();
+    expect(lastCall.update.$set.createdAt).toBeUndefined();
+    expect(lastCall.update.$set._id).toBeUndefined();
+  });
+
   test("DAILY_MAX_LOSS_INR ignored when R cap exists", async () => {
     const { gov } = build({ env: { DAILY_MAX_LOSS_R: 2, DAILY_MAX_LOSS_INR: 1 } });
     await gov.init();

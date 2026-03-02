@@ -143,6 +143,8 @@ class PortfolioGovernor {
     s.orderErrorCount = Math.max(0, Math.floor(toNum(s.orderErrorCount, 0)));
     s.orderErrBreakerUntilTs = Math.max(0, toNum(s.orderErrBreakerUntilTs, 0));
     s.openRiskInrSnapshot = Math.max(0, toNum(s.openRiskInrSnapshot, s.openRiskInr));
+    delete s.createdAt;
+    delete s._id;
     delete s.kind;
     this.state = s;
   }
@@ -346,13 +348,16 @@ class PortfolioGovernor {
   async _persist() {
     if (!this.collection || !this.state) return;
     this._normalizeState();
+    const safeState = {
+      ...this.state,
+      lastUpdated: new Date(),
+    };
+    delete safeState.createdAt;
+    delete safeState._id;
     await this.collection.updateOne(
       { date: this.state.date },
       {
-        $set: {
-          ...this.state,
-          lastUpdated: new Date(),
-        },
+        $set: safeState,
         $setOnInsert: { createdAt: new Date() },
       },
       { upsert: true },
