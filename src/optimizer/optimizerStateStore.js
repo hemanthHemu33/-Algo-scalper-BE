@@ -44,8 +44,16 @@ async function writeState(doc) {
     return { ok: false, reason: "db_not_ready" };
   }
 
+  const baseDoc = doc && typeof doc === "object" ? { ...doc } : {};
+  // Prevent immutable/conflicting fields from entering $set payload.
+  // Mongo rejects updates when the same path appears in both $set and
+  // $setOnInsert (e.g. createdAt), which can happen if callers pass back
+  // hydrated state docs.
+  delete baseDoc.createdAt;
+  delete baseDoc._id;
+
   const payload = {
-    ...(doc || {}),
+    ...baseDoc,
     _id: stateId(),
     updatedAt: now(),
   };
