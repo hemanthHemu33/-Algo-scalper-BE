@@ -352,11 +352,8 @@ function applyMinGreenExitRules({
   const tradePatch = { ...(basePlan?.tradePatch || {}) };
 
   const pnlInr = unrealizedPnlInr({ side, entry, ltp, qty });
-  const riskPerTradeInr = Number(trade?.riskInr ?? env.RISK_PER_TRADE_INR ?? 0);
-  const pnlR =
-    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
-      ? pnlInr / riskPerTradeInr
-      : null;
+  const riskPerTradeInr = Number(trade?.riskInr ?? 0);
+  const pnlR = null;
   const priceRisk = Math.abs(entry - sl0);
   const pnlPriceR = profitR({ side, entry, ltp, risk: priceRisk });
   const maxSpreadBpsForPeak = Number(env.MAX_SPREAD_BPS_FOR_PEAK_UPDATE ?? 80);
@@ -377,10 +374,7 @@ function applyMinGreenExitRules({
   const peakPnlInr = Number.isFinite(prevPeakPnlInr)
     ? Math.max(prevPeakPnlInr, pnlInr, toFiniteOrNaN(peakPnlFromPriceInr))
     : Math.max(pnlInr, toFiniteOrNaN(peakPnlFromPriceInr));
-  const peakPnlR =
-    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
-      ? peakPnlInr / riskPerTradeInr
-      : null;
+  const peakPnlR = null;
   const peakPriceR = Number.isFinite(peakLtpNow)
     ? profitR({ side, entry, ltp: peakLtpNow, risk: priceRisk })
     : null;
@@ -390,7 +384,7 @@ function applyMinGreenExitRules({
     : Number.isFinite(peakPnlR)
       ? peakPnlR
       : peakPriceR;
-  const pnlRForRules = Number.isFinite(pnlR) ? pnlR : pnlPriceR;
+  const pnlRForRules = pnlPriceR;
   if (!Number.isFinite(prevPeakPnlInr) || Math.abs(peakPnlInr - prevPeakPnlInr) >= Math.max(1, tick * qty)) {
     tradePatch.peakPnlInr = peakPnlInr;
   }
@@ -485,40 +479,29 @@ function applyMinGreenExitRules({
     0.9,
     1.6,
   );
-  if (minGreenEnabled && Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0) {
-    const minGreenFromR = scaledMinGreenR * riskPerTradeInr;
-    minGreenInr = Math.max(minGreenInr, Number.isFinite(minGreenFromR) ? minGreenFromR : 0);
-  }
+
   const pnlStepInr = Number.isFinite(qty) && qty > 0 && Number.isFinite(tick) && tick > 0
     ? qty * tick
     : 0;
   const estCostInr = toFiniteOrNaN(basePlan?.meta?.trueBEMeta?.estCostInr);
-  const beLockAtFromR =
-    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0 ? beArmR * riskPerTradeInr : null;
+  const beLockAtFromR = beArmR;
   const beLockAtFromCost =
     Number.isFinite(estCostInr) && estCostInr > 0 && Number.isFinite(beArmCostMult) && beArmCostMult > 0
       ? beArmCostMult * estCostInr
       : null;
-  const beLockAt = Math.max(
-    Number.isFinite(beLockAtFromR) ? beLockAtFromR : 0,
-    Number.isFinite(beLockAtFromCost) ? beLockAtFromCost : 0,
-    minGreenInr,
-  );
-  const trailStartInr =
-    Number.isFinite(riskPerTradeInr) && riskPerTradeInr > 0
-      ? trailArmR * riskPerTradeInr
-      : env.RISK_BUDGET_ENABLED
-        ? 0
-        : Number(env.DYN_TRAIL_START_PROFIT_INR ?? 0);
-  const beArmEpsInr = pnlStepInr;
-  const trailArmEpsInr = pnlStepInr;
+  const costR = Number.isFinite(priceRisk) && priceRisk > 0 && Number.isFinite(beLockAtFromCost) ? beLockAtFromCost / priceRisk : 0;
+  const beOffsetR = Number(env.BE_OFFSET_R ?? 0.1);
+  const beLockAt = Math.max(Number.isFinite(beLockAtFromR) ? beLockAtFromR : 0, costR + beOffsetR, scaledMinGreenR);
+  const trailStartInr = trailArmR;
+  const beArmEpsInr = 0;
+  const trailArmEpsInr = 0;
 
   const beLockedForMaxHold =
     Boolean(tradePatch.beLocked || trade?.beLocked) ||
-    meetsThreshold(pnlInr, beLockAt, beArmEpsInr);
+    meetsThreshold(pnlRForRules, beLockAt, beArmEpsInr);
   const trailLockedForMaxHold =
     Boolean(tradePatch.trailLocked || trade?.trailLocked) ||
-    meetsThreshold(pnlInr, trailStartInr, trailArmEpsInr);
+    meetsThreshold(peakRForRules, trailStartInr, trailArmEpsInr);
 
   const underlyingMoveBpsNow = underlyingMoveBps({ trade, underlyingLtp });
   const absUnderlyingMoveBps = Number.isFinite(underlyingMoveBpsNow)
@@ -548,7 +531,7 @@ function applyMinGreenExitRules({
     !proTimeStopsEnabled &&
     Number.isFinite(timeStopAtMs) &&
     now >= timeStopAtMs &&
-    pnlInr < minGreenInr
+    pnlRForRules < scaledMinGreenR
   ) {
     return {
       ...basePlan,
@@ -696,12 +679,12 @@ function applyMinGreenExitRules({
   let beApplied = Number.isFinite(beAppliedAtTs) && Number.isFinite(beAppliedStopLoss);
   let trailArmed = Boolean(trade?.trailLocked);
   const skipReasons = [];
-  const minGreenHit = !minGreenEnabled || pnlInr >= minGreenInr;
+  const minGreenHit = !minGreenEnabled || pnlRForRules >= scaledMinGreenR;
 
-  if (minGreenHit && meetsThreshold(pnlInr, beLockAt, beArmEpsInr)) {
+  if (minGreenHit && meetsThreshold(pnlRForRules, beLockAt, beArmEpsInr)) {
     beLockArmed = true;
   }
-  if (minGreenHit && meetsThreshold(pnlInr, trailStartInr, trailArmEpsInr)) {
+  if (minGreenHit && meetsThreshold(peakRForRules, trailStartInr, trailArmEpsInr)) {
     trailArmed = true;
   }
 
@@ -1020,7 +1003,7 @@ function applyMinGreenExitRules({
   let structureBufferPts = null;
   let structureRoundGuardApplied = false;
   const strategyId = String(trade?.strategyId ?? trade?.strategy ?? trade?.signal?.strategyId ?? "").trim();
-  const minGreenGatePassed = !minGreenEnabled || meetsThreshold(pnlInr, minGreenInr, pnlStepInr);
+  const minGreenGatePassed = !minGreenEnabled || meetsThreshold(pnlRForRules, scaledMinGreenR, 0);
   if (structureEnabled) {
     const levelSourceCandles = Array.isArray(structureCandles) && structureCandles.length ? structureCandles : candles;
     const levels = getStructureLevelsCached({

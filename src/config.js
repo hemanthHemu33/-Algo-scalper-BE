@@ -248,6 +248,12 @@ const schema = z.object({
   OPT_PICK_REQUIRE_OK: boolFromEnv.default(true),
   // Enforce that selected options contract must fit 1-lot risk budget
   OPT_RISK_FIT_ENABLED: boolFromEnv.default(true),
+  OPT_RISK_FIT_CONFIDENCE_HIGH: z.coerce.number().default(80),
+  OPT_RISK_FIT_ALLOW_LOW_PREMIUM_FALLBACK: boolFromEnv.default(true),
+  OPT_LOW_PREMIUM_FALLBACK_MAX_EXTRA_STEPS: z.coerce.number().default(6),
+  OPT_LOW_PREMIUM_MIN_DELTA: z.coerce.number().default(0.15),
+  OPT_LOW_PREMIUM_MIN_PREMIUM: z.coerce.number().default(8),
+  OPT_ONE_LOT_OVERBUDGET_MAX_MULT: z.coerce.number().default(1.25),
   // Debug: attach the top-N option candidates to last pick metadata (0 disables). Max 10.
   OPT_PICK_DEBUG_TOP_N: z.coerce.number().default(0),
 
@@ -353,6 +359,7 @@ const schema = z.object({
   // Pro default is OFF (STRICT risk-fit). Enable only as an explicit emergency fallback.
   OPT_SL_FIT_WHEN_CAP_BLOCKS: boolFromEnv.default(false),
   ALLOW_SL_FIT_RESCUE: boolFromEnv.default(false),
+  STRATEGY_SL_AUTHORITATIVE: boolFromEnv.default(true),
   // Minimum SL distance enforced by fitter (in ticks). Helps avoid ultra-tight “0.05 SL” fitting.
   OPT_SL_FIT_MIN_TICKS: z.coerce.number().default(10),
 
@@ -569,7 +576,7 @@ const schema = z.object({
 
   // Risk limits
   RISK_PER_TRADE_INR: z.coerce.number().default(450),
-  DAILY_PROFIT_GOAL_INR: z.coerce.number().default(2000),
+  DAILY_PROFIT_GOAL_INR: z.coerce.number().default(0),
   RISK_BUDGET_ENABLED: boolFromEnv.default(true),
   RISK_EQUITY_SOURCE: z.string().default("AVAILABLE_MARGIN"),
   RISK_EQUITY_FLOOR_INR: z.coerce.number().default(0),
@@ -594,7 +601,8 @@ const schema = z.object({
   PORTFOLIO_GOVERNOR_ENABLED: boolFromEnv.default(true),
   DAILY_MAX_LOSS_R: z.coerce.number().default(3.0),
   MAX_LOSS_STREAK: z.coerce.number().default(3),
-  MAX_OPEN_RISK_R: z.coerce.number().default(1.5),
+  MAX_OPEN_RISK_R: z.coerce.number().default(2.0),
+  DAILY_PROFIT_GOAL_R: z.coerce.number().default(0),
   ORDER_ERR_BREAKER_ENABLED: boolFromEnv.default(true),
   ORDER_ERR_BREAKER_MAX: z.coerce.number().default(5),
   ORDER_ERR_BREAKER_WINDOW_SEC: z.coerce.number().default(600),
@@ -604,19 +612,20 @@ const schema = z.object({
   // Exit management (min-green, breakeven lock, trailing, time stop)
   R_EXIT_POLICY_ENABLED: boolFromEnv.default(true),
   MIN_GREEN_ENABLED: z.string().default("true"),
-  MIN_GREEN_R: z.coerce.number().default(0.2),
+  MIN_GREEN_R: z.coerce.number().default(0.25),
   MIN_GREEN_COST_MULT: z.coerce.number().default(1.0),
   MIN_GREEN_MIN_INR: z.coerce.number().default(0),
   MIN_GREEN_SLIP_MULT: z.coerce.number().default(1.0),
   MIN_GREEN_SLIPPAGE_PTS_OPT: z.coerce.number().default(2),
   BE_LOCK_AT_PROFIT_INR: z.coerce.number().default(200),
-  BE_ARM_R: z.coerce.number().default(0.6),
+  BE_ARM_R: z.coerce.number().default(0.7),
+  BE_OFFSET_R: z.coerce.number().default(0.1),
   DYN_BE_COST_MULT: z.coerce.number().default(1.0),
   BE_SLIP_MULT: z.coerce.number().default(1.0),
   BE_SPREAD_MULT: z.coerce.number().default(0.5),
   BE_PROFIT_LOCK_KEEP_R: z.coerce.number().default(0.25),
   BE_ARM_COST_MULT: z.coerce.number().default(2.0),
-  TRAIL_ARM_R: z.coerce.number().default(1.1),
+  TRAIL_ARM_R: z.coerce.number().default(1.2),
   STRUCTURE_EXIT_ENABLED: boolFromEnv.default(true),
   STRUCTURE_ANCHORS_ENABLED: boolFromEnv.default(true),
   ORB_MINUTES: z.coerce.number().default(15),
@@ -744,9 +753,9 @@ const schema = z.object({
     .default(
       "breakout,vwap_reclaim,volume_spike,bollinger_squeeze,ema_pullback,ema_cross,wick_reversal,fakeout,orb",
     ),
-  DAILY_MAX_LOSS_INR: z.coerce.number().default(1350),
+  DAILY_MAX_LOSS_INR: z.coerce.number().default(0),
   AUTO_EXIT_ON_DAILY_LOSS: z.string().default("true"),
-  RISK_MAX_DRAWDOWN_INR: z.coerce.number().default(2700),
+  RISK_MAX_DRAWDOWN_INR: z.coerce.number().default(0),
   RISK_MAX_EXPOSURE_PER_SYMBOL_INR: z.coerce.number().default(150000),
   RISK_MAX_PORTFOLIO_EXPOSURE_INR: z.coerce.number().default(0),
   RISK_MAX_LEVERAGE: z.coerce.number().default(0),

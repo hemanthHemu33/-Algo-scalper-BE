@@ -407,6 +407,7 @@ function buildTradePlan({
   let expectedMovePerUnit = em;
 
   const meta = {
+    slAuthority: "STRATEGY",
     style,
     k,
     m,
@@ -584,6 +585,7 @@ function buildTradePlan({
 
       meta.option = {
         modelUsed: "DELTA_GAMMA_MAP_ONLY",
+        slAuthority: "FALLBACK",
         absDelta,
         delta: Number.isFinite(delta) ? delta : null,
         gamma: Number.isFinite(gamma) ? gamma : null,
@@ -606,7 +608,12 @@ function buildTradePlan({
     stop = stopP;
     target = targetP;
     rrFinal = rrP;
+    if (meta.option?.slAuthority === "FALLBACK") {
+      meta.slAuthority = "FALLBACK";
+    }
   }
+
+  meta.priceRiskPts = Math.abs(Number(stop) - Number(optionMeta ? entryPremium : entryU));
 
   return {
     ok: true,

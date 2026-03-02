@@ -144,4 +144,30 @@ describe("PortfolioGovernor", () => {
     await expect(gov.init()).resolves.toBeUndefined();
     await expect(gov.registerTradeOpen({ tradeId: "o1", riskInr: 300 })).resolves.toBeUndefined();
   });
+  test("DAILY_MAX_LOSS_INR ignored when R cap exists", async () => {
+    const { gov } = build({ env: { DAILY_MAX_LOSS_R: 2, DAILY_MAX_LOSS_INR: 1 } });
+    await gov.init();
+    gov.state.realizedPnlInr = -10;
+    gov.state.realizedPnlR = -0.5;
+    const gate = await gov.canOpenNewTrade();
+    expect(gate.ok).toBe(true);
+  });
+
+  test("MAX_OPEN_RISK_R uses openRiskInr/baseRInr conversion", async () => {
+    const { gov } = build({ env: { MAX_OPEN_RISK_R: 1.2 } });
+    await gov.init();
+    const gate = await gov.canOpenNewTrade({ openRiskInr: 1300 });
+    expect(gate.ok).toBe(false);
+    expect(gate.reason).toBe("max_open_risk");
+  });
+
+  test("DAILY_PROFIT_GOAL_R denies new entries when reached", async () => {
+    const { gov } = build({ env: { DAILY_PROFIT_GOAL_R: 1.0 } });
+    await gov.init();
+    gov.state.realizedPnlR = 1.1;
+    const gate = await gov.canOpenNewTrade();
+    expect(gate.ok).toBe(false);
+    expect(gate.reason).toBe("daily_profit_goal_r");
+  });
+
 });

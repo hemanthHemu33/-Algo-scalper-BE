@@ -527,6 +527,7 @@ async function pickOptionContractForSignal({
   expectedSlippagePts = 0,
   expectedFeesInr = 0,
   prePickPlan = null,
+  confidence = 0,
 }) {
   const u = resolveUnderlyingFromUniverse({
     universe,
@@ -1002,6 +1003,12 @@ async function pickOptionContractForSignal({
   const requireOk = !!env.OPT_PICK_REQUIRE_OK;
 
   const riskFitEnabled = !!env.OPT_RISK_FIT_ENABLED;
+  const riskFitHighConf = Number(env.OPT_RISK_FIT_CONFIDENCE_HIGH ?? 80);
+  const isHighConfidence = Number(confidence) >= riskFitHighConf;
+  const allowLowPremiumFallback = Boolean(env.OPT_RISK_FIT_ALLOW_LOW_PREMIUM_FALLBACK ?? true);
+  const lowPremiumMinDelta = Number(env.OPT_LOW_PREMIUM_MIN_DELTA ?? 0.15);
+  const lowPremiumMinPremium = Number(env.OPT_LOW_PREMIUM_MIN_PREMIUM ?? 8);
+  const oneLotOverbudgetMaxMult = Number(env.OPT_ONE_LOT_OVERBUDGET_MAX_MULT ?? 1.25);
   const riskFitCapInr = Number(riskTradeInr);
   const stopPtsFallback = Math.max(0, Number(stopDistancePts ?? 0));
   const slipPtsEst = Math.max(0, Number(expectedSlippagePts ?? 0));
@@ -1079,7 +1086,12 @@ async function pickOptionContractForSignal({
   // If nothing is eligible, optionally allow a *premium-band-only* fallback
   // (i.e., keep all other gates intact).
   let premiumBandFallbackUsed = false;
-  let best = eligible[0];
+  let best = null;
+  let selectionReason = "NORMAL";
+  const eligibleRiskFit = eligible.filter((x) => x.riskFitOk);
+  if (eligibleRiskFit.length) {
+    best = eligibleRiskFit[0];
+  }
 
   if (!best) {
     const allowPremiumFallback =
@@ -1136,6 +1148,42 @@ async function pickOptionContractForSignal({
           },
           "[options] premium band fallback used (all other gates OK)",
         );
+      }
+    }
+
+    if (!best && isHighConfidence && allowLowPremiumFallback) {
+      const lowPremiumPool = scoredWithRisk
+        .filter((x) => x.hardOk)
+        .filter((x) => Number(x?.ctx?.deltaAbs ?? 0) >= lowPremiumMinDelta)
+        .filter((x) => Number(x?.row?.ltp ?? 0) >= lowPremiumMinPremium)
+        .sort((a, b) => {
+          const fitA = Number(riskFitCapInr) / Math.max(Number(a.riskPerLot ?? 1), 1e-9);
+          const fitB = Number(riskFitCapInr) / Math.max(Number(b.riskPerLot ?? 1), 1e-9);
+          const aOk = fitA >= 1 ? 0 : 1;
+          const bOk = fitB >= 1 ? 0 : 1;
+          if (aOk !== bOk) return aOk - bOk;
+          if (aOk === 0) return fitA - fitB;
+          const aSpread = Number(a?.row?.spread_bps ?? 9999);
+          const bSpread = Number(b?.row?.spread_bps ?? 9999);
+          if (aSpread !== bSpread) return aSpread - bSpread;
+          return a.score - b.score;
+        });
+      if (lowPremiumPool.length && lowPremiumPool[0].riskFitOk) {
+        best = lowPremiumPool[0];
+        selectionReason = "RISK_FIT_FALLBACK_LOW_PREMIUM";
+        logger.warn({ underlying, optType, confidence, picked: best.row.tradingsymbol }, "RISK_FIT_FALLBACK_LOW_PREMIUM");
+      }
+    }
+
+    if (!best && isHighConfidence) {
+      const minRisk = scoredWithRisk.filter((x) => x.hardOk).sort((a, b) => Number(a.riskPerLot ?? 1e12) - Number(b.riskPerLot ?? 1e12))[0];
+      if (minRisk) {
+        const allowCap = Number(riskFitCapInr) > 0 ? Number(riskFitCapInr) * Math.max(oneLotOverbudgetMaxMult, 1) : Infinity;
+        if (Number(minRisk.riskPerLot ?? Infinity) <= allowCap) {
+          best = minRisk;
+          selectionReason = "ONE_LOT_OVERBUDGET_ALLOWED";
+          logger.warn({ underlying, optType, confidence, picked: best.row.tradingsymbol, riskPerLot: best.riskPerLot, riskCap: riskFitCapInr }, "ONE_LOT_OVERBUDGET_ALLOWED");
+        }
       }
     }
 
@@ -1252,7 +1300,7 @@ async function pickOptionContractForSignal({
         ok: false,
         reason:
           riskFitEnabled && Number.isFinite(riskFitCapInr) && riskFitCapInr > 0
-            ? "RISK_FIT_NO_CONTRACT"
+            ? "NO_CONTRACT_CAN_FIT_RISK"
             : requireOk
               ? "NO_OK_CANDIDATE"
               : "NO_PREMIUM_BAND_CANDIDATE",
@@ -1281,7 +1329,7 @@ async function pickOptionContractForSignal({
           },
           greeksRequired,
           oiContext,
-          riskFit: { enabled: riskFitEnabled, capInr: riskFitCapInr, stopPtsEst, slipPtsEst, feesInrEst },
+          riskFit: { enabled: riskFitEnabled, capInr: riskFitCapInr, stopPtsFallback, slipPtsEst, feesInrEst, confidence, highConfidence: isHighConfidence },
           topCandidates: debugTop,
         },
       };
@@ -1409,6 +1457,8 @@ async function pickOptionContractForSignal({
         selectedRiskPerLot: Number(best.riskPerLot ?? 0),
         selectedRiskFitOk: !!best.riskFitOk,
         selectedRiskFitReason: best.riskFitReason,
+        selectionReason,
+        oneLotOverbudgetAllowed: selectionReason === "ONE_LOT_OVERBUDGET_ALLOWED",
       },
       micro: { maxBps, spreadRiseBlockBps, minDepth, flickerBlock, minHealthScore },
       liquidityGate: {

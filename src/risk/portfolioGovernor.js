@@ -175,19 +175,20 @@ class PortfolioGovernor {
     this._trimOrderErrors(now);
 
     const baseRInr = this._baseRInr();
-    const realized = toNum(this.state.realizedPnlInr, 0);
+    const realizedPnlR = toNum(this.state.realizedPnlR, 0);
     const openRiskInr = Number.isFinite(Number(ctx.openRiskInr))
       ? Number(ctx.openRiskInr)
       : toNum(this.state.openRiskInr, 0);
 
-    const maxLossInr = toNum(this.env.DAILY_MAX_LOSS_INR, 0);
-    if (maxLossInr > 0 && realized <= -maxLossInr) {
-      return this._deny("daily_max_loss_inr", { maxLossInr, baseRInr, openRiskInr });
-    }
 
     const maxLossR = toNum(this.env.DAILY_MAX_LOSS_R, 0);
-    if (maxLossR > 0 && baseRInr > 0 && realized <= -(maxLossR * baseRInr)) {
-      return this._deny("daily_max_loss_r", { maxLossR, baseRInr, openRiskInr });
+    if (maxLossR > 0 && realizedPnlR <= -maxLossR) {
+      return this._deny("daily_max_loss_r", { maxLossR, realizedPnlR, baseRInr, openRiskInr });
+    }
+
+    const dailyProfitGoalR = toNum(this.env.DAILY_PROFIT_GOAL_R, 0);
+    if (dailyProfitGoalR > 0 && realizedPnlR >= dailyProfitGoalR) {
+      return this._deny("daily_profit_goal_r", { dailyProfitGoalR, realizedPnlR, baseRInr, openRiskInr });
     }
 
     const maxLossStreak = Math.max(0, Math.floor(toNum(this.env.MAX_LOSS_STREAK, 0)));
@@ -201,8 +202,9 @@ class PortfolioGovernor {
     }
 
     const maxOpenRiskR = toNum(this.env.MAX_OPEN_RISK_R, 0);
-    if (maxOpenRiskR > 0 && baseRInr > 0 && openRiskInr > maxOpenRiskR * baseRInr) {
-      return this._deny("max_open_risk", { maxOpenRiskR, baseRInr, openRiskInr });
+    const openRiskR = baseRInr > 0 ? openRiskInr / baseRInr : 0;
+    if (maxOpenRiskR > 0 && openRiskR > maxOpenRiskR) {
+      return this._deny("max_open_risk", { maxOpenRiskR, openRiskR, baseRInr, openRiskInr });
     }
 
     if (

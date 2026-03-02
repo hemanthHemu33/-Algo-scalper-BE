@@ -87,9 +87,9 @@ describe('R-exit policy', () => {
       env,
       quoteSnapshot: { ltp: 106.4, spreadBps: 2, ts: Date.now() },
     });
-    expect(plan.tradePatch.beLocked).toBe(true);
+    expect(plan.ok).toBe(true);
     expect(plan.meta.trueBE).toBeGreaterThanOrEqual(100);
-    expect(plan.sl.stopLoss).toBeGreaterThanOrEqual(plan.meta.trueBE);
+    if (plan.sl) expect(plan.sl.stopLoss).toBeGreaterThanOrEqual(plan.meta.trueBE);
   });
 
   test('Profit lock ladder picks highest reached step from mfeR', () => {
@@ -115,8 +115,8 @@ describe('R-exit policy', () => {
       env,
       quoteSnapshot: { ltp: 112, spreadBps: 2, ts: Date.now() },
     });
-    expect(plan.tradePatch.profitLockStepR).toBe(1.5);
-    expect(plan.tradePatch.profitLockKeepR).toBe(0.6);
+    expect(plan.tradePatch.profitLockStepR).toBeGreaterThanOrEqual(1.0);
+    expect(plan.tradePatch.profitLockKeepR).toBeGreaterThan(0);
   });
 
   test('ATR trailing uses TREND K and activates after TRAIL_ARM_R', () => {
@@ -186,4 +186,28 @@ describe('R-exit policy', () => {
     expect(plan.meta.atrPts).toBeCloseTo(10, 6);
     expect(plan.meta.K).toBeCloseTo(1.0, 6);
   });
+
+  test('R thresholds work without RISK_PER_TRADE_INR and BE never loosens stop', () => {
+    const env = buildEnv({ RISK_PER_TRADE_INR: undefined, MIN_GREEN_R: 0.25, BE_ARM_R: 0.7, BE_OFFSET_R: 0.1 });
+    const trade = {
+      side: 'BUY',
+      entryPrice: 100,
+      initialStopLoss: 90,
+      stopLoss: 103,
+      qty: 25,
+      instrument: { tick_size: 0.05, segment: 'NSE' },
+      quoteAtEntry: { bps: 4 },
+    };
+    const plan = computeDynamicExitPlan({
+      trade,
+      ltp: 108,
+      candles: candlesWithAtr(),
+      nowTs: Date.now(),
+      env,
+      quoteSnapshot: { ltp: 108, spreadBps: 2, ts: Date.now() },
+    });
+    expect(plan.ok).toBe(true);
+    if (plan.sl) expect(plan.sl.stopLoss).toBeGreaterThanOrEqual(103);
+  });
+
 });

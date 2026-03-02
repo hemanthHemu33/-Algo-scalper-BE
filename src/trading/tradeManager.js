@@ -8939,6 +8939,7 @@ class TradeManager {
           expectedMoveUnderlying: Number(s.expectedMovePerShare ?? 0),
           atrPeriod: Number(env.EXPECTED_MOVE_ATR_PERIOD ?? 14),
         },
+        confidence: Number(s.confidence ?? 0),
       });
 
       // PATCH-10: Hard-focus one underlying (prevents accidental multi-index trading)
@@ -9731,11 +9732,16 @@ class TradeManager {
       "[risk] computed dynamic risk budget",
     );
 
+    const strategySlAuthoritative =
+      String(env.STRATEGY_SL_AUTHORITATIVE ?? "true") !== "false" &&
+      String(planMeta?.slAuthority || "").toUpperCase() === "STRATEGY";
+
     // Option SL fitter: if 1-lot risk exceeds cap, tighten SL toward entry to fit.
     // This avoids frequent LOT_RISK_CAP blocks when lot sizes are large.
     // We only attempt this for the option-leg (not the underlying future token).
     if (
       s.option_meta &&
+      !strategySlAuthoritative &&
       Boolean(env.OPT_SL_FIT_ENABLED) && !env.RISK_BUDGET_ENABLED &&
       Boolean(env.LOT_RISK_CAP_ENFORCE) &&
       Number(instrument?.lot_size ?? 1) > 1
@@ -10183,6 +10189,7 @@ class TradeManager {
 
             const canRescueBySlFit =
               allowSlFitRescue &&
+              !strategySlAuthoritative &&
               !env.RISK_BUDGET_ENABLED &&
               forceOneLot &&
               lot > 1 &&
@@ -10277,7 +10284,15 @@ class TradeManager {
                 return;
               }
             } else {
-              logger.info(
+              const oneLotOverbudgetAllowed = Boolean(s.option_meta?.meta?.riskFit?.oneLotOverbudgetAllowed);
+              if (
+                strategySlAuthoritative &&
+                Number(qty) <= Number(instrument?.lot_size ?? 1) &&
+                oneLotOverbudgetAllowed
+              ) {
+                logger.warn({ token, side, trueRiskInr, capInr }, "[risk] allowing one-lot overbudget by router policy");
+              } else {
+                logger.info(
                 {
                   token,
                   side: side,
@@ -10297,6 +10312,7 @@ class TradeManager {
                 "[trade] blocked (lot risk cap after lot-normalization)",
               );
               return;
+              }
             }
           }
 
@@ -10447,6 +10463,8 @@ class TradeManager {
     let entryValidity = "DAY";
 
     const tradeId = crypto.randomUUID();
+    const initialRiskPts = Math.abs(Number(expectedEntryPrice ?? entryGuess ?? 0) - Number(stopLoss ?? 0));
+    const initialRiskInr = initialRiskPts * Number(qty || 0);
     const trade = {
       tradeId,
       instrument_token: token,
@@ -10462,6 +10480,10 @@ class TradeManager {
       option_meta: s.option_meta || null,
       stopLoss,
       initialStopLoss: stopLoss,
+      initialRiskPts,
+      initialQty: qty,
+      initialRiskInr,
+      riskInr: initialRiskInr,
       slTrigger: stopLoss,
       beLocked: false,
       beLockedAt: null,
