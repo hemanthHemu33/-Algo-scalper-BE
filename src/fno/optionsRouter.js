@@ -639,7 +639,18 @@ async function pickOptionContractForSignal({
   const offsets = buildCandidateOffsets(radius);
 
   // For cache + ranking: scan a wider band around desired strike.
-  const wide = Math.max(radius, Number(env.OPT_CHAIN_STRIKES_AROUND_ATM ?? 10));
+  // If low-premium fallback is enabled, widen strike scan so fallback can actually discover farther strikes.
+  const lowPremiumExtraSteps = Math.max(
+    0,
+    Number(env.OPT_LOW_PREMIUM_FALLBACK_MAX_EXTRA_STEPS ?? 0),
+  );
+  const wide = Math.max(
+    radius,
+    Number(env.OPT_CHAIN_STRIKES_AROUND_ATM ?? 10),
+    Boolean(env.OPT_RISK_FIT_ALLOW_LOW_PREMIUM_FALLBACK ?? true)
+      ? radius + lowPremiumExtraSteps
+      : radius,
+  );
 
   // Build candidate strike set
   const strikeSet = new Set();
