@@ -10484,6 +10484,8 @@ class TradeManager {
       initialQty: qty,
       initialRiskInr,
       riskInr: initialRiskInr,
+      // planned risk budget used for sizing / entry gating (₹)
+      riskBudgetInr: tradeRiskInr,
       slTrigger: stopLoss,
       beLocked: false,
       beLockedAt: null,
@@ -10522,8 +10524,6 @@ class TradeManager {
       minGreenInr: minGreenComputed.minGreenInr,
       minGreenPts: minGreenComputed.minGreenPts,
       minGreenR: minGreenComputed.minGreenR,
-      // planned risk cap used for sizing / gating (₹)
-      riskInr: tradeRiskInr,
       sessionRiskInr: Number(this.riskBudget?.getSessionRInr?.() ?? 0),
       entryOrderType: finalEntryOrderType,
       maxEntrySlippageBps: maxEntrySlipBps,
@@ -12044,7 +12044,15 @@ class TradeManager {
         return { ok: true, skipped: true };
       }
 
-      const capBase = Number(t.riskInr ?? env.RISK_PER_TRADE_INR ?? 0);
+      const strategySlAuthoritative =
+        String(env.STRATEGY_SL_AUTHORITATIVE ?? "true") !== "false" &&
+        String(t?.planMeta?.slAuthority || "").toUpperCase() === "STRATEGY";
+      const allowSlFitRescue =
+        String(env.ALLOW_SL_FIT_RESCUE || "false") === "true";
+
+      const capBase = Number(
+        t.riskBudgetInr ?? t.riskInr ?? env.RISK_PER_TRADE_INR ?? 0,
+      );
       const eps = Math.max(0, Number(env.POST_FILL_RISK_EPS_PCT ?? 0));
       const capInr = capBase * (1 + eps);
 
@@ -12073,6 +12081,57 @@ class TradeManager {
           },
         });
         return { ok: true, refit: false };
+      }
+
+      const action = String(
+        env.POST_FILL_RISK_FAIL_ACTION || "EXIT",
+      ).toUpperCase();
+
+      if (strategySlAuthoritative || !allowSlFitRescue) {
+        await updateTrade(tradeId, {
+          postFillRisk: {
+            ok: false,
+            refit: false,
+            blockedByStrategyAuthority: strategySlAuthoritative,
+            rescueAllowed: allowSlFitRescue,
+            entryPrice: entry,
+            stopLoss: sl,
+            qty: q,
+            trueRiskInr,
+            capInr,
+            reason: strategySlAuthoritative
+              ? "STRATEGY_SL_AUTHORITATIVE"
+              : "SL_FIT_RESCUE_DISABLED",
+            ts: new Date().toISOString(),
+          },
+        });
+
+        if (action === "EXIT") {
+          const fresh = (await getTrade(tradeId)) || t;
+          await this._panicExit(
+            { ...fresh, entryPrice: entry, qty: q },
+            "POST_FILL_RISK_CAP",
+          );
+          await updateTrade(tradeId, {
+            status: STATUS.GUARD_FAILED,
+            closeReason: `POST_FILL_RISK_CAP (${trueRiskInr.toFixed(0)}>${capInr.toFixed(0)})`,
+          });
+          return {
+            ok: false,
+            exited: true,
+            reason: strategySlAuthoritative
+              ? "STRATEGY_SL_AUTHORITATIVE"
+              : "SL_FIT_RESCUE_DISABLED",
+          };
+        }
+
+        return {
+          ok: false,
+          exited: false,
+          reason: strategySlAuthoritative
+            ? "STRATEGY_SL_AUTHORITATIVE"
+            : "SL_FIT_RESCUE_DISABLED",
+        };
       }
 
       const tickSize = Number(t.instrument?.tick_size ?? 0.05);
@@ -12162,9 +12221,6 @@ class TradeManager {
         },
       });
 
-      const action = String(
-        env.POST_FILL_RISK_FAIL_ACTION || "EXIT",
-      ).toUpperCase();
       if (action === "EXIT") {
         alert("error", "🛑 Post-fill risk > cap; panic exit", {
           tradeId,

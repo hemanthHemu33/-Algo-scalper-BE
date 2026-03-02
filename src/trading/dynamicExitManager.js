@@ -489,19 +489,26 @@ function applyMinGreenExitRules({
     Number.isFinite(estCostInr) && estCostInr > 0 && Number.isFinite(beArmCostMult) && beArmCostMult > 0
       ? beArmCostMult * estCostInr
       : null;
-  const costR = Number.isFinite(priceRisk) && priceRisk > 0 && Number.isFinite(beLockAtFromCost) ? beLockAtFromCost / priceRisk : 0;
+  const costR =
+    Number.isFinite(priceRisk) &&
+    priceRisk > 0 &&
+    Number.isFinite(qty) &&
+    qty > 0 &&
+    Number.isFinite(beLockAtFromCost)
+      ? beLockAtFromCost / (priceRisk * qty)
+      : 0;
   const beOffsetR = Number(env.BE_OFFSET_R ?? 0.1);
   const beLockAt = Math.max(Number.isFinite(beLockAtFromR) ? beLockAtFromR : 0, costR + beOffsetR, scaledMinGreenR);
-  const trailStartInr = trailArmR;
-  const beArmEpsInr = 0;
-  const trailArmEpsInr = 0;
+  const trailStartR = trailArmR;
+  const beArmEpsR = 0;
+  const trailArmEpsR = 0;
 
   const beLockedForMaxHold =
     Boolean(tradePatch.beLocked || trade?.beLocked) ||
-    meetsThreshold(pnlRForRules, beLockAt, beArmEpsInr);
+    meetsThreshold(pnlRForRules, beLockAt, beArmEpsR);
   const trailLockedForMaxHold =
     Boolean(tradePatch.trailLocked || trade?.trailLocked) ||
-    meetsThreshold(peakRForRules, trailStartInr, trailArmEpsInr);
+    meetsThreshold(peakRForRules, trailStartR, trailArmEpsR);
 
   const underlyingMoveBpsNow = underlyingMoveBps({ trade, underlyingLtp });
   const absUnderlyingMoveBps = Number.isFinite(underlyingMoveBpsNow)
@@ -681,10 +688,10 @@ function applyMinGreenExitRules({
   const skipReasons = [];
   const minGreenHit = !minGreenEnabled || pnlRForRules >= scaledMinGreenR;
 
-  if (minGreenHit && meetsThreshold(pnlRForRules, beLockAt, beArmEpsInr)) {
+  if (minGreenHit && meetsThreshold(pnlRForRules, beLockAt, beArmEpsR)) {
     beLockArmed = true;
   }
-  if (minGreenHit && meetsThreshold(peakRForRules, trailStartInr, trailArmEpsInr)) {
+  if (minGreenHit && meetsThreshold(peakRForRules, trailStartR, trailArmEpsR)) {
     trailArmed = true;
   }
 
@@ -1102,12 +1109,12 @@ function applyMinGreenExitRules({
 
   if (!beLockedNow) {
     if (!minGreenHit) {
-      skipReasons.push(`pnlInr=${Number(pnlInr ?? 0).toFixed(2)} < minGreenInr=${Number(minGreenInr ?? 0).toFixed(2)}`);
+      skipReasons.push(`pnlR=${Number(pnlRForRules ?? 0).toFixed(3)} < minGreenR=${Number(scaledMinGreenR ?? 0).toFixed(3)}`);
     }
     if (!(Number.isFinite(beLockAt) && beLockAt > 0)) skipReasons.push("be_lock_disabled");
-    else if (!meetsThreshold(pnlInr, beLockAt, beArmEpsInr))
+    else if (!meetsThreshold(pnlRForRules, beLockAt, beArmEpsR))
       skipReasons.push(
-        `pnlInr=${Number(pnlInr ?? 0).toFixed(2)} < beLockAt=${beLockAt} (eps=${Number(beArmEpsInr ?? 0).toFixed(2)})`,
+        `pnlR=${Number(pnlRForRules ?? 0).toFixed(3)} < beLockAtR=${Number(beLockAt ?? 0).toFixed(3)} (epsR=${Number(beArmEpsR ?? 0).toFixed(3)})`,
       );
   }
 
@@ -1118,9 +1125,9 @@ function applyMinGreenExitRules({
   }
 
   if (!trailLockedNow) {
-    if (!(Number.isFinite(trailStartInr) && trailStartInr > 0)) skipReasons.push("trail_arm_disabled");
+    if (!(Number.isFinite(trailStartR) && trailStartR > 0)) skipReasons.push("trail_arm_disabled");
     else if (!allowTrail) {
-      skipReasons.push(`pnlInr=${Number(pnlInr ?? 0).toFixed(2)} < trailStartInr=${trailStartInr}`);
+      skipReasons.push(`peakR=${Number(peakRForRules ?? 0).toFixed(3)} < trailStartR=${Number(trailStartR ?? 0).toFixed(3)}`);
     }
   }
 
@@ -1178,10 +1185,10 @@ function applyMinGreenExitRules({
       beLockAtFromR: Number.isFinite(beLockAtFromR) ? beLockAtFromR : null,
       beLockAtFromCost: Number.isFinite(beLockAtFromCost) ? beLockAtFromCost : null,
       beArmCostMult,
-      beArmEpsInr,
+      beArmEpsR,
       trailGap,
-      trailStartInr: Number.isFinite(trailStartInr) ? trailStartInr : null,
-      trailArmEpsInr,
+      trailStartR: Number.isFinite(trailStartR) ? trailStartR : null,
+      trailArmEpsR,
       allowTrail,
       beLockArmed: beLockedNow,
       beLockFiredThisTick,
