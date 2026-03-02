@@ -592,3 +592,5 @@ Daily max loss (6.5%) and per-trade budget (÷4)
 ₹1,00,000 → daily = ₹6,500 → per-trade budget = ₹1,625
 ₹1,50,000 → daily = ₹9,750 → per-trade budget = ₹2,437.5
 ₹2,00,000 → daily = ₹13,000 → per-trade budget = ₹3,250
+
+Candles → Features/Indicators → Strategy rules → Signal → Trade plan (Entry/SL/Targets) → Risk sizing (qty) → Order → Exit manager (BE/trail/time/EOD)

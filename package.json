@@ -21,7 +21,8 @@
     "test:jest": "jest --runInBand",
     "test:guard-panic-transition": "node scripts/test_guard_failed_panic_transition.js",
     "test:order-rejection-cooldown": "node scripts/test_order_rejection_cooldown_key_regression.js",
-    "investigate:target-reject": "node scripts/investigate_target_reject_reason.js"
+    "investigate:target-reject": "node scripts/investigate_target_reject_reason.js",
+    "bt:backfill": "node scripts/bt_backfill_token_range.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

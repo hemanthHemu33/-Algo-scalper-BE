@@ -204,7 +204,16 @@ async function main() {
   }
 
   const candles = await col.find(q).sort({ ts: 1 }).limit(limit).toArray();
-  if (!candles.length) throw new Error("No candles found for query");
+  if (!candles.length) {
+    const colName = collectionName(intervalMin);
+    const fromTxt = fromMs ? new Date(fromMs).toISOString() : '(none)';
+    const toTxt = toMsArg ? new Date(toMsArg).toISOString() : '(none)';
+    throw new Error(
+      `No candles found for query. token=${token} collection=${colName} from=${fromTxt} to=${toTxt}. ` +
+        `Backfill candles first: npm run bt:backfill -- --token=${token} --from=YYYY-MM-DD --to=YYYY-MM-DDT23:59:59+05:30 --interval=${intervalMin}. ` +
+        `Then re-run bt:run. Also verify CANDLE_COLLECTION_PREFIX and that your candles are stored for the same interval.`
+    );
+  }
   const tokenInstrument = await db.collection("instruments_cache").findOne({ instrument_token: Number(token) });
 
   const dataQuality = dataQualityMode === "off" ? null : assessDataQuality({ candles, intervalMin, timezone });

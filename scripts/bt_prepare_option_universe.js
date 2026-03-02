@@ -152,6 +152,8 @@ async function main() {
 
   const selectedTokens = new Set();
 
+  let daysWithSpot = 0;
+
   while (day <= endDay) {
     const dayIso = day.toISODate();
     const spot = await fetchDayUnderlyingPrice({ candleCol, token: underlyingToken, dayIso, tz: timezone });
@@ -159,6 +161,8 @@ async function main() {
       day = day.plus({ days: 1 });
       continue;
     }
+
+    daysWithSpot += 1;
 
     const expiry = pickNearestExpiry(instruments, dayIso);
     if (!expiry) {
@@ -179,6 +183,21 @@ async function main() {
     dayTokens.forEach((tok) => selectedTokens.add(tok));
     console.log(`[${dayIso}] expiry=${expiry} spot=${Number(spot.close).toFixed(2)} atm=${atm} tokens=${dayTokens.length}`);
     day = day.plus({ days: 1 });
+  }
+
+  if (daysWithSpot === 0) {
+    throw new Error(
+      `No UNDERLYING candles found for token=${underlyingToken} in ${collectionName(intervalMin)} for the given date range. ` +
+        `Backfill underlying candles first: npm run bt:backfill -- --token=${underlyingToken} --from=${from.toISOString().slice(0,10)} --to=${to.toISOString().slice(0,10)}T23:59:59+05:30 --interval=${intervalMin}`
+    );
+  }
+
+  if (selectedTokens.size === 0) {
+    throw new Error(
+      `Selected 0 option tokens. Check: (1) underlying symbol passed via --underlying (e.g., "NIFTY 50"), ` +
+        `(2) instruments_cache contains NFO options for ${root} (${optionType}), and ` +
+        `(3) underlying candles exist so ATM strikes can be computed.`
+    );
   }
 
   const fromDate = new Date(from);
