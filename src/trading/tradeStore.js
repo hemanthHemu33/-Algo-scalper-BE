@@ -353,10 +353,13 @@ async function getLiveOrderSnapshotsByTradeIds(tradeIds = []) {
 
 async function upsertDailyRisk(date, patch) {
   const db = getDb();
+  const basePatch = patch && typeof patch === "object" ? { ...patch } : {};
+  delete basePatch.createdAt;
+  delete basePatch.date;
   await db.collection(DAILY_RISK).updateOne(
     { date },
     {
-      $set: { ...patch, updatedAt: new Date() },
+      $set: { ...basePatch, updatedAt: new Date() },
       $setOnInsert: { createdAt: new Date(), date },
     },
     { upsert: true },
@@ -370,10 +373,13 @@ async function getDailyRisk(date) {
 
 async function upsertRiskState(date, patch) {
   const db = getDb();
+  const basePatch = patch && typeof patch === "object" ? { ...patch } : {};
+  delete basePatch.createdAt;
+  delete basePatch.date;
   await db.collection(RISK_STATE).updateOne(
     { date },
     {
-      $set: { ...patch, updatedAt: new Date() },
+      $set: { ...basePatch, updatedAt: new Date() },
       $setOnInsert: { createdAt: new Date(), date },
     },
     { upsert: true },
