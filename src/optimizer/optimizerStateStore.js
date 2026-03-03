@@ -1,6 +1,7 @@
 const { env } = require("../config");
 const { logger } = require("../logger");
 const { getDb } = require("../db");
+const { stripCreatedAt } = require("../utils/stripCreatedAt");
 
 function enabled() {
   return String(env.OPT_STATE_PERSIST || "false") === "true";
@@ -44,13 +45,11 @@ async function writeState(doc) {
     return { ok: false, reason: "db_not_ready" };
   }
 
-  const baseDoc = doc && typeof doc === "object" ? { ...doc } : {};
   // Prevent immutable/conflicting fields from entering $set payload.
   // Mongo rejects updates when the same path appears in both $set and
   // $setOnInsert (e.g. createdAt), which can happen if callers pass back
   // hydrated state docs.
-  delete baseDoc.createdAt;
-  delete baseDoc._id;
+  const baseDoc = stripCreatedAt(doc);
 
   const payload = {
     ...baseDoc,

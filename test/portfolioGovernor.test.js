@@ -29,10 +29,10 @@ class UniqueDateCollection {
     if (update?.$set?.createdAt && update?.$setOnInsert?.createdAt) {
       throw new Error("Updating the path 'createdAt' would create a conflict at 'createdAt'");
     }
-    const prev = this.rows.get(key) || {};
+    const prev = this.rows.get(key) || null;
     const next = {
-      ...prev,
-      ...(update.$setOnInsert || {}),
+      ...(prev || {}),
+      ...(!prev ? (update.$setOnInsert || {}) : {}),
       ...(update.$set || {}),
     };
     this.rows.set(key, next);
@@ -148,6 +148,26 @@ describe("PortfolioGovernor", () => {
 
     await expect(gov.init()).resolves.toBeUndefined();
     await expect(gov.registerTradeOpen({ tradeId: "o1", riskInr: 300 })).resolves.toBeUndefined();
+  });
+
+
+  test("persist upsert is repeat-safe: createdAt is stable and updatedAt advances", async () => {
+    const { gov, collection } = build();
+    await gov.init();
+
+    await gov.canOpenNewTrade();
+    const first = await collection.findOne({ date: "2025-01-15" });
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await gov.canOpenNewTrade();
+    const second = await collection.findOne({ date: "2025-01-15" });
+
+    expect(first).toBeTruthy();
+    expect(second).toBeTruthy();
+    expect(second.createdAt).toEqual(first.createdAt);
+    expect(new Date(second.lastUpdated).getTime()).toBeGreaterThanOrEqual(
+      new Date(first.lastUpdated).getTime(),
+    );
   });
 
   test("persist strips createdAt and _id from $set after loading existing row", async () => {

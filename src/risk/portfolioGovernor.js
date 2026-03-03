@@ -1,4 +1,5 @@
 const { DateTime } = require("luxon");
+const { stripCreatedAt } = require("../utils/stripCreatedAt");
 const { env } = require("../config");
 const { logger: defaultLogger } = require("../logger");
 const { getSessionForDateTime } = require("../market/marketCalendar");
@@ -348,20 +349,34 @@ class PortfolioGovernor {
   async _persist() {
     if (!this.collection || !this.state) return;
     this._normalizeState();
-    const safeState = {
-      ...this.state,
-      lastUpdated: new Date(),
-    };
-    delete safeState.createdAt;
-    delete safeState._id;
-    await this.collection.updateOne(
-      { date: this.state.date },
+    const safeState = stripCreatedAt(
       {
-        $set: safeState,
-        $setOnInsert: { createdAt: new Date() },
+        ...this.state,
+        lastUpdated: new Date(),
       },
-      { upsert: true },
+      { extraKeys: ["date"] },
     );
+
+    try {
+      await this.collection.updateOne(
+        { date: this.state.date },
+        {
+          $set: safeState,
+          $setOnInsert: { createdAt: new Date() },
+        },
+        { upsert: true },
+      );
+    } catch (e) {
+      this.logger.warn(
+        {
+          collection: this.collection?.name || PORTFOLIO_GOVERNOR_COLLECTION,
+          date: this.state?.date,
+          e: e?.message || String(e),
+        },
+        "[portfolio_governor] state persist failed",
+      );
+      throw e;
+    }
     this.logger.debug?.(
       {
         date: this.state.date,
