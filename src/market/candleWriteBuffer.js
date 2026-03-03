@@ -1,5 +1,5 @@
 const { env } = require("../config");
-const { insertManyCandles } = require("./candleStore");
+const { insertManyCandles, collectionName } = require("./candleStore");
 const { logger } = require("../logger");
 const { reportFault } = require("../runtime/errorBus");
 
@@ -109,8 +109,16 @@ class CandleWriteBuffer {
           } catch (e) {
             // Put back and retry later
             arr.unshift(...batch);
+            const sample = batch[0] || {};
             logger.warn(
-              { intervalMin, e: e?.message || String(e) },
+              {
+                collection: collectionName(intervalMin),
+                intervalMin,
+                token: sample?.instrument_token ?? null,
+                tickAt: sample?.ts ?? null,
+                batchSize: batch.length,
+                e: e?.message || String(e),
+              },
               "[candle-writer] bulkWrite failed; will retry",
             );
             return;

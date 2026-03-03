@@ -1,4 +1,5 @@
 const { getDb } = require("../db");
+const { stripCreatedAt } = require("../utils/stripCreatedAt");
 const { logger } = require("../logger");
 const { canTransition, normalizeTradeStatus } = require("./tradeStateMachine");
 
@@ -353,9 +354,7 @@ async function getLiveOrderSnapshotsByTradeIds(tradeIds = []) {
 
 async function upsertDailyRisk(date, patch) {
   const db = getDb();
-  const basePatch = patch && typeof patch === "object" ? { ...patch } : {};
-  delete basePatch.createdAt;
-  delete basePatch.date;
+  const basePatch = stripCreatedAt(patch, { extraKeys: ["date"] });
   await db.collection(DAILY_RISK).updateOne(
     { date },
     {
@@ -373,9 +372,7 @@ async function getDailyRisk(date) {
 
 async function upsertRiskState(date, patch) {
   const db = getDb();
-  const basePatch = patch && typeof patch === "object" ? { ...patch } : {};
-  delete basePatch.createdAt;
-  delete basePatch.date;
+  const basePatch = stripCreatedAt(patch, { extraKeys: ["date"] });
   await db.collection(RISK_STATE).updateOne(
     { date },
     {
