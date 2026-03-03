@@ -39,9 +39,44 @@ async function watchLatestToken({ onToken, onMissing }) {
     ).catch((err) => { reportFault({ code: "TOKENWATCHER_ASYNC", err, message: "[src/tokenWatcher.js] async task failed" }); });
   };
 
+  async function safeInvoke(callback, ...args) {
+    if (typeof callback !== "function") return;
+    try {
+      await callback(...args);
+    } catch (err) {
+      logger.warn(
+        {
+          reason: args?.[2] || args?.[1] || "callback",
+          e: err?.message || String(err),
+        },
+        "[tokenWatcher] callback failed (continuing)",
+      );
+      reportFault({
+        code: "TOKENWATCHER_CATCH",
+        err,
+        message: "[src/tokenWatcher.js] callback failed",
+      });
+    }
+  }
+
   const refreshAndNotify = async (reason = "manual") => {
     if (stopped) return;
-    const res = await readLatestTokenDoc();
+    let res = null;
+    try {
+      res = await readLatestTokenDoc();
+    } catch (err) {
+      logger.warn(
+        { reason, e: err?.message || String(err) },
+        "[tokenWatcher] token read failed (will retry)",
+      );
+      await maybeNotifyMissing({
+        collection: env.TOKENS_COLLECTION,
+        filter: {},
+        reason: "TOKEN_READ_FAILED",
+      });
+      await safeInvoke(onMissing, null, "TOKEN_READ_FAILED");
+      return;
+    }
 
     // No doc / no access token -> keep the process alive and notify operator.
     if (!res?.accessToken) {
@@ -59,10 +94,7 @@ async function watchLatestToken({ onToken, onMissing }) {
         "[tokenWatcher] no usable kite token. Engine will stay up and wait."
       );
       await maybeNotifyMissing(res);
-      if (typeof onMissing === "function") {
-        await onMissing(res?.doc || null, res?.reason || reason);
-      }
-      await onToken(null, res?.doc || null, res?.reason || reason);
+      await safeInvoke(onMissing, res?.doc || null, res?.reason || reason);
       return;
     }
 
@@ -77,7 +109,7 @@ async function watchLatestToken({ onToken, onMissing }) {
       "[token] loaded/updated"
     );
     alert("info", "🔑 Kite token loaded/updated").catch((err) => { reportFault({ code: "TOKENWATCHER_ASYNC", err, message: "[src/tokenWatcher.js] async task failed" }); });
-    await onToken(accessToken, res?.doc || null, reason);
+    await safeInvoke(onToken, accessToken, res?.doc || null, reason);
   };
 
   // Initial refresh should never crash the app now
