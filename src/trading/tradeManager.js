@@ -9346,6 +9346,8 @@ class TradeManager {
       return;
     }
 
+    const instrument = await ensureInstrument(this.kite, token);
+
     const executionBreaker = await this._checkExecutionBreaker(
       this._executionMetricSymbol(instrument),
     );
@@ -9398,8 +9400,6 @@ class TradeManager {
         meta: { conf, minConf, regime: s.regime, side: s.side },
       });
     }
-    const instrument = await ensureInstrument(this.kite, token);
-
     const tick = Number(instrument.tick_size ?? 0.05);
 
     // Normalize side and detect contract type (options)
