@@ -9007,6 +9007,23 @@ class TradeManager {
         prePickCandles = null;
       }
 
+      const baseTradeRiskInr = Number(await this.riskBudget.getTradeRiskInr({
+        confidence: Number(s.confidence),
+        regime: s.regime,
+      }));
+      const dailyRiskSnap = await getDailyRisk(todayKey());
+      const dailyLossCapInr = Number(env.DAILY_MAX_LOSS_INR ?? 0);
+      const bookedDayPnlInr = Number(
+        dailyRiskSnap?.lastTotal ?? dailyRiskSnap?.realizedPnl ?? 0,
+      );
+      const usedLossInr = Math.max(0, -bookedDayPnlInr);
+      const remainingDailyLossInr =
+        dailyLossCapInr > 0 ? Math.max(0, dailyLossCapInr - usedLossInr) : Infinity;
+      const effectiveTradeRiskInr =
+        Number.isFinite(remainingDailyLossInr)
+          ? Math.max(0, Math.min(baseTradeRiskInr, remainingDailyLossInr))
+          : Math.max(0, baseTradeRiskInr);
+
       const picked = await pickOptionContractForSignal({
         kite: this.kite,
         universe: uni,
@@ -9015,10 +9032,7 @@ class TradeManager {
         side: underlyingSide,
         underlyingLtp: routeLtp,
         maxSpreadBpsOverride: policy?.maxSpreadBpsOpt,
-        riskTradeInr: Number(await this.riskBudget.getTradeRiskInr({
-          confidence: Number(s.confidence),
-          regime: s.regime,
-        })),
+        riskTradeInr: effectiveTradeRiskInr,
         stopDistancePts: Number(env.MIN_SL_POINTS ?? env.EXPECTED_SLIPPAGE_POINTS ?? 0),
         expectedSlippagePts: Number(env.EXPECTED_SLIPPAGE_POINTS ?? 0),
         prePickPlan: {
@@ -9057,6 +9071,7 @@ class TradeManager {
             reason: picked?.reason,
             message: picked?.message,
             meta: picked?.meta,
+            riskBudget: { baseTradeRiskInr, effectiveTradeRiskInr, dailyLossCapInr, remainingDailyLossInr },
           },
           "[options] no contract could be picked",
         );
@@ -9182,6 +9197,21 @@ class TradeManager {
       });
     };
 
+    const logFinalGateSummary = ({ blocker, stage, meta }) => {
+      logger.info(
+        {
+          token,
+          strategyId: s?.strategyId || null,
+          side: s?.side || null,
+          confidence: Number(s?.confidence),
+          stage,
+          blocker,
+          blockerMeta: meta || null,
+        },
+        "[gate] final summary",
+      );
+    };
+
     trackDecision("RECEIVED", "signal", "RECEIVED", {
       confidence: s.confidence,
       regime: s.regime,
@@ -9198,6 +9228,7 @@ class TradeManager {
     const dailyState = String(dailyRisk?.state || "RUNNING");
     if (dailyState === "PAUSED") {
       logger.warn({ token, dailyState }, "[trade] blocked (daily paused)");
+      logFinalGateSummary({ blocker: "daily_paused", stage: "daily_risk", meta: { dailyState } });
       return;
     }
 
@@ -9207,6 +9238,7 @@ class TradeManager {
         { token, reason: governorGate.reason, metrics: governorGate.metrics || null },
         "[trade] blocked_by_portfolio_governor",
       );
+      logFinalGateSummary({ blocker: "portfolio_governor", stage: "portfolio", meta: { reason: governorGate.reason, metrics: governorGate.metrics || null } });
       return "blocked_by_portfolio_governor";
     }
 
@@ -9321,17 +9353,20 @@ class TradeManager {
       } else {
         logger.info({ token, reason: check.reason }, "[trade] blocked");
       }
+      logFinalGateSummary({ blocker: check.reason || "risk_gate", stage: "risk_can_trade" });
       return;
     }
 
     const cbState = this._checkCircuitBreakers();
     if (!cbState.ok) {
       logger.warn({ token, cbState }, "[trade] blocked (circuit breaker)");
+      logFinalGateSummary({ blocker: "circuit_breaker", stage: "circuit_breaker", meta: cbState });
       return;
     }
 
     if (this.risk.getKillSwitch()) {
       logger.warn("[trade] blocked (kill switch)");
+      logFinalGateSummary({ blocker: "kill_switch", stage: "risk_can_trade" });
       return;
     }
 
@@ -9343,6 +9378,7 @@ class TradeManager {
         { token, until: this._slippageCooldownUntil },
         "[trade] blocked (slippage cooldown)",
       );
+      logFinalGateSummary({ blocker: "slippage_cooldown", stage: "execution", meta: { until: this._slippageCooldownUntil } });
       return;
     }
 
@@ -9353,6 +9389,7 @@ class TradeManager {
     );
     if (!executionBreaker.ok) {
       logger.warn({ token, executionBreaker }, "[trade] blocked (execution breaker)");
+      logFinalGateSummary({ blocker: "execution_breaker", stage: "execution", meta: executionBreaker });
       return;
     }
 
@@ -9362,6 +9399,7 @@ class TradeManager {
         { strategyId: s.strategyId, until },
         "[trade] blocked (strategy cooldown)",
       );
+      logFinalGateSummary({ blocker: "strategy_cooldown", stage: "strategy", meta: { strategyId: s.strategyId, until } });
       return;
     }
 

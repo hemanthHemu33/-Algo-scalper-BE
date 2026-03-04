@@ -56,6 +56,7 @@ describe('optionsRouter risk fit fallbacks', () => {
     env.OPT_STRICT_ATM_ONLY = false;
     env.OPT_MIN_PREMIUM_NIFTY = 0;
     env.OPT_MAX_PREMIUM_NIFTY = 1000;
+    env.OPT_MIN_DAYS_TO_EXPIRY = 0;
   });
 
   test('high confidence picks lower premium contract that fits risk', async () => {
@@ -64,7 +65,7 @@ describe('optionsRouter risk fit fallbacks', () => {
     getOptionChainSnapshot.mockResolvedValue({ snapshot: { rows } });
     const out = await pickOptionContractForSignal({
       kite: {}, universe: { universe: { contracts: { NIFTY: { instrument_token: 1, tradingsymbol: 'NIFTY 50', name: 'NIFTY' } } } }, underlyingToken: 1, underlyingTradingsymbol: 'NIFTY 50', side: 'BUY', underlyingLtp: 22010,
-      riskTradeInr: 500, stopDistancePts: 12, confidence: 90,
+      riskTradeInr: 500, stopDistancePts: 12, confidence: 90, nowMs: new Date('2026-01-02T10:00:00+05:30').getTime(),
     });
     expect(out.instrument_token).toBe(2);
     expect(out.meta.riskFit.oneLotOverbudgetAllowed).toBe(false);
@@ -76,7 +77,7 @@ describe('optionsRouter risk fit fallbacks', () => {
     getOptionChainSnapshot.mockResolvedValue({ snapshot: { rows } });
     const out = await pickOptionContractForSignal({
       kite: {}, universe: { universe: { contracts: { NIFTY: { instrument_token: 1, tradingsymbol: 'NIFTY 50', name: 'NIFTY' } } } }, underlyingToken: 1, underlyingTradingsymbol: 'NIFTY 50', side: 'BUY', underlyingLtp: 22010,
-      riskTradeInr: 500, stopDistancePts: 11, confidence: 90,
+      riskTradeInr: 500, stopDistancePts: 11, confidence: 90, nowMs: new Date('2026-01-02T10:00:00+05:30').getTime(),
     });
     expect(out.instrument_token).toBe(11);
     expect(out.meta.riskFit.oneLotOverbudgetAllowed).toBe(true);
@@ -88,9 +89,54 @@ describe('optionsRouter risk fit fallbacks', () => {
     getOptionChainSnapshot.mockResolvedValue({ snapshot: { rows } });
     const out = await pickOptionContractForSignal({
       kite: {}, universe: { universe: { contracts: { NIFTY: { instrument_token: 1, tradingsymbol: 'NIFTY 50', name: 'NIFTY' } } } }, underlyingToken: 1, underlyingTradingsymbol: 'NIFTY 50', side: 'BUY', underlyingLtp: 22010,
-      riskTradeInr: 200, stopDistancePts: 12, confidence: 60,
+      riskTradeInr: 200, stopDistancePts: 12, confidence: 60, nowMs: new Date('2026-01-02T10:00:00+05:30').getTime(),
     });
     expect(out.ok).toBe(false);
     expect(out.reason).toBe('NO_CONTRACT_CAN_FIT_RISK');
   });
+});
+
+test('returns NO_VALID_EXPIRY when no policy-allowed expiry exists', async () => {
+  env.OPT_MIN_DAYS_TO_EXPIRY = 2;
+  const rows = [
+    { ...mkRow({ strike: 22000, ltp: 120, token: 31 }), expiry: '2026-01-01' },
+  ];
+  getInstrumentsDump.mockResolvedValue(rows);
+  getOptionChainSnapshot.mockResolvedValue({ snapshot: { rows } });
+  const out = await pickOptionContractForSignal({
+    kite: {},
+    universe: { universe: { contracts: { NIFTY: { instrument_token: 1, tradingsymbol: 'NIFTY 50', name: 'NIFTY' } } } },
+    underlyingToken: 1,
+    underlyingTradingsymbol: 'NIFTY 50',
+    side: 'BUY',
+    underlyingLtp: 22010,
+    riskTradeInr: 500,
+    stopDistancePts: 12,
+    confidence: 70,
+    nowMs: new Date('2026-01-01T10:00:00+05:30').getTime(),
+  });
+  expect(out.ok).toBe(false);
+  expect(out.reason).toBe('NO_VALID_EXPIRY');
+});
+
+test('uses instrument-master lot size when row lot_size is missing', async () => {
+  const rows = [
+    { ...mkRow({ strike: 22000, ltp: 120, token: 41, lotSize: undefined }), lot_size: undefined },
+  ];
+  getInstrumentsDump.mockResolvedValue(rows);
+  getOptionChainSnapshot.mockResolvedValue({ snapshot: { rows } });
+  const out = await pickOptionContractForSignal({
+    kite: {},
+    universe: { universe: { contracts: { NIFTY: { instrument_token: 41, lot_size: 75 } } } },
+    underlyingToken: 1,
+    underlyingTradingsymbol: 'NIFTY 50',
+    side: 'BUY',
+    underlyingLtp: 22010,
+    riskTradeInr: 2000,
+    stopDistancePts: 10,
+    confidence: 70,
+    nowMs: new Date('2026-01-02T10:00:00+05:30').getTime(),
+  });
+  expect(out.lot_size).toBe(75);
+  expect(out.meta.riskFit.selectedRiskPerLot).toBeGreaterThanOrEqual(750);
 });

@@ -7,7 +7,7 @@ const { reportFault } = require("./runtime/errorBus");
 // dotenv is for local development. In production, set env vars in the host (Render/PM2/Docker/K8s).
 // We load .env only if it exists and DOTENV_ENABLED is not "false".
 try {
-  const enabled = String(process.env.DOTENV_ENABLED || "true") !== "false";
+  const enabled = String(process.env.DOTENV_ENABLED || "false") !== "false";
   if (enabled) {
     const dotenvPath =
       process.env.DOTENV_PATH || path.join(process.cwd(), ".env");
@@ -81,7 +81,7 @@ const schema = z.object({
   WS_CHART_INCLUDE_LIVE: z.string().default("true"),
 
   // Local dotenv loader toggle (config.js pre-loads dotenv using process.env too)
-  DOTENV_ENABLED: z.string().optional(),
+  DOTENV_ENABLED: z.string().default("false"),
   DOTENV_PATH: z.string().optional(),
   PROFILE_PRESET: z.string().optional(),
   PROFILE_VALIDATE: z.string().default("true"),
@@ -472,7 +472,7 @@ const schema = z.object({
   // Admin DB purge (dangerous; deletes all docs except keep list)
   DB_PURGE_ENABLED: z.string().default("false"),
   // Comma-separated collections to keep when purging (e.g., "audit_logs,broker_tokens")
-  DB_PURGE_KEEP_COLLECTIONS: z.string().default("audit_logs"),
+  DB_PURGE_KEEP_COLLECTIONS: z.string().default("instruments,optimizer_state"),
 
   // Production hardening
   RECONCILE_INTERVAL_SEC: z.coerce.number().default(60),
