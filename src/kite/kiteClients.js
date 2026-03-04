@@ -3,6 +3,7 @@ const KiteTicker = require("kiteconnect").KiteTicker;
 const { logger } = require("../logger");
 const { halt } = require("../runtime/halt");
 const { reportFault } = require("../runtime/errorBus");
+const { env } = require("../config");
 
 function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
@@ -102,7 +103,12 @@ function wrapKiteConnect(kc) {
       continue;
     }
 
-    const call = (...args) => withRetry(() => orig(...args), { name: m });
+    const call = (...args) =>
+      withRetry(() => orig(...args), {
+        name: m,
+        attempts: Number(env.KITE_RETRY_ATTEMPTS || 4),
+        baseDelayMs: Number(env.KITE_RETRY_BASE_DELAY_MS || 300),
+      });
     if (m === "getOrders" || m === "getPositions" || m === "getMargins") {
       singleFlight(kc, m, call);
       continue;
@@ -114,7 +120,10 @@ function wrapKiteConnect(kc) {
 }
 
 function createKiteConnect({ apiKey, accessToken }) {
-  const kc = new KiteConnect({ api_key: apiKey });
+  const kc = new KiteConnect({
+    api_key: apiKey,
+    timeout: Number(env.KITE_HTTP_TIMEOUT_MS || 15000),
+  });
   kc.setAccessToken(accessToken);
   return wrapKiteConnect(kc);
 }

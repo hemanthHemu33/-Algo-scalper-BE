@@ -174,6 +174,9 @@ const schema = z.object({
   KITE_API_SECRET: z.string().optional(),
   KITE_REDIRECT_SUCCESS_URL: z.string().optional(),
   KITE_ALLOWED_USER_ID: z.string().optional(),
+  KITE_HTTP_TIMEOUT_MS: z.coerce.number().default(15000),
+  KITE_RETRY_ATTEMPTS: z.coerce.number().default(4),
+  KITE_RETRY_BASE_DELAY_MS: z.coerce.number().default(300),
 
   // PATCH-7: Quote guard (throttle + chunk + backoff + circuit breaker)
   QUOTE_GUARD_ENABLED: z.string().default("true"),
