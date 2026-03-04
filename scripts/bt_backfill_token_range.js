@@ -2,12 +2,8 @@
 /**
  * Backfill historical candles for a single instrument token into MongoDB for backtesting.
  *
- * Why this exists:
- * - bt_run.js expects candles to already be present in Mongo (e.g., candles_1m).
- * - bt_prepare_option_universe.js needs UNDERLYING candles to pick ATM strikes.
- *
  * Usage (PowerShell-friendly single line):
- *   node scripts/bt_backfill_token_range.js --token=256265 --from=2026-01-01 --to=2026-01-31T23:59:59+05:30 --interval=1 --chunkDays=10
+ *   npm run bt:backfill -- --token=256265 --from=2026-01-01 --to=2026-01-31T23:59:59+05:30 --interval=1 --chunkDays=10
  */
 
 const { DateTime } = require("luxon");
@@ -27,6 +23,7 @@ function getArg(name, fb = null) {
 }
 
 function toNum(v, fb = null) {
+  if (v === null || v === undefined || v === '') return fb;
   const x = Number(v);
   return Number.isFinite(x) ? x : fb;
 }
@@ -34,6 +31,30 @@ function toNum(v, fb = null) {
 function toDate(v) {
   const d = new Date(v);
   return Number.isFinite(d.getTime()) ? d : null;
+}
+
+function isValidDate(d) {
+  return d instanceof Date && Number.isFinite(d.getTime());
+}
+
+function parseKiteDate(v) {
+  // Kite may return Date objects or ISO strings depending on client version.
+  if (v instanceof Date) return isValidDate(v) ? v : null;
+  const s = String(v || '').trim();
+  if (!s) return null;
+
+  // Native ISO parse
+  const d1 = new Date(s);
+  if (isValidDate(d1)) return d1;
+
+  // Some feeds may send without timezone; interpret as Asia/Kolkata
+  const dt = DateTime.fromFormat(s, "yyyy-LL-dd HH:mm:ss", { zone: "Asia/Kolkata" });
+  if (dt.isValid) return dt.toJSDate();
+
+  const dt2 = DateTime.fromISO(s, { setZone: true });
+  if (dt2.isValid) return dt2.toJSDate();
+
+  return null;
 }
 
 function intervalStr(intervalMin) {
@@ -52,12 +73,17 @@ async function fetchChunk({ kite, token, intervalMin, from, to }) {
   );
 
   const out = [];
+  let bad = 0;
   for (const x of rows || []) {
-    // Kite returns { date, open, high, low, close, volume }
+    const ts = parseKiteDate(x.date);
+    if (!ts) {
+      bad += 1;
+      continue;
+    }
     out.push({
       instrument_token: Number(token),
       interval_min: intervalMin,
-      ts: new Date(x.date),
+      ts,
       open: Number(x.open),
       high: Number(x.high),
       low: Number(x.low),
@@ -65,6 +91,9 @@ async function fetchChunk({ kite, token, intervalMin, from, to }) {
       volume: Number(x.volume ?? 0),
       source: "historical",
     });
+  }
+  if (bad > 0) {
+    console.warn(`[bt_backfill] WARN: skipped ${bad} rows with unparseable date for token=${token}`);
   }
   return out;
 }
@@ -90,7 +119,6 @@ async function main() {
     );
   }
 
-  // DB connect first (so errors show early)
   await connectMongo();
   const db = getDb();
 
@@ -115,11 +143,16 @@ async function main() {
 
   let total = 0;
   while (cursor <= end) {
-    const chunkEnd = DateTime.min(cursor.plus({ days: chunkDays }).endOf("day"), end);
+    const chunkEnd = DateTime.min(
+      cursor.plus({ days: chunkDays }).endOf("day"),
+      end
+    );
+
     const fromIso = cursor.toISO();
     const toIso = chunkEnd.toISO();
 
     console.log(`[bt_backfill] fetching ${fromIso} -> ${toIso}`);
+
     const candles = await fetchChunk({
       kite,
       token,
@@ -132,14 +165,16 @@ async function main() {
     total += candles.length;
 
     console.log(`[bt_backfill] inserted/upserted ${candles.length} (total ${total})`);
+
     cursor = chunkEnd.plus({ minutes: 1 });
   }
 
   const count = await db
     .collection(colName)
     .countDocuments({ instrument_token: Number(token) });
-
-  console.log(`[bt_backfill] done. token=${token} now has ${count} candles in ${colName}`);
+  console.log(
+    `[bt_backfill] done. token=${token} now has ${count} candles in ${colName}`
+  );
 }
 
 main().catch((e) => {

@@ -12,6 +12,8 @@
     "health:critical": "node scripts/health-critical.js",
     "bt:run": "node scripts/bt_run.js",
     "bt:prepare-options": "node scripts/bt_prepare_option_universe.js",
+    "bt:backfill": "node scripts/bt_backfill_token_range.js",
+    "bt:fix-ts": "node scripts/bt_fix_candle_ts.js",
     "test:dynexit": "node scripts/dyn_exit_scenarios.js",
     "test:phase8:live": "node scripts/phase8_live_matrix.js",
     "test": "node --check src/index.js",
@@ -21,8 +23,7 @@
     "test:jest": "jest --runInBand",
     "test:guard-panic-transition": "node scripts/test_guard_failed_panic_transition.js",
     "test:order-rejection-cooldown": "node scripts/test_order_rejection_cooldown_key_regression.js",
-    "investigate:target-reject": "node scripts/investigate_target_reject_reason.js",
-    "bt:backfill": "node scripts/bt_backfill_token_range.js"
+    "investigate:target-reject": "node scripts/investigate_target_reject_reason.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

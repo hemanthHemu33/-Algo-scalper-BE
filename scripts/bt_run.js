@@ -27,14 +27,22 @@ function getArg(name, def = null) {
 }
 
 function n(v, d) {
+  if (v === null || v === undefined || v === '') return d;
   const x = Number(v);
   return Number.isFinite(x) ? x : d;
 }
 
-function toMs(v, fb = null) {
-  const d = new Date(v);
+function parseMs(arg, { tz, endOfDay = false } = {}) {
+  if (!arg) return null;
+  const s = String(arg).trim();
+  // Date-only: interpret in requested tz
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const dt = DateTime.fromISO(s, { zone: tz || 'Asia/Kolkata' });
+    return (endOfDay ? dt.endOf('day') : dt.startOf('day')).toMillis();
+  }
+  const d = new Date(s);
   const t = d.getTime();
-  return Number.isFinite(t) ? t : fb;
+  return Number.isFinite(t) ? t : null;
 }
 
 function pickEnvSnapshot() {
@@ -185,7 +193,6 @@ async function main() {
   const calibrationMode = String(getArg("--calibrationMode", "fixed")).toLowerCase();
   const dataQualityMode = String(getArg("--dataQuality", "strict")).toLowerCase(); // off|warn|strict
   const forceEodExit = String(getArg("--forceEodExit", "false")) === "true";
-  const timezone = String(getArg("--timezone", env.CANDLE_TZ || "Asia/Kolkata"));
   const partialFillProbability = clamp01(n(getArg("--partialFillProbability"), 0.15));
   const minPartialFillRatio = clamp01(n(getArg("--minPartialFillRatio"), 0.35));
   const out = getArg("--out", `bt_result_${Date.now()}.json`);
@@ -205,14 +212,25 @@ async function main() {
 
   const candles = await col.find(q).sort({ ts: 1 }).limit(limit).toArray();
   if (!candles.length) {
-    const colName = collectionName(intervalMin);
-    const fromTxt = fromMs ? new Date(fromMs).toISOString() : '(none)';
-    const toTxt = toMsArg ? new Date(toMsArg).toISOString() : '(none)';
-    throw new Error(
-      `No candles found for query. token=${token} collection=${colName} from=${fromTxt} to=${toTxt}. ` +
-        `Backfill candles first: npm run bt:backfill -- --token=${token} --from=YYYY-MM-DD --to=YYYY-MM-DDT23:59:59+05:30 --interval=${intervalMin}. ` +
-        `Then re-run bt:run. Also verify CANDLE_COLLECTION_PREFIX and that your candles are stored for the same interval.`
-    );
+    const baseQ = { instrument_token: Number(token) };
+    const totalForToken = await col.countDocuments(baseQ);
+    const minDoc = await col.find(baseQ).sort({ ts: 1 }).limit(1).project({ ts: 1 }).toArray();
+    const maxDoc = await col.find(baseQ).sort({ ts: -1 }).limit(1).project({ ts: 1 }).toArray();
+    let rangeCount = null;
+    if (fromMs || toMsArg) {
+      const rq = { ...baseQ, ts: {} };
+      if (fromMs) rq.ts.$gte = new Date(fromMs);
+      if (toMsArg) rq.ts.$lte = new Date(toMsArg);
+      rangeCount = await col.countDocuments(rq);
+    }
+
+    const msg = `No candles found for query. token=${token} collection=${collectionName(intervalMin)} ` +
+      `from=${fromMs ? new Date(fromMs).toISOString() : 'null'} to=${toMsArg ? new Date(toMsArg).toISOString() : 'null'} ` +
+      `limit=${limit}. tokenDocs=${totalForToken} rangeDocs=${rangeCount}. ` +
+      `minTs=${minDoc[0]?.ts ? new Date(minDoc[0].ts).toISOString() : 'null'} ` +
+      `maxTs=${maxDoc[0]?.ts ? new Date(maxDoc[0].ts).toISOString() : 'null'}. ` +
+      `Run: node scripts/bt_debug_candles.js --token=${token} --interval=${intervalMin} --from=${getArg('--from', 'YYYY-MM-DD')} --to=${getArg('--to', 'YYYY-MM-DDT23:59:59+05:30')}`;
+    throw new Error(msg);
   }
   const tokenInstrument = await db.collection("instruments_cache").findOne({ instrument_token: Number(token) });
 
