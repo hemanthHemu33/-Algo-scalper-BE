@@ -53,6 +53,8 @@ function buildPipeline({ kite, tickerCtrl, marketGate, tradeManagerFactory } = {
   // Strategy evaluation must stay limited to the original underlying universe.
   let signalTokensSet = new Set();
   const tickSignalState = new Map();
+  let reconcileInFlight = false;
+  let ocoReconcileInFlight = false;
 
   // Separate queue for runtime subscription/backfills (avoid deadlocks with main serial queue)
   let subsSerial = Promise.resolve();
@@ -276,10 +278,19 @@ function buildPipeline({ kite, tickerCtrl, marketGate, tradeManagerFactory } = {
   }
 
   async function reconcile() {
+    if (reconcileInFlight) {
+      return { ok: false, skipped: true, reason: "in_flight" };
+    }
+
+    reconcileInFlight = true;
     const queued =
       typeof trader.queueReconcile === "function"
         ? trader.queueReconcile(tokensRef, "ticker_reconcile")
         : trader.reconcile(tokensRef);
+    const p = Promise.resolve(queued);
+    p.finally(() => {
+      reconcileInFlight = false;
+    });
     queued
       ?.then?.(() => {
         logger.info("[reconcile] done");
@@ -287,7 +298,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate, tradeManagerFactory } = {
       ?.catch?.((e) => {
         logger.warn({ e: e?.message || String(e) }, "[reconcile] failed");
       });
-    return queued;
+    return p;
   }
 
   async function handleClosedCandles(closed) {
@@ -537,11 +548,25 @@ function buildPipeline({ kite, tickerCtrl, marketGate, tradeManagerFactory } = {
   }
 
   async function ocoReconcile() {
-    if (typeof trader.queuePositionFirstReconcile === "function") {
-      return trader.queuePositionFirstReconcile("oco_timer");
+    if (ocoReconcileInFlight) {
+      return { ok: false, skipped: true, reason: "in_flight" };
     }
-    if (typeof trader.positionFirstReconcile !== "function") return;
-    return trader.positionFirstReconcile("oco_timer");
+
+    ocoReconcileInFlight = true;
+    const queued =
+      typeof trader.queuePositionFirstReconcile === "function"
+        ? trader.queuePositionFirstReconcile("oco_timer")
+        : typeof trader.positionFirstReconcile === "function"
+          ? trader.positionFirstReconcile("oco_timer")
+          : null;
+    const p = Promise.resolve(queued);
+    p.finally(() => {
+      ocoReconcileInFlight = false;
+    });
+    if (queued == null) {
+      return p;
+    }
+    return p;
   }
 
   async function setKillSwitch(enabled, reason) {

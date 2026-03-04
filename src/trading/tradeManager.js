@@ -5654,7 +5654,7 @@ class TradeManager {
       try {
         return await this._handleSignal(signal);
       } finally {
-        if (!this.activeTradeId) this._entryInFlight = false;
+        this._entryInFlight = false;
       }
     }, "signal");
   }
@@ -6701,7 +6701,7 @@ class TradeManager {
     }
 
     try {
-      await this._handleReconcile([]);
+      await this.queueReconcile([], "dyn_exit_reconcile");
     } catch (e) {
       logger.error({ tradeId, e: e?.message || String(e) }, "[dyn_exit] reconcile failed after pnl blind detection");
     }
@@ -14052,6 +14052,7 @@ class TradeManager {
     } catch (err) { reportFault({ code: "TRADING_TRADEMANAGER_CATCH", err, message: "[src/trading/tradeManager.js] caught and continued" }); }
 
     this.activeTradeId = null;
+    this._entryInFlight = false;
     this.recoveredPosition = null;
     this._activeTradeToken = null;
     this._activeTradeSide = null;
