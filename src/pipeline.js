@@ -23,7 +23,7 @@ const { telemetry } = require("./telemetry/signalTelemetry");
 const { marketHealth } = require("./market/marketHealth");
 const { alert } = require("./alerts/alertService");
 
-function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
+function buildPipeline({ kite, tickerCtrl, marketGate, tradeManagerFactory } = {}) {
   const intervals = (env.CANDLE_INTERVALS || "1,3")
     .split(",")
     .map((s) => Number(s.trim()))
@@ -41,7 +41,10 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   candleWriter.start();
 
   const risk = new RiskEngine();
-  const trader = new TradeManager({ kite, riskEngine: risk });
+  const trader =
+    typeof tradeManagerFactory === "function"
+      ? tradeManagerFactory({ kite, riskEngine: risk })
+      : new TradeManager({ kite, riskEngine: risk });
   let finalizerTimer = null;
 
   let tokensRef = [];
@@ -63,7 +66,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
     return subsSerial;
   }
 
-  // ---- SERIAL QUEUE (prevents tick/order/reconcile overlap) ----
+  // ---- SERIAL QUEUE (tick/candle processing only) ----
   let serial = Promise.resolve();
 
   function enqueue(fn, label) {
@@ -273,10 +276,18 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   }
 
   async function reconcile() {
-    return enqueue(async () => {
-      await trader.reconcile(tokensRef);
-      logger.info("[reconcile] done");
-    }, "reconcile");
+    const queued =
+      typeof trader.queueReconcile === "function"
+        ? trader.queueReconcile(tokensRef, "ticker_reconcile")
+        : trader.reconcile(tokensRef);
+    queued
+      ?.then?.(() => {
+        logger.info("[reconcile] done");
+      })
+      ?.catch?.((e) => {
+        logger.warn({ e: e?.message || String(e) }, "[reconcile] failed");
+      });
+    return queued;
   }
 
   async function handleClosedCandles(closed) {
@@ -358,7 +369,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
           reason: signal.reason,
           meta: { confidence: signal.confidence, regime: signal.regime },
         });
-        await trader.onSignal(signal);
+        trader.queueSignal(signal);
       }
     }
   }
@@ -455,7 +466,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
             reason: signal.reason,
             meta: { confidence: signal.confidence, regime: signal.regime },
           });
-          await trader.onSignal(signal);
+          trader.queueSignal(signal);
           tickSignalState.set(key, {
             ...tickSignalState.get(key),
             lastSignalCandleTs: candleTs,
@@ -519,17 +530,18 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   }
 
   async function onOrderUpdate(order) {
-    return enqueue(async () => {
-      await trader.onOrderUpdate(order);
-    }, "onOrderUpdate");
+    if (typeof trader.queueOrderUpdate === "function") {
+      return trader.queueOrderUpdate(order);
+    }
+    return trader.onOrderUpdate(order);
   }
 
   async function ocoReconcile() {
+    if (typeof trader.queuePositionFirstReconcile === "function") {
+      return trader.queuePositionFirstReconcile("oco_timer");
+    }
     if (typeof trader.positionFirstReconcile !== "function") return;
-    return enqueue(
-      () => trader.positionFirstReconcile("oco_timer"),
-      "ocoReconcile",
-    );
+    return trader.positionFirstReconcile("oco_timer");
   }
 
   async function setKillSwitch(enabled, reason) {
