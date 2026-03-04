@@ -7,19 +7,26 @@ const { DateTime } = require("luxon");
 const { env } = require("../src/config");
 const { connectMongo, getDb } = require("../src/db");
 const { collectionName } = require("../src/market/candleStore");
-const { getSessionForDateTime, buildBoundsForToday } = require("../src/market/marketCalendar");
+const {
+  getSessionForDateTime,
+  buildBoundsForToday,
+} = require("../src/market/marketCalendar");
 const { evaluateOnCandles } = require("../src/strategy/replayEngine");
 const { computeDynamicExitPlan } = require("../src/trading/dynamicExitManager");
 const { estimateRoundTripCostInr } = require("../src/trading/costModel");
 const { buildTradePlan } = require("../src/trading/planBuilder");
 const { createBacktestClock } = require("../src/backtest/clock");
-const { buildOptionBacktestProvider } = require("../src/backtest/optionBacktest");
+const {
+  buildOptionBacktestProvider,
+} = require("../src/backtest/optionBacktest");
 const {
   calibrateFromRecentTrades,
   applyExecutionRealism,
   seeded,
 } = require("../src/backtest/executionRealism");
-const { simulateOrderLifecycle } = require("../src/backtest/eventBrokerSimulator");
+const {
+  simulateOrderLifecycle,
+} = require("../src/backtest/eventBrokerSimulator");
 
 function getArg(name, def = null) {
   const hit = process.argv.find((a) => a.startsWith(`${name}=`));
@@ -27,22 +34,16 @@ function getArg(name, def = null) {
 }
 
 function n(v, d) {
-  if (v === null || v === undefined || v === '') return d;
+  if (v === null || v === undefined || v === "") return d;
   const x = Number(v);
   return Number.isFinite(x) ? x : d;
 }
 
-function parseMs(arg, { tz, endOfDay = false } = {}) {
-  if (!arg) return null;
-  const s = String(arg).trim();
-  // Date-only: interpret in requested tz
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    const dt = DateTime.fromISO(s, { zone: tz || 'Asia/Kolkata' });
-    return (endOfDay ? dt.endOf('day') : dt.startOf('day')).toMillis();
-  }
-  const d = new Date(s);
+function toMs(v, fb = null) {
+  if (v === null || v === undefined || v === "") return fb;
+  const d = new Date(v);
   const t = d.getTime();
-  return Number.isFinite(t) ? t : null;
+  return Number.isFinite(t) ? t : fb;
 }
 
 function pickEnvSnapshot() {
@@ -62,7 +63,10 @@ function pickEnvSnapshot() {
   ];
   const out = {};
   for (const [k, v] of Object.entries(process.env)) {
-    if (prefixes.some((p) => k.startsWith(p)) || ["NODE_ENV", "ALLOW_SYNTHETIC_SIGNALS"].includes(k)) {
+    if (
+      prefixes.some((p) => k.startsWith(p)) ||
+      ["NODE_ENV", "ALLOW_SYNTHETIC_SIGNALS"].includes(k)
+    ) {
       out[k] = v;
     }
   }
@@ -77,7 +81,13 @@ function gitHash() {
   }
 }
 
-function resolveExitPrice({ side, candle, stopLoss, targetPrice, conservative = true }) {
+function resolveExitPrice({
+  side,
+  candle,
+  stopLoss,
+  targetPrice,
+  conservative = true,
+}) {
   const high = Number(candle?.high);
   const low = Number(candle?.low);
   const close = Number(candle?.close);
@@ -89,7 +99,11 @@ function resolveExitPrice({ side, candle, stopLoss, targetPrice, conservative = 
     const stopHit = hasStop && Number.isFinite(low) && low <= stopLoss;
     const targetHit = hasTarget && Number.isFinite(high) && high >= targetPrice;
     if (stopHit && targetHit) {
-      return { hit: true, reason: conservative ? "STOPLOSS" : "TARGET", price: conservative ? stopLoss : targetPrice };
+      return {
+        hit: true,
+        reason: conservative ? "STOPLOSS" : "TARGET",
+        price: conservative ? stopLoss : targetPrice,
+      };
     }
     if (stopHit) return { hit: true, reason: "STOPLOSS", price: stopLoss };
     if (targetHit) return { hit: true, reason: "TARGET", price: targetPrice };
@@ -97,7 +111,11 @@ function resolveExitPrice({ side, candle, stopLoss, targetPrice, conservative = 
     const stopHit = hasStop && Number.isFinite(high) && high >= stopLoss;
     const targetHit = hasTarget && Number.isFinite(low) && low <= targetPrice;
     if (stopHit && targetHit) {
-      return { hit: true, reason: conservative ? "STOPLOSS" : "TARGET", price: conservative ? stopLoss : targetPrice };
+      return {
+        hit: true,
+        reason: conservative ? "STOPLOSS" : "TARGET",
+        price: conservative ? stopLoss : targetPrice,
+      };
     }
     if (stopHit) return { hit: true, reason: "STOPLOSS", price: stopLoss };
     if (targetHit) return { hit: true, reason: "TARGET", price: targetPrice };
@@ -128,14 +146,19 @@ function buildBacktestTradePlan({
   const regimeMeta = pendingEntry?.sig?.regimeMeta || null;
   const atr = Number(regimeMeta?.atr);
   const close = Number(regimeMeta?.close);
-  const atrPctUnderlying = Number.isFinite(atr) && Number.isFinite(close) && close > 0 ? (atr / close) * 100 : null;
+  const atrPctUnderlying =
+    Number.isFinite(atr) && Number.isFinite(close) && close > 0
+      ? (atr / close) * 100
+      : null;
 
   const isOpt = String(mode).toUpperCase() === "OPT";
   const optionMeta = isOpt
     ? {
         strategyStyle: pendingEntry?.sig?.strategyStyle || null,
-        optionType: pendingEntry?.selectedContract?.snapshot?.optionType || null,
-        strike: Number(pendingEntry?.selectedContract?.selected?.strike ?? 0) || null,
+        optionType:
+          pendingEntry?.selectedContract?.snapshot?.optionType || null,
+        strike:
+          Number(pendingEntry?.selectedContract?.selected?.strike ?? 0) || null,
         expiry: pendingEntry?.selectedContract?.selected?.expiry || null,
         delta: Number(pendingEntry?.selectedContract?.selected?.greeks?.delta),
         gamma: Number(pendingEntry?.selectedContract?.selected?.greeks?.gamma),
@@ -144,7 +167,10 @@ function buildBacktestTradePlan({
 
   const premiumCandles =
     isOpt && pendingEntry?.selectedContract?.selectedToken
-      ? optionProvider?.getCandlesUpToTs?.(pendingEntry.selectedContract.selectedToken, baseCandle.ts) || null
+      ? optionProvider?.getCandlesUpToTs?.(
+          pendingEntry.selectedContract.selectedToken,
+          baseCandle.ts,
+        ) || null
       : null;
 
   const plan = buildTradePlan({
@@ -159,7 +185,9 @@ function buildBacktestTradePlan({
     atrPeriod: Number(env.EXPECTED_MOVE_ATR_PERIOD ?? 14),
     optionMeta,
     entryPremium: isOpt ? Number(tradedCandle?.close) : null,
-    premiumTick: Number(pendingEntry?.selectedContract?.selected?.instrument?.tick_size ?? 0.05),
+    premiumTick: Number(
+      pendingEntry?.selectedContract?.selected?.instrument?.tick_size ?? 0.05,
+    ),
     atrPctUnderlying,
     nowTs: new Date(baseCandle.ts).getTime(),
   });
@@ -179,7 +207,8 @@ async function main() {
   const slPct = Math.max(0.1, n(getArg("--slPct"), 0.7));
   const slipBps = Math.max(0, n(getArg("--slippageBps"), 3));
   const seed = n(getArg("--seed", "42"), 42);
-  const dynamicContracts = String(getArg("--dynamicContracts", "false")) === "true";
+  const dynamicContracts =
+    String(getArg("--dynamicContracts", "false")) === "true";
   const optionType = String(getArg("--optionType", "CE")).toUpperCase();
   const scanSteps = Math.max(0, n(getArg("--scanSteps"), 2));
   const strikeStep = Math.max(1, n(getArg("--strikeStep"), 50));
@@ -190,14 +219,24 @@ async function main() {
   const execRealism = String(getArg("--execRealism", "true")) === "true";
   const eventBroker = String(getArg("--eventBroker", "true")) === "true";
   const calibrationDays = Math.max(1, n(getArg("--calibrationDays"), 5));
-  const calibrationMode = String(getArg("--calibrationMode", "fixed")).toLowerCase();
-  const dataQualityMode = String(getArg("--dataQuality", "strict")).toLowerCase(); // off|warn|strict
+  const calibrationMode = String(
+    getArg("--calibrationMode", "fixed"),
+  ).toLowerCase();
+  const dataQualityMode = String(
+    getArg("--dataQuality", "strict"),
+  ).toLowerCase(); // off|warn|strict
   const forceEodExit = String(getArg("--forceEodExit", "false")) === "true";
-  const partialFillProbability = clamp01(n(getArg("--partialFillProbability"), 0.15));
+  const timezone = String(
+    getArg("--timezone", env.CANDLE_TZ || "Asia/Kolkata"),
+  );
+  const partialFillProbability = clamp01(
+    n(getArg("--partialFillProbability"), 0.15),
+  );
   const minPartialFillRatio = clamp01(n(getArg("--minPartialFillRatio"), 0.35));
   const out = getArg("--out", `bt_result_${Date.now()}.json`);
 
-  if (!Number.isFinite(token)) throw new Error("Missing --token=<instrument_token>");
+  if (!Number.isFinite(token))
+    throw new Error("Missing --token=<instrument_token>");
 
   await connectMongo();
   const db = getDb();
@@ -212,35 +251,54 @@ async function main() {
 
   const candles = await col.find(q).sort({ ts: 1 }).limit(limit).toArray();
   if (!candles.length) {
-    const baseQ = { instrument_token: Number(token) };
-    const totalForToken = await col.countDocuments(baseQ);
-    const minDoc = await col.find(baseQ).sort({ ts: 1 }).limit(1).project({ ts: 1 }).toArray();
-    const maxDoc = await col.find(baseQ).sort({ ts: -1 }).limit(1).project({ ts: 1 }).toArray();
-    let rangeCount = null;
-    if (fromMs || toMsArg) {
-      const rq = { ...baseQ, ts: {} };
-      if (fromMs) rq.ts.$gte = new Date(fromMs);
-      if (toMsArg) rq.ts.$lte = new Date(toMsArg);
-      rangeCount = await col.countDocuments(rq);
+    const colName = collectionName(intervalMin);
+    const fromTxt = fromMs ? new Date(fromMs).toISOString() : "(none)";
+    const toTxt = toMsArg ? new Date(toMsArg).toISOString() : "(none)";
+
+    // Extra diagnostics: if token exists but ts-range query returns 0, ts type is likely wrong (string/number)
+    const any = await col.findOne(
+      { instrument_token: Number(token) },
+      { projection: { ts: 1 }, sort: { ts: 1 } },
+    );
+
+    if (any) {
+      const tsVal = any.ts;
+      const tsType = tsVal instanceof Date ? "date" : typeof tsVal;
+      const tsTxt =
+        tsVal && tsVal.toISOString ? tsVal.toISOString() : String(tsVal);
+      throw new Error(
+        `No candles found for ts-range query. token=${token} collection=${colName} from=${fromTxt} to=${toTxt}. ` +
+          `But documents DO exist for this token (sample ts=${tsTxt}, type=${tsType}). ` +
+          `If ts is stored as a STRING/NUMBER, Mongo date range filters will not match. ` +
+          `Fix it by running: npm run bt:fix-ts -- --token=${token} --interval=${intervalMin}.`,
+      );
     }
 
-    const msg = `No candles found for query. token=${token} collection=${collectionName(intervalMin)} ` +
-      `from=${fromMs ? new Date(fromMs).toISOString() : 'null'} to=${toMsArg ? new Date(toMsArg).toISOString() : 'null'} ` +
-      `limit=${limit}. tokenDocs=${totalForToken} rangeDocs=${rangeCount}. ` +
-      `minTs=${minDoc[0]?.ts ? new Date(minDoc[0].ts).toISOString() : 'null'} ` +
-      `maxTs=${maxDoc[0]?.ts ? new Date(maxDoc[0].ts).toISOString() : 'null'}. ` +
-      `Run: node scripts/bt_debug_candles.js --token=${token} --interval=${intervalMin} --from=${getArg('--from', 'YYYY-MM-DD')} --to=${getArg('--to', 'YYYY-MM-DDT23:59:59+05:30')}`;
-    throw new Error(msg);
+    throw new Error(
+      `No candles found for query. token=${token} collection=${colName} from=${fromTxt} to=${toTxt}. ` +
+        `Backfill candles first: npm run bt:backfill -- --token=${token} --from=YYYY-MM-DD --to=YYYY-MM-DDT23:59:59+05:30 --interval=${intervalMin}. ` +
+        `Then re-run bt:run. Also verify CANDLE_COLLECTION_PREFIX and that your candles are stored for the same interval.`,
+    );
   }
-  const tokenInstrument = await db.collection("instruments_cache").findOne({ instrument_token: Number(token) });
+  const tokenInstrument = await db
+    .collection("instruments_cache")
+    .findOne({ instrument_token: Number(token) });
 
-  const dataQuality = dataQualityMode === "off" ? null : assessDataQuality({ candles, intervalMin, timezone });
+  const dataQuality =
+    dataQualityMode === "off"
+      ? null
+      : assessDataQuality({ candles, intervalMin, timezone });
   const dataIssues = Number(dataQuality?.summary?.totalIssues ?? 0);
   if (dataIssues > 0 && dataQualityMode === "strict") {
-    throw new Error(`Data quality validation failed (${dataIssues} issues). Re-run with --dataQuality=warn to inspect.`);
+    throw new Error(
+      `Data quality validation failed (${dataIssues} issues). Re-run with --dataQuality=warn to inspect.`,
+    );
   }
   if (dataIssues > 0 && dataQualityMode === "warn") {
-    console.warn("[bt_run] data quality guardrails warnings", dataQuality.summary);
+    console.warn(
+      "[bt_run] data quality guardrails warnings",
+      dataQuality.summary,
+    );
   }
 
   const optionProvider =
@@ -261,7 +319,10 @@ async function main() {
 
   const execCalibration = execRealism
     ? calibrationMode === "recent"
-      ? { ...(await calibrateFromRecentTrades({ db, days: calibrationDays })), source: "recent_trades" }
+      ? {
+          ...(await calibrateFromRecentTrades({ db, days: calibrationDays })),
+          source: "recent_trades",
+        }
       : buildCalibrationFallback()
     : null;
   const rng = seeded(seed);
@@ -288,7 +349,10 @@ async function main() {
       const baseCandle = candle;
       const tradedCandle =
         mode === "OPT" && pendingEntry.selectedContract?.selectedToken
-          ? optionProvider?.getCandleAtTs?.(pendingEntry.selectedContract.selectedToken, baseCandle.ts) || null
+          ? optionProvider?.getCandleAtTs?.(
+              pendingEntry.selectedContract.selectedToken,
+              baseCandle.ts,
+            ) || null
           : baseCandle;
       const rawEntry = Number(tradedCandle?.close);
       if (Number.isFinite(rawEntry) && rawEntry > 0) {
@@ -299,7 +363,10 @@ async function main() {
           minPartialFillRatio,
           eventBroker,
           latencyBars: 0,
-          tickSize: Number(pendingEntry.selectedContract?.selected?.instrument?.tick_size ?? 0.05),
+          tickSize: Number(
+            pendingEntry.selectedContract?.selected?.instrument?.tick_size ??
+              0.05,
+          ),
         };
         const exec = execRealism
           ? eventBroker
@@ -326,7 +393,10 @@ async function main() {
         const filledQty = Number(exec?.filledQty ?? pendingEntry.qty);
         if (filledQty > 0 && Number.isFinite(entryPrice) && entryPrice > 0) {
           const fallbackRiskPts = Math.max(0.05, entryPrice * (slPct / 100));
-          const fallbackStopLoss = pendingEntry.side === "BUY" ? entryPrice - fallbackRiskPts : entryPrice + fallbackRiskPts;
+          const fallbackStopLoss =
+            pendingEntry.side === "BUY"
+              ? entryPrice - fallbackRiskPts
+              : entryPrice + fallbackRiskPts;
           const fallbackTargetPrice =
             pendingEntry.side === "BUY"
               ? entryPrice + rrTarget * fallbackRiskPts
@@ -341,14 +411,18 @@ async function main() {
             optionProvider,
             tradedCandle,
           });
-          const stopLoss = Number.isFinite(Number(plan?.stopLoss)) ? Number(plan.stopLoss) : fallbackStopLoss;
+          const stopLoss = Number.isFinite(Number(plan?.stopLoss))
+            ? Number(plan.stopLoss)
+            : fallbackStopLoss;
           const targetEnabled = isTargetEnabledForMode(mode);
           const targetPrice = targetEnabled
             ? Number.isFinite(Number(plan?.targetPrice))
               ? Number(plan.targetPrice)
               : fallbackTargetPrice
             : null;
-          const plannedRr = Number.isFinite(Number(plan?.rr)) ? Number(plan.rr) : rrTarget;
+          const plannedRr = Number.isFinite(Number(plan?.rr))
+            ? Number(plan.rr)
+            : rrTarget;
 
           openTrade = {
             side: pendingEntry.side,
@@ -374,14 +448,20 @@ async function main() {
             confidence: Number(pendingEntry.sig.confidence ?? 0),
             signalReason: pendingEntry.sig.reason || null,
             mode,
-            contractToken: pendingEntry.selectedContract?.selectedToken || Number(token),
+            contractToken:
+              pendingEntry.selectedContract?.selectedToken || Number(token),
             optionSnapshot: pendingEntry.selectedContract?.snapshot || null,
             option_meta:
               mode === "OPT"
                 ? {
                     optType: optionType,
-                    strike: Number(pendingEntry.selectedContract?.selected?.strike ?? 0) || null,
-                    expiry: pendingEntry.selectedContract?.selected?.expiryISO || null,
+                    strike:
+                      Number(
+                        pendingEntry.selectedContract?.selected?.strike ?? 0,
+                      ) || null,
+                    expiry:
+                      pendingEntry.selectedContract?.selected?.expiryISO ||
+                      null,
                     underlyingToken: Number(token),
                   }
                 : null,
@@ -407,7 +487,10 @@ async function main() {
       const underlyingCandle = candle;
       const tradedCandle =
         mode === "OPT" && openTrade?.contractToken
-          ? optionProvider?.getCandleAtTs?.(openTrade.contractToken, underlyingCandle.ts) || null
+          ? optionProvider?.getCandleAtTs?.(
+              openTrade.contractToken,
+              underlyingCandle.ts,
+            ) || null
           : underlyingCandle;
       const managedCandles =
         mode === "OPT" && openTrade?.contractToken
@@ -430,11 +513,14 @@ async function main() {
         underlyingLtp: Number(underlyingCandle.close),
       });
 
-      if (plan?.tradePatch && Object.keys(plan.tradePatch).length) Object.assign(openTrade, plan.tradePatch);
+      if (plan?.tradePatch && Object.keys(plan.tradePatch).length)
+        Object.assign(openTrade, plan.tradePatch);
       openTrade.updatedAt = new Date(nowMs);
 
-      if (Number.isFinite(Number(plan?.sl?.stopLoss))) openTrade.stopLoss = Number(plan.sl.stopLoss);
-      if (Number.isFinite(Number(plan?.target?.targetPrice))) openTrade.targetPrice = Number(plan.target.targetPrice);
+      if (Number.isFinite(Number(plan?.sl?.stopLoss)))
+        openTrade.stopLoss = Number(plan.sl.stopLoss);
+      if (Number.isFinite(Number(plan?.target?.targetPrice)))
+        openTrade.targetPrice = Number(plan.target.targetPrice);
 
       const pricePathCandle =
         tradedCandle ||
@@ -452,13 +538,17 @@ async function main() {
         side: openTrade.side,
         candle: pricePathCandle,
         stopLoss: openTrade.stopLoss,
-        targetPrice: isTargetEnabledForMode(mode) ? openTrade.targetPrice : null,
+        targetPrice: isTargetEnabledForMode(mode)
+          ? openTrade.targetPrice
+          : null,
         conservative: true,
       });
 
       if (!pendingExit) {
         const forceExit = plan?.action?.exitNow;
-        const eodBoundary = forceEodExit ? evaluateEodBoundary({ candles, idx: i, intervalMin, timezone }) : null;
+        const eodBoundary = forceEodExit
+          ? evaluateEodBoundary({ candles, idx: i, intervalMin, timezone })
+          : null;
         if (pathExit.hit || forceExit || eodBoundary?.shouldExitNow) {
           const basePx = forceExit
             ? Number.isFinite(ltp) && ltp > 0
@@ -471,7 +561,13 @@ async function main() {
                 ? ltp
                 : Number(openTrade.lastLtp ?? underlyingCandle.close)
               : basePx;
-          const latencyBars = Math.max(0, Math.round((execCalibration?.avgFillLatencyMs || 0) / (intervalMin * 60 * 1000)));
+          const latencyBars = Math.max(
+            0,
+            Math.round(
+              (execCalibration?.avgFillLatencyMs || 0) /
+                (intervalMin * 60 * 1000),
+            ),
+          );
           pendingExit = {
             executeAtIdx: i + latencyBars,
             basePx: exitBasePx,
@@ -517,10 +613,17 @@ async function main() {
           : null;
 
         const exitPrice = Number(exec?.avgFillPrice ?? pendingExit.basePx);
-        const filledQty = Math.max(0, Math.min(Number(openTrade.qty ?? 0), Number(exec?.filledQty ?? openTrade.qty)));
+        const filledQty = Math.max(
+          0,
+          Math.min(
+            Number(openTrade.qty ?? 0),
+            Number(exec?.filledQty ?? openTrade.qty),
+          ),
+        );
         if (filledQty > 0 && Number.isFinite(exitPrice)) {
           const signed = openTrade.side === "BUY" ? 1 : -1;
-          const grossPnl = (exitPrice - openTrade.entryPrice) * filledQty * signed;
+          const grossPnl =
+            (exitPrice - openTrade.entryPrice) * filledQty * signed;
           const costs = estimateRoundTripCostInr({
             entryPrice: (openTrade.entryPrice + exitPrice) / 2,
             qty: filledQty,
@@ -531,9 +634,13 @@ async function main() {
           const netPnl = grossPnl - Number(costs.estCostInr ?? 0);
 
           openTrade.qty -= filledQty;
-          openTrade.realizedGrossPnl = Number(openTrade.realizedGrossPnl ?? 0) + grossPnl;
-          openTrade.realizedCostInr = Number(openTrade.realizedCostInr ?? 0) + Number(costs.estCostInr ?? 0);
-          openTrade.realizedNetPnl = Number(openTrade.realizedNetPnl ?? 0) + netPnl;
+          openTrade.realizedGrossPnl =
+            Number(openTrade.realizedGrossPnl ?? 0) + grossPnl;
+          openTrade.realizedCostInr =
+            Number(openTrade.realizedCostInr ?? 0) +
+            Number(costs.estCostInr ?? 0);
+          openTrade.realizedNetPnl =
+            Number(openTrade.realizedNetPnl ?? 0) + netPnl;
           openTrade.exitFills.push({
             ts: underlyingCandle.ts,
             qty: filledQty,
@@ -545,7 +652,11 @@ async function main() {
           equity += netPnl;
           peak = Math.max(peak, equity);
           maxDD = Math.min(maxDD, equity - peak);
-          equityCurve.push({ ts: underlyingCandle.ts, equity, drawdown: equity - peak });
+          equityCurve.push({
+            ts: underlyingCandle.ts,
+            equity,
+            drawdown: equity - peak,
+          });
 
           if (openTrade.qty <= 0) {
             const finalizedTrade = { ...openTrade };
@@ -593,9 +704,19 @@ async function main() {
             })
           : null;
 
-      if (mode === "OPT" && dynamicContracts && !selectedContract?.selectedToken) continue;
+      if (
+        mode === "OPT" &&
+        dynamicContracts &&
+        !selectedContract?.selectedToken
+      )
+        continue;
 
-      const latencyBars = Math.max(0, Math.round((execCalibration?.avgFillLatencyMs || 0) / (intervalMin * 60 * 1000)));
+      const latencyBars = Math.max(
+        0,
+        Math.round(
+          (execCalibration?.avgFillLatencyMs || 0) / (intervalMin * 60 * 1000),
+        ),
+      );
       pendingEntry = {
         executeAtIdx: i + latencyBars,
         signalTs: candle.ts,
@@ -609,7 +730,9 @@ async function main() {
 
   if (openTrade && forceEodExit) {
     const last = candles[candles.length - 1] || null;
-    const exitPrice = Number(last?.close ?? openTrade.lastLtp ?? openTrade.entryPrice);
+    const exitPrice = Number(
+      last?.close ?? openTrade.lastLtp ?? openTrade.entryPrice,
+    );
     const filledQty = Number(openTrade.qty ?? 0);
     if (filledQty > 0 && Number.isFinite(exitPrice) && exitPrice > 0) {
       const signed = openTrade.side === "BUY" ? 1 : -1;
@@ -626,7 +749,11 @@ async function main() {
       equity += netPnl;
       peak = Math.max(peak, equity);
       maxDD = Math.min(maxDD, equity - peak);
-      equityCurve.push({ ts: last?.ts || new Date(), equity, drawdown: equity - peak });
+      equityCurve.push({
+        ts: last?.ts || new Date(),
+        equity,
+        drawdown: equity - peak,
+      });
 
       const finalizedTrade = { ...openTrade };
       delete finalizedTrade._managedCandles;
@@ -665,7 +792,18 @@ async function main() {
     seed,
     gitHash: gitHash(),
     configSnapshot: pickEnvSnapshot(),
-    params: { warmup, qty, rrTarget, slPct, slippageBps: slipBps, eventBroker, calibrationMode, dataQualityMode, forceEodExit, timezone },
+    params: {
+      warmup,
+      qty,
+      rrTarget,
+      slPct,
+      slippageBps: slipBps,
+      eventBroker,
+      calibrationMode,
+      dataQualityMode,
+      forceEodExit,
+      timezone,
+    },
     dataQuality: dataQuality || { mode: "off" },
     phase3: {
       mode,
@@ -719,8 +857,18 @@ async function main() {
 function aggregatePerDay(trades) {
   const map = new Map();
   for (const t of trades || []) {
-    const key = new Date(t.exitTs || t.entryTs || Date.now()).toISOString().slice(0, 10);
-    if (!map.has(key)) map.set(key, { day: key, trades: 0, wins: 0, netPnl: 0, grossPnl: 0, costs: 0 });
+    const key = new Date(t.exitTs || t.entryTs || Date.now())
+      .toISOString()
+      .slice(0, 10);
+    if (!map.has(key))
+      map.set(key, {
+        day: key,
+        trades: 0,
+        wins: 0,
+        netPnl: 0,
+        grossPnl: 0,
+        costs: 0,
+      });
     const row = map.get(key);
     row.trades += 1;
     if (Number(t.netPnl) > 0) row.wins += 1;
@@ -728,20 +876,27 @@ function aggregatePerDay(trades) {
     row.grossPnl += Number(t.grossPnl ?? 0);
     row.costs += Number(t.estCostInr ?? 0);
   }
-  return Array.from(map.values()).map((r) => ({ ...r, winRate: r.trades ? (r.wins / r.trades) * 100 : 0 }));
+  return Array.from(map.values()).map((r) => ({
+    ...r,
+    winRate: r.trades ? (r.wins / r.trades) * 100 : 0,
+  }));
 }
 
 function aggregatePerStrategy(trades) {
   const map = new Map();
   for (const t of trades || []) {
-    const key = String(t.strategyId || 'UNKNOWN');
-    if (!map.has(key)) map.set(key, { strategyId: key, trades: 0, wins: 0, netPnl: 0 });
+    const key = String(t.strategyId || "UNKNOWN");
+    if (!map.has(key))
+      map.set(key, { strategyId: key, trades: 0, wins: 0, netPnl: 0 });
     const row = map.get(key);
     row.trades += 1;
     if (Number(t.netPnl) > 0) row.wins += 1;
     row.netPnl += Number(t.netPnl ?? 0);
   }
-  return Array.from(map.values()).map((r) => ({ ...r, winRate: r.trades ? (r.wins / r.trades) * 100 : 0 }));
+  return Array.from(map.values()).map((r) => ({
+    ...r,
+    winRate: r.trades ? (r.wins / r.trades) * 100 : 0,
+  }));
 }
 
 function clamp01(v) {
@@ -775,7 +930,12 @@ function assessDataQuality({ candles, intervalMin, timezone }) {
     const ts = new Date(cur?.ts).getTime();
     const dt = DateTime.fromJSDate(new Date(cur.ts), { zone: timezone });
 
-    if (!dt.isValid || dt.second !== 0 || dt.millisecond !== 0 || dt.minute % intervalMin !== 0) {
+    if (
+      !dt.isValid ||
+      dt.second !== 0 ||
+      dt.millisecond !== 0 ||
+      dt.minute % intervalMin !== 0
+    ) {
       issues.intervalAlignment.push({ idx: i, ts: cur?.ts || null });
     }
 
@@ -789,7 +949,11 @@ function assessDataQuality({ candles, intervalMin, timezone }) {
       closeTs.toMillis() >= open.toMillis() &&
       closeTs.toMillis() <= close.toMillis();
     if (!inSession) {
-      issues.sessionBoundary.push({ idx: i, ts: cur?.ts || null, dayKey: session.dayKey });
+      issues.sessionBoundary.push({
+        idx: i,
+        ts: cur?.ts || null,
+        dayKey: session.dayKey,
+      });
     }
 
     if (i === 0) continue;
@@ -797,13 +961,27 @@ function assessDataQuality({ candles, intervalMin, timezone }) {
     const prevTs = new Date(prev?.ts).getTime();
     const diff = ts - prevTs;
     if (!Number.isFinite(ts) || !Number.isFinite(prevTs) || diff <= 0) {
-      issues.nonMonotonicTs.push({ prevIdx: i - 1, idx: i, prevTs: prev?.ts || null, ts: cur?.ts || null });
+      issues.nonMonotonicTs.push({
+        prevIdx: i - 1,
+        idx: i,
+        prevTs: prev?.ts || null,
+        ts: cur?.ts || null,
+      });
       continue;
     }
     const prevDt = DateTime.fromJSDate(new Date(prev.ts), { zone: timezone });
-    const sameSessionDay = prevDt.isValid && dt.isValid && prevDt.toFormat("yyyy-LL-dd") === dt.toFormat("yyyy-LL-dd");
+    const sameSessionDay =
+      prevDt.isValid &&
+      dt.isValid &&
+      prevDt.toFormat("yyyy-LL-dd") === dt.toFormat("yyyy-LL-dd");
     if (sameSessionDay && diff > intervalMs) {
-      issues.gaps.push({ prevIdx: i - 1, idx: i, prevTs: prev?.ts || null, ts: cur?.ts || null, gapMs: diff - intervalMs });
+      issues.gaps.push({
+        prevIdx: i - 1,
+        idx: i,
+        prevTs: prev?.ts || null,
+        ts: cur?.ts || null,
+        gapMs: diff - intervalMs,
+      });
     }
   }
 
@@ -837,15 +1015,22 @@ function evaluateEodBoundary({ candles, idx, intervalMin, timezone }) {
 
   const curDt = DateTime.fromJSDate(new Date(cur.ts), { zone: timezone });
   const nextDt = DateTime.fromJSDate(new Date(next.ts), { zone: timezone });
-  if (!curDt.isValid || !nextDt.isValid) return { shouldExitNow: false, reason: null };
+  if (!curDt.isValid || !nextDt.isValid)
+    return { shouldExitNow: false, reason: null };
 
-  const curSession = getSessionForDateTime(curDt.plus({ minutes: intervalMin }));
+  const curSession = getSessionForDateTime(
+    curDt.plus({ minutes: intervalMin }),
+  );
   const curDay = curSession.dayKey;
-  const nextDay = getSessionForDateTime(nextDt.plus({ minutes: intervalMin })).dayKey;
-  if (curDay !== nextDay) return { shouldExitNow: true, reason: "FORCE_EOD_SESSION_BOUNDARY" };
+  const nextDay = getSessionForDateTime(
+    nextDt.plus({ minutes: intervalMin }),
+  ).dayKey;
+  if (curDay !== nextDay)
+    return { shouldExitNow: true, reason: "FORCE_EOD_SESSION_BOUNDARY" };
 
   const diff = nextDt.toMillis() - curDt.toMillis();
-  if (diff > intervalMin * 60 * 1000) return { shouldExitNow: true, reason: "FORCE_EOD_GAP_BOUNDARY" };
+  if (diff > intervalMin * 60 * 1000)
+    return { shouldExitNow: true, reason: "FORCE_EOD_GAP_BOUNDARY" };
 
   return { shouldExitNow: false, reason: null };
 }
@@ -854,33 +1039,66 @@ function upsertOptionManagedCandles({ optionProvider, token, ts, trade }) {
   if (!trade || !Number.isFinite(Number(token))) return [];
   if (!Array.isArray(trade._managedCandles)) {
     trade._managedCandles = optionProvider?.getCandlesUpToTs?.(token, ts) || [];
-    const lastTs = trade._managedCandles.length ? new Date(trade._managedCandles[trade._managedCandles.length - 1].ts).getTime() : null;
+    const lastTs = trade._managedCandles.length
+      ? new Date(
+          trade._managedCandles[trade._managedCandles.length - 1].ts,
+        ).getTime()
+      : null;
     trade._lastManagedTs = Number.isFinite(lastTs) ? lastTs : null;
     return trade._managedCandles;
   }
 
   const next = optionProvider?.getCandleAtTs?.(token, ts) || null;
   const nextTs = new Date(ts).getTime();
-  if (next && Number.isFinite(nextTs) && (!Number.isFinite(trade._lastManagedTs) || nextTs > trade._lastManagedTs)) {
+  if (
+    next &&
+    Number.isFinite(nextTs) &&
+    (!Number.isFinite(trade._lastManagedTs) || nextTs > trade._lastManagedTs)
+  ) {
     trade._managedCandles.push(next);
     trade._lastManagedTs = nextTs;
   }
   return trade._managedCandles;
 }
 
-function instrumentFromContract({ fallbackToken, fallbackInstrument, selected, mode }) {
+function instrumentFromContract({
+  fallbackToken,
+  fallbackInstrument,
+  selected,
+  mode,
+}) {
   const selectedInstrument = selected?.instrument || null;
   const inferredMode = String(mode || "").toUpperCase();
-  const token = Number(selected?.token ?? fallbackInstrument?.instrument_token ?? fallbackToken);
-  const tick = Number(selectedInstrument?.tick_size ?? fallbackInstrument?.tick_size ?? 0.05);
-  const lot = Number(selectedInstrument?.lot_size ?? fallbackInstrument?.lot_size ?? 1);
+  const token = Number(
+    selected?.token ?? fallbackInstrument?.instrument_token ?? fallbackToken,
+  );
+  const tick = Number(
+    selectedInstrument?.tick_size ?? fallbackInstrument?.tick_size ?? 0.05,
+  );
+  const lot = Number(
+    selectedInstrument?.lot_size ?? fallbackInstrument?.lot_size ?? 1,
+  );
   const tradingsymbol =
-    String(selectedInstrument?.tradingsymbol || fallbackInstrument?.tradingsymbol || "").toUpperCase() || null;
+    String(
+      selectedInstrument?.tradingsymbol ||
+        fallbackInstrument?.tradingsymbol ||
+        "",
+    ).toUpperCase() || null;
   const segmentRaw =
-    String(selectedInstrument?.segment || fallbackInstrument?.segment || "").toUpperCase() ||
-    (inferredMode === "OPT" ? "NFO-OPT" : inferredMode === "FUT" ? "NFO-FUT" : "NSE");
+    String(
+      selectedInstrument?.segment || fallbackInstrument?.segment || "",
+    ).toUpperCase() ||
+    (inferredMode === "OPT"
+      ? "NFO-OPT"
+      : inferredMode === "FUT"
+        ? "NFO-FUT"
+        : "NSE");
   const instrumentType =
-    String(selectedInstrument?.instrument_type || fallbackInstrument?.instrument_type || "").toUpperCase() ||
+    String(
+      selectedInstrument?.instrument_type ||
+        fallbackInstrument?.instrument_type ||
+        "",
+    ).toUpperCase() ||
     (inferredMode === "OPT" ? "CE" : inferredMode === "FUT" ? "FUT" : "EQ");
   return {
     instrument_token: token,

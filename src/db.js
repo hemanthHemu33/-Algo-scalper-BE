@@ -50,7 +50,6 @@ async function connectMongo() {
   return { client, db };
 }
 
-
 async function closeMongo() {
   if (!client) return;
   try {
@@ -67,4 +66,9 @@ function getDb() {
   return db;
 }
 
-module.exports = { connectMongo, closeMongo, getDb };
+function getClient() {
+  if (!client) throw new Error("Mongo not connected yet");
+  return client;
+}
+
+module.exports = { connectMongo, closeMongo, getDb, getClient };
