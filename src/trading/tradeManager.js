@@ -43,6 +43,7 @@ const {
 } = require("../kite/quoteGuard");
 const { OrderRateLimiter } = require("./orderRateLimiter");
 const { computeDynamicExitPlan } = require("./dynamicExitManager");
+const { STATUS } = require("./tradeStateMachine");
 const { planRunnerTarget } = require("./targetPlanner");
 const { detectRegime } = require("../strategy/selector");
 const {
@@ -100,29 +101,6 @@ const {
   getRiskState,
 } = require("./tradeStore");
 
-const STATUS = {
-  ENTRY_PLACED: "ENTRY_PLACED",
-  ENTRY_OPEN: "ENTRY_OPEN",
-  ENTRY_REPLACED: "ENTRY_REPLACED",
-  ENTRY_CANCELLED: "ENTRY_CANCELLED",
-  ENTRY_FILLED: "ENTRY_FILLED",
-  LIVE: "LIVE",
-  SL_PLACED: "SL_PLACED",
-  SL_OPEN: "SL_OPEN",
-  SL_CONFIRMED: "SL_CONFIRMED",
-  EXIT_PLACED: "EXIT_PLACED",
-  EXIT_OPEN: "EXIT_OPEN",
-  EXIT_PARTIAL: "EXIT_PARTIAL",
-  EXIT_FILLED: "EXIT_FILLED",
-  PANIC_EXIT_PLACED: "PANIC_EXIT_PLACED",
-  PANIC_EXIT_CONFIRMED: "PANIC_EXIT_CONFIRMED",
-  RECOVERY_REHYDRATED: "RECOVERY_REHYDRATED",
-  EXITED_TARGET: "EXITED_TARGET",
-  EXITED_SL: "EXITED_SL",
-  ENTRY_FAILED: "ENTRY_FAILED",
-  GUARD_FAILED: "GUARD_FAILED",
-  CLOSED: "CLOSED",
-};
 
 const LIVE_ELIGIBLE_ENTRY_STATUSES = new Set([
   STATUS.ENTRY_FILLED,
@@ -457,6 +435,21 @@ class TradeManager {
     };
     this._activeTradeToken = null;
     this._activeTradeSide = null;
+
+    this._opSerial = Promise.resolve();
+    this._opQueueDepth = 0;
+    this._opQueueMaxDepth = 0;
+    this._opStats = {
+      enqueued: 0,
+      started: 0,
+      finished: 0,
+      dropped: 0,
+      lastEnqueueAt: null,
+      lastStartAt: null,
+      lastFinishAt: null,
+    };
+    this._entryInFlight = false;
+    this._signalDedupe = new Map();
 
     // Injected by pipeline: runtime token subscription (needed for OPT mode correctness)
     this.runtimeAddTokens = null;
@@ -5598,6 +5591,105 @@ class TradeManager {
     return { ok: !!orderId, orderId, price };
   }
 
+  _enqueueOp(fn, label = "op") {
+    this._opQueueDepth += 1;
+    this._opQueueMaxDepth = Math.max(this._opQueueMaxDepth, this._opQueueDepth);
+    this._opStats.enqueued += 1;
+    this._opStats.lastEnqueueAt = new Date();
+
+    const run = async () => {
+      this._opStats.started += 1;
+      this._opStats.lastStartAt = new Date();
+      try {
+        return await fn();
+      } catch (err) {
+        logger.error(
+          { label, e: err?.message || String(err) },
+          "[trade-op-queue] task failed",
+        );
+        return null;
+      } finally {
+        this._opQueueDepth = Math.max(0, this._opQueueDepth - 1);
+        this._opStats.finished += 1;
+        this._opStats.lastFinishAt = new Date();
+      }
+    };
+
+    const completion = this._opSerial.then(run);
+    this._opSerial = completion.catch(() => null);
+    return completion;
+  }
+
+  _pruneSignalDedupe(now = Date.now(), ttlMs = 2000) {
+    for (const [key, ts] of this._signalDedupe.entries()) {
+      if (now - Number(ts || 0) > ttlMs) this._signalDedupe.delete(key);
+    }
+  }
+
+  async queueSignal(signal) {
+    const token = Number(signal?.instrument_token);
+    const side = String(signal?.side || "").toUpperCase();
+    const strategyId = String(signal?.strategyId || "");
+    const candleTs = signal?.candleTs ?? signal?.candle?.ts ?? signal?.signalTs ?? signal?.ts ?? Date.now();
+    const signalKey = `${token}|${side}|${strategyId}|${candleTs}`;
+
+    this._pruneSignalDedupe();
+
+    if (this.activeTradeId || this._entryInFlight) {
+      this._opStats.dropped += 1;
+      return { ok: false, reason: "busy" };
+    }
+
+    const now = Date.now();
+    const dedupeTtlMs = Number(env.SIGNAL_DEDUPE_TTL_MS ?? 2000);
+    const prevTs = Number(this._signalDedupe.get(signalKey) || 0);
+    if (prevTs > 0 && now - prevTs <= dedupeTtlMs) {
+      this._opStats.dropped += 1;
+      return { ok: false, reason: "duplicate" };
+    }
+    this._signalDedupe.set(signalKey, now);
+
+    this._entryInFlight = true;
+    return this._enqueueOp(async () => {
+      try {
+        return await this._handleSignal(signal);
+      } finally {
+        if (!this.activeTradeId) this._entryInFlight = false;
+      }
+    }, "signal");
+  }
+
+  async onSignal(signal) {
+    return this.queueSignal(signal);
+  }
+
+  async queueOrderUpdate(order) {
+    return this._enqueueOp(() => this._handleOrderUpdate(order), "order_update");
+  }
+
+  async onOrderUpdate(order) {
+    return this.queueOrderUpdate(order);
+  }
+
+  async queueReconcile(tokensRef = [], reason = "reconcile") {
+    return this._enqueueOp(() => this._handleReconcile(tokensRef), reason);
+  }
+
+  async reconcile(tokens = []) {
+    return this.queueReconcile(tokens, "reconcile");
+  }
+
+  async queuePositionFirstReconcile(reason = "oco_tick") {
+    return this._enqueueOp(
+      () => this._handlePositionFirstReconcile(reason),
+      "position_first_reconcile",
+    );
+  }
+
+  async positionFirstReconcile(source = "oco_tick") {
+    return this.queuePositionFirstReconcile(source);
+  }
+
   /**
    * Restart safety:
    * - fetch open orders + positions
@@ -5607,7 +5699,7 @@ class TradeManager {
    * NOTE: If an open position exists but we can't map it to an active trade,
    * we set kill-switch and create a "recovery" trade record (no new orders placed).
    */
-  async reconcile(tokens = []) {
+  async _handleReconcile(tokens = []) {
     await this.init();
     this._recoveryEpoch += 1;
 
@@ -5846,7 +5938,7 @@ class TradeManager {
     await halt("OCO_DOUBLE_FILL", { tradeId, token, filledRole, orderId });
   }
 
-  async positionFirstReconcile(source = "oco_tick") {
+  async _handlePositionFirstReconcile(source = "oco_tick") {
     // Position-first reconciler:
     // - if position is flat -> cancel remaining exits
     // - if position is reversed / over-exited -> emergency flatten + halt
@@ -6609,7 +6701,7 @@ class TradeManager {
     }
 
     try {
-      await this.reconcile([]);
+      await this._handleReconcile([]);
     } catch (e) {
       logger.error({ tradeId, e: e?.message || String(e) }, "[dyn_exit] reconcile failed after pnl blind detection");
     }
@@ -8716,7 +8808,7 @@ class TradeManager {
     return { ok: true };
   }
 
-  async onSignal(signal) {
+  async _handleSignal(signal) {
     if (this.activeTradeId) {
       logger.info(
         { activeTradeId: this.activeTradeId },
@@ -10729,7 +10821,7 @@ class TradeManager {
     });
   }
 
-  async onOrderUpdate(order) {
+  async _handleOrderUpdate(order) {
     const orderId = String(order.order_id || order.orderId || "");
     if (!orderId) return;
 
@@ -14098,6 +14190,18 @@ class TradeManager {
       dynamicExitCadence: this._dynExitCadenceSnapshot(),
       factRecoveryGate: { ...this._factRecoveryGate },
       orphanReplay: { ...this._orphanReplayStats },
+      opQueue: {
+        depth: this._opQueueDepth,
+        maxDepth: this._opQueueMaxDepth,
+        enqueued: this._opStats.enqueued,
+        started: this._opStats.started,
+        finished: this._opStats.finished,
+        dropped: this._opStats.dropped,
+        lastEnqueueAt: this._opStats.lastEnqueueAt,
+        lastStartAt: this._opStats.lastStartAt,
+        lastFinishAt: this._opStats.lastFinishAt,
+      },
+      entryInFlight: this._entryInFlight,
       faults: snapshotFaults(),
     };
   }
