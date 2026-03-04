@@ -12,7 +12,7 @@ const {
   parseCsvList,
   uniq,
 } = require("../instruments/instrumentRepo");
-const { pickBestExpiryISO } = require("./expiryPolicy");
+const { pickBestExpiryISO, isExpiryAllowed } = require("./expiryPolicy");
 const {
   getOptionChainSnapshot,
   setLastOptionPick,
@@ -213,7 +213,9 @@ async function buildOptionSubscriptionCandidates({
       .filter(Boolean),
     env,
     nowMs,
-  })?.expiryISO || pickNearestExpiryISO(optionRows, nowMs);
+  })?.expiryISO;
+
+  if (!expiryISO) return [];
 
   const slice = optionRows.filter(
     (r) => expiryISOInTz(r.expiry) === expiryISO,
@@ -288,6 +290,23 @@ function pickNearestExpiryISO(rows, nowMs = Date.now()) {
     if (!bestExp || exp < bestExp) bestExp = exp;
   }
   return bestExp ? bestExp.toFormat("yyyy-LL-dd") : null;
+}
+
+function resolveLotSizeFromMaster({ row, universe }) {
+  const rowLot = Number(row?.lot_size);
+  if (Number.isFinite(rowLot) && rowLot > 0) return rowLot;
+
+  const token = Number(row?.instrument_token);
+  const contracts = universe?.universe?.contracts;
+  if (contracts && Number.isFinite(token)) {
+    for (const contract of Object.values(contracts)) {
+      if (Number(contract?.instrument_token) !== token) continue;
+      const lot = Number(contract?.lot_size);
+      if (Number.isFinite(lot) && lot > 0) return lot;
+    }
+  }
+
+  return 1;
 }
 
 function parseWeights(spec) {
@@ -605,21 +624,26 @@ async function pickOptionContractForSignal({
   // Build expiry set
   const expiries = optionRows.map((r) => expiryISOInTz(r.expiry)).filter(Boolean);
 
-  let expiryISO = forceExpiryISO || pickNearestExpiryISO(optionRows, nowMs);
-  // Apply roll rules (min DTE / avoid expiry-day after cutoff)
-  const picked = pickBestExpiryISO({ expiries, env, nowMs });
-  if (!forceExpiryISO && picked?.expiryISO) expiryISO = picked.expiryISO;
   const sortedExpiries = Array.from(new Set(expiries)).sort();
+  const allowedExpiries = sortedExpiries.filter((expiry) => {
+    const policy = isExpiryAllowed({ expiryISO: expiry, env, nowMs });
+    return !!policy?.ok;
+  });
+
+  let expiryISO = forceExpiryISO || null;
+  // Apply roll rules (min DTE / avoid expiry-day after cutoff)
+  const picked = pickBestExpiryISO({ expiries: allowedExpiries, env, nowMs });
+  if (!forceExpiryISO && picked?.expiryISO) expiryISO = picked.expiryISO;
 
   if (!expiryISO) {
     logger.warn(
-      { underlying, optType },
-      "[options] no valid upcoming expiry found",
+      { underlying, optType, sortedExpiries, allowedExpiries },
+      "[options] no policy-allowed expiry found",
     );
     return {
       ok: false,
       reason: "NO_VALID_EXPIRY",
-      message: `[options] no valid upcoming expiry found for ${underlying} ${optType}`,
+      message: `[options] no policy-allowed expiry found for ${underlying} ${optType}`,
       underlying,
       optType,
     };
@@ -1031,7 +1055,7 @@ async function pickOptionContractForSignal({
     prePickPlan.candles.length >= 30;
 
   const scoredWithRisk = scored.map((x) => {
-    const lot = Math.max(1, Number(x?.row?.lot_size ?? 1));
+    const lot = Math.max(1, resolveLotSizeFromMaster({ row: x?.row, universe }));
     let stopPtsUsed = stopPtsFallback;
     let stopSource = "FALLBACK";
 
@@ -1263,7 +1287,7 @@ async function pickOptionContractForSignal({
       );
 
       const triedSet = new Set([...(triedExpiries || []), expiryISO]);
-      const nextExpiry = sortedExpiries.find((e) => !triedSet.has(e));
+      const nextExpiry = allowedExpiries.find((e) => !triedSet.has(e));
       const canRelax = stage < 4;
       if (nextExpiry || canRelax) {
         const nextStage = nextExpiry ? stage : stage + 1;
@@ -1408,7 +1432,7 @@ async function pickOptionContractForSignal({
     exchange: best.row.exchange,
     tradingsymbol: best.row.tradingsymbol,
     segment: best.row.segment,
-    lot_size: Number(best.row.lot_size ?? 1),
+    lot_size: resolveLotSizeFromMaster({ row: best.row, universe }),
     tick_size: normalizeTickSize(best.row.tick_size),
     strike: Number(best.row.strike),
     pickedAt: new Date().toISOString(),
