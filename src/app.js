@@ -623,6 +623,9 @@ function buildApp() {
       res.json({
         ok: true,
         ...s,
+        instanceId: s?.instanceId || sessionStatus?.instanceId || null,
+        pid: s?.pid || sessionStatus?.pid || process.pid,
+        bootTs: s?.bootTs || sessionStatus?.bootTs || null,
         kiteLoginUrl: buildKiteLoginUrl(),
         tokenPresent,
         needsKiteLogin: !tokenPresent || needsLogin,
@@ -636,6 +639,18 @@ function buildApp() {
         needsLogin,
         haltInfo,
         ticker: normalizedTicker,
+        ws: {
+          connected: !!sessionStatus?.tickerConnected,
+          connectCount: Number(sessionStatus?.wsConnectCount || 0),
+          reconnectCount: Number(sessionStatus?.wsReconnectCount || 0),
+          subscribedTokenCount: Number(sessionStatus?.subscribedTokenCount || sessionStatus?.subscribedTokens || 0),
+          lastSubscribeTs: sessionStatus?.lastSubscribeTs || null,
+        },
+        ticktap: sessionStatus?.ticktap || null,
+        timers: {
+          ...(s?.timers || {}),
+          ...(sessionStatus?.timers || {}),
+        },
         now: new Date().toISOString(),
         tradesToday: s?.tradesToday ?? 0,
         ordersPlacedToday: s?.ordersPlacedToday ?? 0,
