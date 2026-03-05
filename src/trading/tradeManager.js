@@ -73,7 +73,8 @@ const {
 } = require("../execution/executionMetrics");
 const { equityService } = require("../account/equityService");
 const { buildPositionsSnapshot } = require("./positionService");
-const { getRiskLimits, evaluateDailyRiskState } = require("../risk/riskLimits");
+const riskLimits = require("../risk/riskLimits");
+const { getRiskLimits } = riskLimits;
 const intervalRegistry = require("../utils/intervalRegistry");
 const { RiskBudget } = require("../risk/riskBudget");
 const {
@@ -946,7 +947,14 @@ class TradeManager {
 
   _safeEvaluateDailyRiskState({ dayPnlR, limits, prevState = "RUNNING" } = {}) {
     try {
-      const evaluated = evaluateDailyRiskState({ dayPnlR, limits });
+      const evaluator =
+        typeof riskLimits?.evaluateDailyRiskState === "function"
+          ? riskLimits.evaluateDailyRiskState
+          : null;
+      if (!evaluator) {
+        throw new ReferenceError("evaluateDailyRiskState is not defined");
+      }
+      const evaluated = evaluator({ dayPnlR, limits });
       const state = String(evaluated?.state || prevState || "RUNNING");
       const reason = evaluated?.reason || null;
       this._dailyRiskEval = {
