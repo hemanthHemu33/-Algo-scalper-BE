@@ -747,13 +747,16 @@ async function forceFlatten(reason = "ENGINE_FORCE_FLATTEN") {
 
 function wireEvents() {
   if (!ticker) return;
-  ticker.removeAllListeners("connect");
-  ticker.removeAllListeners("ticks");
-  ticker.removeAllListeners("order_update");
-  ticker.removeAllListeners("error");
-  ticker.removeAllListeners("reconnect");
-  ticker.removeAllListeners("close");
-  ticker.removeAllListeners("disconnect");
+  const resetEvents = ["connect", "ticks", "order_update", "error", "reconnect", "close", "disconnect"];
+  for (const eventName of resetEvents) {
+    if (typeof ticker.removeAllListeners === "function") {
+      ticker.removeAllListeners(eventName);
+      continue;
+    }
+    if (typeof ticker.off === "function") {
+      ticker.off(eventName);
+    }
+  }
 
   ticker.on("connect", async () => {
     wsConnectCount += 1;
