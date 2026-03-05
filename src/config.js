@@ -4,6 +4,42 @@ const fs = require("fs");
 const path = require("path");
 const { reportFault } = require("./runtime/errorBus");
 
+const runtimeKnobsPath =
+  process.env.RUNTIME_KNOBS_FILE ||
+  path.join(process.cwd(), "config", "runtime_knobs.json");
+
+function normalizeKnobValue(value) {
+  if (value === null || typeof value === "undefined") return "";
+  if (Array.isArray(value)) return value.join(",");
+  return String(value);
+}
+
+function seedProcessEnvFromRuntimeKnobs() {
+  try {
+    if (!fs.existsSync(runtimeKnobsPath)) return;
+    const parsed = JSON.parse(fs.readFileSync(runtimeKnobsPath, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!key) continue;
+      const hasRaw =
+        Object.prototype.hasOwnProperty.call(process.env, key) &&
+        String(process.env[key] ?? "").trim() !== "";
+      if (!hasRaw) {
+        process.env[key] = normalizeKnobValue(value);
+      }
+    }
+  } catch (err) {
+    reportFault({
+      code: "CONFIG_CATCH",
+      err,
+      message: "[src/config.js] failed to load runtime_knobs.json",
+    });
+  }
+}
+
+seedProcessEnvFromRuntimeKnobs();
+
 // dotenv is for local development. In production, set env vars in the host (Render/PM2/Docker/K8s).
 // We load .env only if it exists and DOTENV_ENABLED is not "false".
 try {
@@ -591,6 +627,7 @@ const schema = z.object({
   RISK_TRADE_R_MIN: z.coerce.number().default(0.6),
   RISK_TRADE_R_BASE: z.coerce.number().default(1.0),
   RISK_TRADE_R_MAX: z.coerce.number().default(1.25),
+  RISK_AUTO_BUMP_TO_MIN_LOT: boolFromEnv.default(true),
   RISK_SCALE_BY_CONFIDENCE: boolFromEnv.default(true),
   RISK_SCALE_BY_REGIME: boolFromEnv.default(true),
   RISK_SCALE_BY_SPREAD: boolFromEnv.default(true),
@@ -1499,4 +1536,70 @@ const subscribeSymbols = Array.from(
   ),
 );
 
-module.exports = { env, subscribeTokens, subscribeSymbols };
+function getRuntimeKnobsSnapshot() {
+  try {
+    if (!fs.existsSync(runtimeKnobsPath)) return {};
+    const parsed = JSON.parse(fs.readFileSync(runtimeKnobsPath, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : {};
+  } catch (err) {
+    reportFault({
+      code: "CONFIG_CATCH",
+      err,
+      message: "[src/config.js] failed reading runtime knobs snapshot",
+    });
+    return {};
+  }
+}
+
+function coerceLikeCurrentEnv(key, rawValue) {
+  const current = env[key];
+  if (typeof current === "number") {
+    const n = Number(rawValue);
+    return Number.isFinite(n) ? n : current;
+  }
+  if (typeof current === "boolean") {
+    const normalized = String(rawValue).trim().toLowerCase();
+    if (["1", "true", "yes", "on"].includes(normalized)) return true;
+    if (["0", "false", "no", "off", ""].includes(normalized)) return false;
+    return current;
+  }
+  return String(rawValue);
+}
+
+function updateRuntimeKnobs(patch = {}) {
+  const incoming = patch && typeof patch === "object" ? patch : {};
+  const existing = getRuntimeKnobsSnapshot();
+  const next = { ...existing };
+
+  for (const [key, value] of Object.entries(incoming)) {
+    if (!Object.prototype.hasOwnProperty.call(env, key)) continue;
+    if (value === null) {
+      delete next[key];
+      continue;
+    }
+    next[key] = value;
+  }
+
+  fs.mkdirSync(path.dirname(runtimeKnobsPath), { recursive: true });
+  fs.writeFileSync(runtimeKnobsPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+
+  for (const [key, value] of Object.entries(incoming)) {
+    if (!Object.prototype.hasOwnProperty.call(env, key)) continue;
+    if (value === null) continue;
+    process.env[key] = normalizeKnobValue(value);
+    env[key] = coerceLikeCurrentEnv(key, value);
+  }
+
+  return next;
+}
+
+module.exports = {
+  env,
+  subscribeTokens,
+  subscribeSymbols,
+  runtimeKnobsPath,
+  getRuntimeKnobsSnapshot,
+  updateRuntimeKnobs,
+};

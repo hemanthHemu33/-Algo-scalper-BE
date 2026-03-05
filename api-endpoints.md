@@ -173,7 +173,51 @@ app.use("/admin", buildAdminAuth());
   "strategyId": "rsi_fade",
   "strategies": ["rsi_fade", "vwap_reclaim"],
   "signalIntervals": [1, 3],
-  "reconcileIntervalSec": 15
+  "reconcileIntervalSec": 15,
+  "runtimeKnobsFile": "config/runtime_knobs.json",
+  "runtimeKnobs": {
+    "RISK_TRADE_R_BASE": 1,
+    "RISK_TRADE_R_MAX": 1.2
+  }
+}
+```
+
+---
+
+### `GET /admin/config/knobs`
+
+**Purpose:** Read persisted runtime knobs used to seed config (`config/runtime_knobs.json`).
+
+**200**
+
+```json
+{
+  "ok": true,
+  "file": "config/runtime_knobs.json",
+  "knobs": {
+    "RISK_TRADE_R_BASE": 1,
+    "RISK_TRADE_R_MAX": 1.2
+  }
+}
+```
+
+---
+
+### `POST /admin/config/knobs`
+
+**Purpose:** Update runtime knobs from FE. Body keys are env-style knob names. Set a key to `null` to remove it from the file.
+
+**200**
+
+```json
+{
+  "ok": true,
+  "file": "config/runtime_knobs.json",
+  "knobs": {
+    "RISK_TRADE_R_BASE": 1.05,
+    "RISK_TRADE_R_MAX": 1.3
+  },
+  "applied": ["RISK_TRADE_R_BASE", "RISK_TRADE_R_MAX"]
 }
 ```
 

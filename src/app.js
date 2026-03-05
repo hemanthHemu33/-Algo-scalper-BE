@@ -1,5 +1,10 @@
 const express = require("express");
-const { env } = require("./config");
+const {
+  env,
+  runtimeKnobsPath,
+  getRuntimeKnobsSnapshot,
+  updateRuntimeKnobs,
+} = require("./config");
 const {
   getPipeline,
   getTickerStatus,
@@ -58,6 +63,37 @@ const {
 const { STATUS } = require("./trading/tradeStateMachine");
 const { reportFault, snapshotFaults } = require("./runtime/errorBus");
 const { getEngineLifecycleStatus } = require("./runtime/engineLifecycle");
+
+
+
+function parseBoolLoose(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "off", ""].includes(normalized)) return false;
+  return value;
+}
+
+function normalizeKnobPatch(input) {
+  const patch = {};
+  for (const [key, value] of Object.entries(input || {})) {
+    if (value === null) {
+      patch[key] = null;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      patch[key] = value.join(",");
+      continue;
+    }
+    if (typeof value === "object") {
+      patch[key] = JSON.stringify(value);
+      continue;
+    }
+    patch[key] = parseBoolLoose(value);
+  }
+  return patch;
+}
 
 function buildAdminAuth() {
   const expected = env.ADMIN_API_KEY;
@@ -346,7 +382,41 @@ function buildApp() {
       strategies: env.STRATEGIES,
       signalIntervals: env.SIGNAL_INTERVALS,
       reconcileIntervalSec: env.RECONCILE_INTERVAL_SEC,
+      runtimeKnobsFile: runtimeKnobsPath,
+      runtimeKnobs: getRuntimeKnobsSnapshot(),
     });
+  });
+
+  app.get("/admin/config/knobs", requirePerm("read"), (req, res) => {
+    return res.json({
+      ok: true,
+      file: runtimeKnobsPath,
+      knobs: getRuntimeKnobsSnapshot(),
+    });
+  });
+
+  app.post("/admin/config/knobs", requirePerm("admin"), async (req, res) => {
+    try {
+      const patch = normalizeKnobPatch(req.body || {});
+      const updated = updateRuntimeKnobs(patch);
+
+      await recordAudit({
+        actor: actorFromReq(req),
+        action: "runtime_knobs_update",
+        resource: "config",
+        status: "ok",
+        meta: { keys: Object.keys(patch) },
+      });
+
+      return res.json({
+        ok: true,
+        file: runtimeKnobsPath,
+        knobs: updated,
+        applied: Object.keys(patch),
+      });
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: e?.message || String(e) });
+    }
   });
 
   app.get("/admin/trading", requirePerm("read"), (req, res) => {
