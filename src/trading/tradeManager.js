@@ -9844,9 +9844,9 @@ class TradeManager {
     const _baseRiskInrAdj = Number(_baseRiskInr) * (
       Number.isFinite(reentryMult) ? reentryMult : 1
     );
-    const _riskInrOverride = Number(_baseRiskInrAdj) * _openMult;
+    let _riskInrOverride = Number(_baseRiskInrAdj) * _openMult;
     const _sessionRiskInr = Number(this.riskBudget?.getSessionRInr?.() ?? 0);
-    const _tradeRiskR =
+    let _tradeRiskR =
       Number.isFinite(_sessionRiskInr) && _sessionRiskInr > 0
         ? _riskInrOverride / _sessionRiskInr
         : null;
@@ -10069,23 +10069,71 @@ class TradeManager {
     // NOTE: RiskEngine.calcQty expects `entryPrice`.
     // Passing the wrong key here makes qtyByRisk become NaN (and JSON logs show it as null),
     // which then trips margin sizing and blocks trades incorrectly.
-    const qtyByRisk = this.risk.calcQty({
+    const lotSize = Math.max(1, Number(instrument.lot_size ?? 1));
+    const expectedSlippagePts = Number(
+      env.EXPECTED_SLIPPAGE_POINTS ??
+        (Number(quoteAtEntry?.bps ?? 0) > 0 && Number(entryGuess) > 0
+          ? (Number(quoteAtEntry.bps) / 10000) * Number(entryGuess)
+          : 0),
+    );
+    const feePerLotInr = Number(env.EXPECTED_FEES_PER_LOT_INR ?? 0);
+
+    let qtyByRisk = this.risk.calcQty({
       entryPrice: entryGuess,
       stopLoss,
       riskInr: _riskInrOverride,
-      lotSize: Number(instrument.lot_size ?? 1),
-      expectedSlippagePts: Number(
-        env.EXPECTED_SLIPPAGE_POINTS ??
-          (Number(quoteAtEntry?.bps ?? 0) > 0 && Number(entryGuess) > 0
-            ? (Number(quoteAtEntry.bps) / 10000) * Number(entryGuess)
-            : 0),
-      ),
-      feePerLotInr: Number(env.EXPECTED_FEES_PER_LOT_INR ?? 0),
+      lotSize,
+      expectedSlippagePts,
+      feePerLotInr,
     });
 
-    const lotSize = Math.max(1, Number(instrument.lot_size ?? 1));
-    const lotsByRisk = Math.max(0, Math.floor(Number(qtyByRisk ?? 0) / lotSize));
-    const qtyUnitsByRisk = lotsByRisk * lotSize;
+    let lotsByRisk = Math.max(0, Math.floor(Number(qtyByRisk ?? 0) / lotSize));
+    let qtyUnitsByRisk = lotsByRisk * lotSize;
+
+    if (qtyMode !== "MARGIN" && qtyUnitsByRisk < 1) {
+      const autoBumpRisk =
+        String(env.RISK_AUTO_BUMP_TO_MIN_LOT || "true") === "true";
+      if (autoBumpRisk) {
+        const slPts = Math.max(0.05, Math.abs(Number(entryGuess) - Number(stopLoss)));
+        const perLotRiskInr = Math.max(
+          0.05,
+          (slPts + Math.max(0, Number(expectedSlippagePts))) * lotSize +
+            Math.max(0, Number(feePerLotInr)),
+        );
+        if (Number.isFinite(perLotRiskInr) && perLotRiskInr > _riskInrOverride) {
+          const prevRiskInr = _riskInrOverride;
+          _riskInrOverride = perLotRiskInr;
+          _tradeRiskR =
+            Number.isFinite(_sessionRiskInr) && _sessionRiskInr > 0
+              ? _riskInrOverride / _sessionRiskInr
+              : null;
+
+          qtyByRisk = this.risk.calcQty({
+            entryPrice: entryGuess,
+            stopLoss,
+            riskInr: _riskInrOverride,
+            lotSize,
+            expectedSlippagePts,
+            feePerLotInr,
+          });
+          lotsByRisk = Math.max(0, Math.floor(Number(qtyByRisk ?? 0) / lotSize));
+          qtyUnitsByRisk = lotsByRisk * lotSize;
+
+          logger.info(
+            {
+              token,
+              side,
+              lotSize,
+              prevRiskInr,
+              bumpedRiskInr: _riskInrOverride,
+              bumpedTradeRiskR: _tradeRiskR,
+              perLotRiskInr,
+            },
+            "[risk] auto-bumped trade risk to fit one lot",
+          );
+        }
+      }
+    }
 
     // If you want sizing purely from available margin, set:
     //   QTY_SIZING_MODE=MARGIN
