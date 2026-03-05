@@ -17,6 +17,8 @@ const { buildPipeline } = require("../pipeline");
 const { updateFromTicks } = require("../market/ltpStream");
 const { MarketGate } = require("../market/marketGate");
 const { isMarketOpenNow } = require("../market/isMarketOpenNow");
+const intervalRegistry = require("../utils/intervalRegistry");
+const crypto = require("crypto");
 
 let kite = null;
 let ticker = null;
@@ -38,6 +40,12 @@ let tickTapTimer = null;
 let tickTapCount = 0;
 let lastTickAt = 0;
 let recentOrderUpdateKeys = new Map();
+let wsConnectCount = 0;
+let wsReconnectCount = 0;
+let lastSubscribeTs = null;
+const instanceId = crypto.randomUUID();
+const bootTs = new Date().toISOString();
+let tickTapSamples = [];
 
 // Track ALL subscribed tokens (base universe + runtime position tokens)
 let subscribedTokens = new Set();
@@ -166,7 +174,7 @@ function startTickWatchdog() {
   if (tickWatchdogTimer || !_tickWatchdogEnabled()) return;
   const intervalMs = _tickWatchdogIntervalMs();
   const maxAgeMs = _tickWatchdogMaxAgeMs();
-  tickWatchdogTimer = setInterval(() => {
+  const reg = intervalRegistry.start("tickerManager.tickWatchdog", () => {
     if (!ticker || !tickerConnected) return;
     if (!marketGate?.isOpen?.()) return;
     if (!subscribedTokens.size) return;
@@ -189,16 +197,21 @@ function startTickWatchdog() {
       logger.warn({ e: e?.message || String(e) }, "[ticks] resubscribe failed");
     }
   }, Math.max(1000, intervalMs));
-  tickWatchdogTimer.unref?.();
+  tickWatchdogTimer = reg?.id || tickWatchdogTimer;
 }
 
 function startTickTapLogger() {
   if (tickTapTimer || !_tickTapEnabled()) return;
-  tickTapTimer = setInterval(() => {
-    logger.info({ ticks10s: tickTapCount }, "[ticktap]");
+  const reg = intervalRegistry.start("tickerManager.ticktap", () => {
+    tickTapSamples.push(Number(tickTapCount) || 0);
+    if (tickTapSamples.length > 6) tickTapSamples = tickTapSamples.slice(-6);
+    const avg1m = tickTapSamples.length
+      ? Math.round((tickTapSamples.reduce((a, b) => a + b, 0) / tickTapSamples.length) * 100) / 100
+      : 0;
+    logger.info({ ticks10s: tickTapCount, ticks10sAvg1m: avg1m, subscribedTokenCount: subscribedTokens.size }, "[ticktap]");
     tickTapCount = 0;
   }, 10000);
-  tickTapTimer.unref?.();
+  tickTapTimer = reg?.id || tickTapTimer;
 }
 
 function stopTickWatchdog() {
@@ -206,6 +219,7 @@ function stopTickWatchdog() {
     clearInterval(tickWatchdogTimer);
     tickWatchdogTimer = null;
   }
+  intervalRegistry.stop("tickerManager.tickWatchdog");
 }
 
 function stopTickTapLogger() {
@@ -213,7 +227,9 @@ function stopTickTapLogger() {
     clearInterval(tickTapTimer);
     tickTapTimer = null;
   }
+  intervalRegistry.stop("tickerManager.ticktap");
   tickTapCount = 0;
+  tickTapSamples = [];
 }
 
 function stopMarketGate() {
@@ -364,6 +380,14 @@ async function _positionSubscriptionTokens() {
   return Array.from(out);
 }
 
+function _dedupeNewTokens(tokens) {
+  const arr = (tokens || [])
+    .map((x) => Number(x))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  const unique = Array.from(new Set(arr));
+  return unique.filter((t) => !subscribedTokens.has(t));
+}
+
 async function _subscribeTokens(tokens, opts = {}) {
   const arr = (tokens || [])
     .map((x) => Number(x))
@@ -371,7 +395,11 @@ async function _subscribeTokens(tokens, opts = {}) {
 
   if (!arr.length) return { ok: true, added: [] };
 
-  ticker.subscribe(arr);
+  const toAdd = _dedupeNewTokens(arr);
+  if (!toAdd.length) return { ok: true, added: [] };
+
+  ticker.subscribe(toAdd);
+  lastSubscribeTs = new Date().toISOString();
 
   const underlyingMode = _modeStrSafe(env.TICK_MODE_UNDERLYING, "quote");
   const tradeMode = _modeStrSafe(env.TICK_MODE_TRADE, "full");
@@ -387,7 +415,7 @@ async function _subscribeTokens(tokens, opts = {}) {
   if (classify && typeof ensureInstrument === "function") {
     const trade = [];
     const under = [];
-    for (const tok of arr) {
+    for (const tok of toAdd) {
       try {
         const doc = await ensureInstrument(kite, tok);
         if (_isOptLikeInstrument(doc)) trade.push(tok);
@@ -401,11 +429,11 @@ async function _subscribeTokens(tokens, opts = {}) {
     if (trade.length) _applyMode(trade, tradeMode);
   } else {
     const mode = opts?.isOption === true ? optionMode : hintedTrade ? tradeMode : underlyingMode;
-    _applyMode(arr, mode);
+    _applyMode(toAdd, mode);
   }
 
-  for (const t of arr) subscribedTokens.add(t);
-  return { ok: true, added: arr };
+  for (const t of toAdd) subscribedTokens.add(t);
+  return { ok: true, added: toAdd };
 }
 
 async function ensureActivePositionSubscriptions({
@@ -458,7 +486,7 @@ function startOcoReconcileLoop() {
   const everySec = Number(env.OCO_RECONCILE_INTERVAL_SEC ?? 5);
   if (!Number.isFinite(everySec) || everySec <= 0) return;
 
-  ocoReconcileTimer = setInterval(
+  const reg = intervalRegistry.start("tickerManager.ocoReconcile",
     () => {
       if (!tickerConnected) return;
       if (!pipeline || typeof pipeline.ocoReconcile !== "function") return;
@@ -466,7 +494,7 @@ function startOcoReconcileLoop() {
     },
     Math.max(1, everySec) * 1000,
   );
-  ocoReconcileTimer.unref?.();
+  ocoReconcileTimer = reg?.id || ocoReconcileTimer;
 }
 
 function stopOcoReconcileLoop() {
@@ -474,6 +502,7 @@ function stopOcoReconcileLoop() {
     clearInterval(ocoReconcileTimer);
     ocoReconcileTimer = null;
   }
+  intervalRegistry.stop("tickerManager.ocoReconcile");
 }
 
 function stopReconcileLoop() {
@@ -481,17 +510,17 @@ function stopReconcileLoop() {
     clearInterval(reconcileTimer);
     reconcileTimer = null;
   }
+  intervalRegistry.stop("tickerManager.reconcile");
   stopOcoReconcileLoop();
 }
 
 function startReconcileLoop() {
-  stopReconcileLoop();
   const sec = _num(env.RECONCILE_INTERVAL_SEC, 60);
   if (!Number.isFinite(sec) || sec <= 0) return;
 
   startOcoReconcileLoop();
 
-  reconcileTimer = setInterval(() => {
+  const reg = intervalRegistry.start("tickerManager.reconcile", () => {
     if (!pipeline) return;
     if (!tickerConnected) return;
 
@@ -509,7 +538,7 @@ function startReconcileLoop() {
         ),
       );
   }, sec * 1000);
-  reconcileTimer.unref?.();
+  reconcileTimer = reg?.id || reconcileTimer;
 }
 
 async function drainTicks() {
@@ -648,6 +677,19 @@ async function getSessionStatus() {
     lastTickAt: lastTickAt || null,
     lastDisconnect,
     subscribedTokens: Array.from(subscribedTokens || []).length,
+    subscribedTokenCount: subscribedTokens.size,
+    lastSubscribeTs,
+    wsConnectCount,
+    wsReconnectCount,
+    instanceId,
+    pid: process.pid,
+    bootTs,
+    ticktap: {
+      ticks10s: tickTapCount,
+      ticks10sAvg1m: tickTapSamples.length ? Math.round((tickTapSamples.reduce((a, b) => a + b, 0) / tickTapSamples.length) * 100) / 100 : 0,
+      lastTickTs: lastTickAt || null,
+    },
+    timers: intervalRegistry.snapshot(["tickerManager.reconcile", "tickerManager.ocoReconcile", "tickerManager.ticktap", "tickerManager.tickWatchdog"]),
   };
 }
 
@@ -704,7 +746,17 @@ async function forceFlatten(reason = "ENGINE_FORCE_FLATTEN") {
 }
 
 function wireEvents() {
+  if (!ticker) return;
+  ticker.removeAllListeners("connect");
+  ticker.removeAllListeners("ticks");
+  ticker.removeAllListeners("order_update");
+  ticker.removeAllListeners("error");
+  ticker.removeAllListeners("reconnect");
+  ticker.removeAllListeners("close");
+  ticker.removeAllListeners("disconnect");
+
   ticker.on("connect", async () => {
+    wsConnectCount += 1;
     tickerConnected = true;
     lastDisconnect = null;
 
@@ -772,6 +824,7 @@ function wireEvents() {
         _applyMode(allTokens, _modeStrSafe(env.TICK_MODE_UNDERLYING, "quote"));
         _applyMode(posTokens || [], _modeStrSafe(env.TICK_MODE_TRADE, "full"));
         subscribedTokens = new Set(allTokens);
+        lastSubscribeTs = new Date().toISOString();
 
         logger.info(
           {
@@ -902,14 +955,18 @@ function wireEvents() {
   });
 
   ticker.on("reconnect", () => {
+    wsReconnectCount += 1;
     if (!_isResubOnReconnect()) return;
     try {
       const arr = Array.from(subscribedTokens || []);
       if (arr.length) {
+        subscribedTokens = new Set();
         ticker.subscribe(arr);
         _applyModesFromCache(arr);
+        for (const t of arr) subscribedTokens.add(Number(t));
+        lastSubscribeTs = new Date().toISOString();
         logger.warn(
-          { count: arr.length },
+          { count: arr.length, wsReconnectCount },
           "[kite] reconnect: re-subscribed tokens",
         );
       }
@@ -966,6 +1023,14 @@ async function shutdownAll(reason = "shutdown") {
   await teardownActiveSession(reason);
 }
 
+function __resetSubscriptionStateForTests() {
+  subscribedTokens = new Set();
+}
+
+function __setSubscribedTokensForTests(tokens = []) {
+  subscribedTokens = new Set((tokens || []).map((t) => Number(t)).filter((n) => Number.isFinite(n) && n > 0));
+}
+
 module.exports = {
   setSession,
   startSession,
@@ -981,4 +1046,7 @@ module.exports = {
   getSubscribedTokens,
   ensureActivePositionSubscriptions,
   shutdownAll,
+  __resetSubscriptionStateForTests,
+  __dedupeNewTokensForTests: _dedupeNewTokens,
+  __setSubscribedTokensForTests,
 };

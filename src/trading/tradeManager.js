@@ -73,7 +73,8 @@ const {
 } = require("../execution/executionMetrics");
 const { equityService } = require("../account/equityService");
 const { buildPositionsSnapshot } = require("./positionService");
-const { getRiskLimits } = require("../risk/riskLimits");
+const { getRiskLimits, evaluateDailyRiskState } = require("../risk/riskLimits");
+const intervalRegistry = require("../utils/intervalRegistry");
 const { RiskBudget } = require("../risk/riskBudget");
 const {
   PortfolioGovernor,
@@ -486,6 +487,10 @@ class TradeManager {
     };
     this._recoveryEpoch = 0;
     this._initialized = false;
+    this.instanceId = crypto.randomUUID();
+    this.bootTs = new Date().toISOString();
+    this._dailyRiskEval = { ok: true, reason: null, updatedAt: null, errorCount: 0, state: "RUNNING", lastErrorAt: null };
+    this._dailyRiskEvalLog = { lastLogAt: 0, suppressed: 0 };
 
     // Reconcile debouncer (order-update driven)
     this._reconcileTimer = null;
@@ -927,6 +932,71 @@ class TradeManager {
     );
   }
 
+  _logDailyRiskEvalErrorThrottled(err, meta = {}) {
+    const now = Date.now();
+    const last = Number(this._dailyRiskEvalLog.lastLogAt || 0);
+    if (!last || now - last >= 60_000) {
+      logger.warn({ e: err?.message || String(err), suppressed: this._dailyRiskEvalLog.suppressed, errorCount: this._dailyRiskEval.errorCount, ...meta }, "[risk] daily evaluation failed");
+      this._dailyRiskEvalLog.lastLogAt = now;
+      this._dailyRiskEvalLog.suppressed = 0;
+      return;
+    }
+    this._dailyRiskEvalLog.suppressed += 1;
+  }
+
+  _safeEvaluateDailyRiskState({ dayPnlR, limits, prevState = "RUNNING" } = {}) {
+    try {
+      const evaluated = evaluateDailyRiskState({ dayPnlR, limits });
+      const state = String(evaluated?.state || prevState || "RUNNING");
+      const reason = evaluated?.reason || null;
+      this._dailyRiskEval = {
+        ok: true,
+        reason,
+        state,
+        updatedAt: new Date().toISOString(),
+        errorCount: Number(this._dailyRiskEval.errorCount || 0),
+        lastErrorAt: this._dailyRiskEval.lastErrorAt || null,
+      };
+      return { ok: true, state, reason, meta: { dayPnlR } };
+    } catch (err) {
+      this._dailyRiskEval = {
+        ...this._dailyRiskEval,
+        ok: false,
+        reason: "DAILY_RISK_UNAVAILABLE",
+        updatedAt: new Date().toISOString(),
+        errorCount: Number(this._dailyRiskEval.errorCount || 0) + 1,
+        lastErrorAt: Date.now(),
+      };
+      this._logDailyRiskEvalErrorThrottled(err, { dayPnlR });
+      return { ok: false, reason: "DAILY_RISK_UNAVAILABLE", meta: { error: err?.message || String(err) } };
+    }
+  }
+
+  _startDailyRiskEvalLoop() {
+    intervalRegistry.start("tradeManager.dailyRiskEval", () => {
+      getDailyRisk(todayKey())
+        .then((risk) => {
+          const total = Number(risk?.lastTotal ?? risk?.realizedPnl ?? 0);
+          const sessionRInrRaw = Number(this.riskBudget?.getSessionRInr?.() ?? 0);
+          const sessionRInr = sessionRInrRaw > 0 ? sessionRInrRaw : Number(env.RISK_PER_TRADE_INR ?? 1);
+          const dayPnlR = sessionRInr > 0 ? total / sessionRInr : 0;
+          const limits = this.risk?.getLimits?.() || {};
+          this._safeEvaluateDailyRiskState({ dayPnlR, limits, prevState: risk?.state || "RUNNING" });
+        })
+        .catch((err) => {
+          this._dailyRiskEval = {
+            ...this._dailyRiskEval,
+            ok: false,
+            reason: "DAILY_RISK_UNAVAILABLE",
+            updatedAt: new Date().toISOString(),
+            errorCount: Number(this._dailyRiskEval.errorCount || 0) + 1,
+            lastErrorAt: Date.now(),
+          };
+          this._logDailyRiskEvalErrorThrottled(err, { source: "dailyRiskEvalLoop" });
+        });
+    }, 1000);
+  }
+
   async init() {
     if (this._initialized) return;
     await ensureTradeIndexes();
@@ -963,6 +1033,7 @@ class TradeManager {
     await this._hydrateOpenPositionFromActiveTrade();
     this._startExitLoop();
     this._startWallClockTimeGuardLoop();
+    this._startDailyRiskEvalLoop();
     this._initialized = true;
   }
 
@@ -979,6 +1050,9 @@ class TradeManager {
       clearInterval(this._timeGuardTimer);
       this._timeGuardTimer = null;
     }
+    intervalRegistry.stop("tradeManager.exitLoop");
+    intervalRegistry.stop("tradeManager.timeGuard");
+    intervalRegistry.stop("tradeManager.dailyRiskEval");
 
     for (const [, timer] of this._entryFallbackTimers.entries()) {
       clearTimeout(timer);
@@ -1118,18 +1192,16 @@ class TradeManager {
     const everyMs = Number(env.EXIT_LOOP_MS ?? 0);
     if (!Number.isFinite(everyMs) || everyMs <= 0) return;
 
-    this._exitLoopTimer = setInterval(
-      () => {
-        this._exitLoopTick().catch((err) =>
-          reportFault({
-            code: "EXIT_LOOP_TICK_FAILED",
-            err,
-            message: "[exit] exit loop tick failed",
-          }),
-        );
-      },
-      Math.max(250, everyMs),
-    );
+    const reg = intervalRegistry.start("tradeManager.exitLoop", () => {
+      this._exitLoopTick().catch((err) =>
+        reportFault({
+          code: "EXIT_LOOP_TICK_FAILED",
+          err,
+          message: "[exit] exit loop tick failed",
+        }),
+      );
+    }, Math.max(250, everyMs));
+    this._exitLoopTimer = reg?.id || this._exitLoopTimer;
     logger.info(
       { exitLoopInstanceId: this._exitLoopInstanceId, everyMs: Math.max(250, everyMs) },
       "[dyn_exit] exit loop started",
@@ -1142,7 +1214,7 @@ class TradeManager {
       1000,
       Number(env.FORCE_FLATTEN_CHECK_MS ?? 1000),
     );
-    this._timeGuardTimer = setInterval(() => {
+    const reg = intervalRegistry.start("tradeManager.timeGuard", () => {
       if (this._timeGuardInFlight) return;
       this._timeGuardInFlight = true;
       this._forceFlattenIfNeeded()
@@ -1157,7 +1229,7 @@ class TradeManager {
           this._timeGuardInFlight = false;
         });
     }, everyMs);
-    this._timeGuardTimer.unref?.();
+    this._timeGuardTimer = reg?.id || this._timeGuardTimer;
   }
 
   async _exitLoopTick() {
@@ -1232,7 +1304,10 @@ class TradeManager {
     const dayPnlR = sessionRInr > 0 ? Number(total) / sessionRInr : 0;
 
     const limits = this.risk?.getLimits?.() || {};
-    const evaluated = evaluateDailyRiskState({ dayPnlR, limits });
+    const evaluated = this._safeEvaluateDailyRiskState({ dayPnlR, limits, prevState });
+    if (!evaluated?.ok) {
+      return { state: String(prevState || "RUNNING"), reason: "DAILY_RISK_UNAVAILABLE", unavailable: true };
+    }
     const state = evaluated.state;
     const reason = evaluated.reason;
 
@@ -9224,6 +9299,16 @@ class TradeManager {
           }
         : null,
     });
+    const riskEval = this._dailyRiskEval || {};
+    const riskEvalLastErrorAt = Number(riskEval.lastErrorAt || 0);
+    const riskEvalFailureWindowMs = Math.max(60_000, Number(env.DAILY_RISK_EVAL_FAILURE_WINDOW_MS ?? 120_000));
+    const riskEvalErroredRecently = riskEvalLastErrorAt > 0 && Date.now() - riskEvalLastErrorAt <= riskEvalFailureWindowMs;
+    if (riskEval.ok === false || riskEvalErroredRecently) {
+      logger.warn({ token, reason: riskEval.reason, updatedAt: riskEval.updatedAt, riskEvalErroredRecently }, "[trade] blocked (daily risk unavailable)");
+      logFinalGateSummary({ blocker: "daily_risk_unavailable", stage: "daily_risk", meta: { reason: riskEval.reason || "DAILY_RISK_UNAVAILABLE", riskEvalErroredRecently } });
+      return "DAILY_RISK_UNAVAILABLE";
+    }
+
     const dailyRisk = await getDailyRisk(todayKey());
     const dailyState = String(dailyRisk?.state || "RUNNING");
     if (dailyState === "PAUSED") {
@@ -14263,6 +14348,9 @@ class TradeManager {
       : null;
     const risk = await getDailyRisk(todayKey());
     return {
+      instanceId: this.instanceId,
+      pid: process.pid,
+      bootTs: this.bootTs,
       tradingEnabled: getTradingEnabled(),
       tradingEnabledSource: getTradingEnabledSource(),
       killSwitch: this.risk.getKillSwitch(),
@@ -14273,6 +14361,8 @@ class TradeManager {
       dailyRisk: risk,
       dailyRiskState: risk?.state || "RUNNING",
       dailyRiskReason: risk?.stateReason || null,
+      dailyRiskEval: this._dailyRiskEval,
+      timers: intervalRegistry.snapshot(["tradeManager.exitLoop", "tradeManager.timeGuard", "tradeManager.dailyRiskEval"]),
       ordersPlacedToday: this.ordersPlacedToday,
       dynamicExitCadence: this._dynExitCadenceSnapshot(),
       factRecoveryGate: { ...this._factRecoveryGate },
